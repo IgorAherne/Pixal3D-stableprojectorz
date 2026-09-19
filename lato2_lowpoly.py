@@ -161,7 +161,12 @@ def run_lato2(
         input_mesh: High-poly mesh (.glb/.obj/.ply/.stl/.gltf/.off).
         output_path: Where to write the low-poly mesh. The extension decides the
             format (trimesh handles .glb/.obj/.ply).
-        vert_num: Target vertex count for V-Flow, clamped by LATO.2 to [200, 5000].
+        vert_num: Target vertex count for V-Flow. The weights were trained with
+            `max_vertex_num = 10000` (V-Flow density conditioning) and
+            `max_vertices = 10000` (T-Flow capacity), so anything up to 10000 is
+            in-distribution. LATO.2's `--min_verts` / `--max_verts` clamp of
+            [200, 5000] only applies on the `--use_gt_vert_count` path, which this
+            wrapper does not use, so `vert_num` is passed through unclamped.
         vflow_steps / tflow_steps: Euler steps for the two flows.
         cfg_strength: Classifier-free guidance on the rendered view condition.
         edge_threshold: Logit cutoff for the topology flow's edge predictor
@@ -272,7 +277,8 @@ if __name__ == "__main__":
     parser.add_argument("--input", required=True, help="High-poly mesh to retopologise")
     parser.add_argument("--output", default=None, help="Output mesh (default: <input>_lowpoly.glb)")
     parser.add_argument("--vert_num", type=int, default=DEFAULT_VERT_NUM,
-                        help=f"Target vertex count, clamped to [200, 5000] (default: {DEFAULT_VERT_NUM})")
+                        help=f"Target vertex count (default: {DEFAULT_VERT_NUM}). The weights "
+                             f"are trained up to 10000; not clamped on this path.")
     parser.add_argument("--vflow_steps", type=int, default=24)
     parser.add_argument("--tflow_steps", type=int, default=50)
     parser.add_argument("--cfg_strength", type=float, default=3.0)

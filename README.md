@@ -72,7 +72,7 @@ output_lowpoly.glb   low-poly, geometry only
 
 ```bat
 python inference.py --image assets/images/0_img.png --output ./output.glb --low_vram
-python inference.py ... --lowpoly_verts 1200      :: target vertex count, clamped to [200, 5000]
+python inference.py ... --lowpoly_verts 4000      :: target vertex count; weights trained up to 10000
 python inference.py ... --no_lowpoly              :: high-poly only
 ```
 
