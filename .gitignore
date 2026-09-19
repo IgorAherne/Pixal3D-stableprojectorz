@@ -24,3 +24,11 @@ env/
 Thumbs.db
 
 tmp
+
+# Downloaded by install.py
+/MODELS
+/models
+# Wheels pulled from release mirrors at install time (too big for git).
+# The cp311 wheels committed under whl/ are deliberately kept.
+/whl/natten-*.whl
+/whl/flash_attn-*.whl

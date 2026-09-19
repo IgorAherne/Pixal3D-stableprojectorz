@@ -1,4 +1,85 @@
 
+## Windows install (no CUDA Toolkit needed)
+
+This fork ships pre-compiled wheels, so you don't need the CUDA Toolkit, Visual Studio, git or conda.
+
+```bat
+venv\Scripts\python.exe install.py
+```
+
+The stack is fixed, because the wheels are ABI-locked to it: **Python 3.11 + torch 2.8.0 + CUDA 12.8**.
+Any other Python or torch version will fail to import the native extensions.
+
+`install.py` does everything in one pass:
+
+| Step | What it installs |
+|---|---|
+| torch | `torch 2.8.0` / `torchvision 0.23.0` / `torchaudio 2.8.0`, cu128 |
+| python deps | transformers, gradio, diffusers, timm, kornia, trimesh, einops, triton-windows, … |
+| attention | `flash_attn` on Ampere+ (sm_80), `xformers` as the fallback backend |
+| local wheels | `cumesh`, `flex_gemm`, `o_voxel`, `nvdiffrast`, `nvdiffrec_render` from `whl/` |
+| downloaded wheels | `natten` (for the NAF upsampler) — 136 MB, too big for git |
+| MoGe-2 | pinned commit, `--no-deps`, plus `utils3d_moge` |
+| weights | Pixal3D checkpoints (~29 GB), MoGe-2, NAF, DINOv3 and RMBG-2.0 |
+
+Useful flags:
+
+```bat
+venv\Scripts\python.exe install.py --skip-models      :: packages only, no 29GB download
+venv\Scripts\python.exe install.py --models-only      :: resume just the weights download
+venv\Scripts\python.exe install.py --mv               :: also fetch the multi-view checkpoints (+17GB)
+venv\Scripts\python.exe install.py --dl-workers 4     :: more parallel streams (fast connections only)
+venv\Scripts\python.exe install.py --no-pillow-simd   :: keep standard Pillow
+```
+
+### If the download is interrupted
+
+Nothing is lost. Partial files are kept as `<sha>.incomplete` blobs under `models\hub` and resumed
+over HTTP Range, so re-running picks up where it stopped. `--models-only` skips straight past the
+package steps.
+
+Downloads default to a **single** stream. HuggingFace's own default is 8, which on a slow
+connection splits the pipe until every stream falls under the read timeout and thrashes — one
+stream at full speed finishes sooner. `--dl-workers 4` is worth it on fibre, not otherwise.
+
+### Where the weights go
+
+Everything lands under the app folder, so the install stays portable. Your launcher has to
+export the same two variables, otherwise the runtime will re-download into the user-wide caches:
+
+```bat
+set HF_HOME=%CD%\models
+set TORCH_HOME=%CD%\models\torch
+python inference.py --image assets/images/0_img.png --output ./output.glb
+```
+
+`briaai/RMBG-2.0` and `facebook/dinov3-*` are gated on HuggingFace, so the installer mirrors them
+as plain zips into `MODELS/`. The loaders in
+[pixal3d/utils/local_models.py](pixal3d/utils/local_models.py) prefer that folder and only fall
+back to the HuggingFace repo id when it's missing.
+
+### Troubleshooting
+
+**`AttributeError: module 'flex_gemm.kernels' has no attribute 'triton'`** — raised part-way
+through a generation, in the shape decoder's `upsample`. Pixal3D's sparse conv defaults to the
+`masked_implicit_gemm_splitk` algorithm, which lives in a pure-python `flex_gemm/kernels/triton/`
+subpackage. Builds that omit it still import cleanly, because `flex_gemm/kernels/__init__.py`
+wraps the import in a bare `except ImportError: pass` — so the problem only surfaces minutes into
+a run. `install.py` now checks for it explicitly and swaps in a complete wheel. To fix an existing
+environment without a full re-run:
+
+```bat
+venv\Scripts\python.exe -m pip install --no-deps "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/flex_gemm-latest/flex_gemm-1.0.0%2Bcu128torch2.8-cp311-cp311-win_amd64.whl"
+```
+
+### GPU requirements
+
+Ampere (RTX 30xx) or newer. `flash_attn` and `natten` have no pre-Ampere kernels — on older cards
+the installer skips both, `xformers` covers attention, but the NAF feature upsampler used by the
+shape and texture stages will not run.
+
+---
+
 <div align="center">
 
 # Pixal3D: Pixel-Aligned 3D Generation from Images

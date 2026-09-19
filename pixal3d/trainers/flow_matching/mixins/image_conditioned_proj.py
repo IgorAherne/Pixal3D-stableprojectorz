@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw
 import torch.distributed as dist
 from ....utils import dist_utils
 from ....utils.dist_utils import read_file_dist
+from ....utils.local_models import resolve_local_model
 
 
 # =============================================================================
@@ -477,8 +478,10 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         else:
             self.naf_target_size = tuple(naf_target_size)
         
-        # Load DINOv3 model (frozen, no trainable params in this module)
-        self.model = DINOv3ViTModel.from_pretrained(model_name)
+        # Load DINOv3 model (frozen, no trainable params in this module).
+        # Prefer the copy bundled in MODELS/dinov3 over the HuggingFace mirror.
+        target_path, use_local = resolve_local_model(model_name, "dinov3")
+        self.model = DINOv3ViTModel.from_pretrained(target_path, local_files_only=use_local)
         self.model.eval()
         self.model.requires_grad_(False)
         

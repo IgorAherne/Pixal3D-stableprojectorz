@@ -4,11 +4,16 @@ import torch
 from torchvision import transforms
 from PIL import Image
 
+from ...utils.local_models import resolve_local_model
+
 
 class BiRefNet:
     def __init__(self, model_name: str = "ZhengPeng7/BiRefNet"):
+        # pipeline.json asks for briaai/RMBG-2.0, which is gated on HuggingFace.
+        # install.py mirrors it into MODELS/RMBG-2.0.
+        target_path, use_local = resolve_local_model(model_name, "RMBG-2.0")
         self.model = AutoModelForImageSegmentation.from_pretrained(
-            model_name, trust_remote_code=True
+            target_path, trust_remote_code=True, local_files_only=use_local
         )
         self.model.eval()
         self.transform_image = transforms.Compose(
