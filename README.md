@@ -88,6 +88,52 @@ and does not inherit the high-poly's texture. And it works in a normalised box, 
 scale; the two GLBs line up when opened together. Pass `--raw_frame` to keep LATO.2's own
 `[-0.5, 0.5]` output.
 
+#### Input preparation, and why it matters
+
+LATO.2's own example meshes are ~9k verts / ~11k faces, and its topology flow degrades badly
+outside that range. A raw Pixal3D export is ~920k faces. Fed in unchanged it produced 6.66 faces
+per vertex (a closed manifold has ~2) with 81% of edges shared by more than two faces — a soup of
+overlapping triangles. So `run_lato2` preprocesses the input:
+
+1. **Weld seam vertices.** A textured GLB splits vertices along UV and normal seams, and trimesh
+   keeps them apart by default: Pixal3D's export loads as 647k verts with 351k boundary edges, but
+   welding on position gives 459k verts and *zero* boundary edges. Skipping this step and
+   decimating the unwelded soup shatters the mesh.
+2. **Decimate** to `--simplify_faces` (12000 by default) with CuMesh, putting the input in the
+   range LATO.2 expects.
+3. **Export**, attempting a winding fix. Single-sided by default.
+
+#### Why the output has see-through holes
+
+`edges_to_faces` builds faces by enumerating 3-cliques in vertex index order, with no orientation,
+so LATO.2's output is never consistently wound — its own examples included. Under backface culling
+that reads as holes, which is the first thing you notice in a viewer.
+
+Reorienting does not fix it, because the mesh is not orientable. Measured on one asset:
+
+- 73% of edges are shared by **more than two** faces, but only 51 edges are open boundaries — so
+  the holes are not missing geometry.
+- p99 of those faces sit within **0.7% of the bounding diagonal** of the input surface. They are
+  not stray bridging triangles; LATO.2 has tiled the true surface in overlapping layers.
+- `trimesh.repair.fix_normals` reports `is_winding_consistent = True` on this, yet 50% of faces
+  still point inward and total volume is negative. The check passes vacuously on non-manifold
+  edges.
+
+There is no consistent orientation to find and nothing spurious to prune, so the geometry cannot be
+repaired here — this is an upstream limitation. The export is therefore left single-sided, showing
+the mesh as it really is. Pass `--double_sided` to write `doubleSided: true` and stop the culling;
+that hides the holes for preview or texture-projection use, but it is a display workaround, not a
+repair.
+
+`--edge_threshold` raises the edge predictor's logit cutoff (default 0.0, i.e. p > 0.5) to prune
+low-confidence connections. In testing it barely moved the overlap (66% to 65%); input preparation
+mattered far more.
+
+Upstream warns that "generated meshes may still contain holes and incorrect connectivity". The
+overlapping tiling is inherent to the method, not to this port — running LATO.2's own
+`crocodile.glb` through this pipeline reproduces its expected numbers (2.39 faces per vertex, 20%
+non-manifold).
+
 It runs as a **subprocess**, not an import: LATO.2 owns the top-level package names `models`,
 `modules`, `utils` and `dataset`, and a separate process also guarantees its ~3.6 GB of weights
 are released afterwards. The trade-off is that model load is paid per call, which matters for

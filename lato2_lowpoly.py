@@ -50,6 +50,14 @@ CKPT_FILES = {
 
 DEFAULT_VERT_NUM = 2000
 
+# LATO.2's own example meshes are ~9k verts / ~11k faces, and its topology flow
+# behaves badly well outside that range. A raw Pixal3D export is ~650k verts /
+# ~920k faces, and feeding that in unchanged makes the edge predictor massively
+# over-connect: measured on one asset, 6.66 faces per vertex (a closed manifold
+# has ~2) with 81% of edges shared by more than two faces. Decimating the input
+# to roughly LATO.2's own scale first brought that to 2.04 and 36%.
+DEFAULT_SIMPLIFY_FACES = 12000
+
 
 class Lato2Unavailable(RuntimeError):
     """LATO.2 source or checkpoints are missing."""
@@ -80,7 +88,8 @@ def _input_frame(mesh_path: str):
     """Recover the centre/extent LATO.2 normalises the input mesh by.
 
     Mirrors quantize_mesh_clustering in dataset/utils.py: vertices are mapped to
-    (v - center) / max_extent, and the exported mesh stays in that space.
+    (v - center) / max_extent, and the exported mesh stays in that space. Must be
+    computed from the file actually handed to LATO.2, decimation included.
     """
     import numpy as np
     import trimesh
@@ -93,6 +102,44 @@ def _input_frame(mesh_path: str):
     return center, max_extent
 
 
+def _decimate(src: str, dst: str, target_faces: int) -> bool:
+    """Decimate `src` to ~target_faces with CuMesh. False if it wasn't needed."""
+    import numpy as np
+    import torch
+    import trimesh
+    import cumesh
+
+    mesh = trimesh.load(src, process=False, force="mesh")
+
+    # A textured GLB splits vertices along UV and normal seams, and trimesh keeps
+    # them apart by default. Pixal3D's export loads as 647k verts with 351k
+    # boundary edges that way; welding on position alone gives 459k verts and a
+    # closed surface. Decimating the unwelded version shatters it.
+    before = len(mesh.vertices)
+    mesh.merge_vertices(merge_tex=True, merge_norm=True)
+    if len(mesh.vertices) != before:
+        print(f"[LATO.2] Welded seam vertices {before} -> {len(mesh.vertices)}")
+
+    if len(mesh.faces) <= target_faces:
+        return False
+
+    cm = cumesh.CuMesh()
+    cm.init(
+        torch.as_tensor(np.asarray(mesh.vertices), dtype=torch.float32, device="cuda"),
+        torch.as_tensor(np.asarray(mesh.faces), dtype=torch.int32, device="cuda"),
+    )
+    cm.simplify(int(target_faces))
+    verts, faces = cm.read()
+
+    out = trimesh.Trimesh(vertices=verts.cpu().numpy(), faces=faces.cpu().numpy(), process=False)
+    # simplify() leaves the collapsed vertices in place; they would skew the
+    # bounding box LATO.2 normalises by.
+    out.remove_unreferenced_vertices()
+    out.export(dst)
+    print(f"[LATO.2] Decimated input {len(mesh.faces)} -> {len(out.faces)} faces for retopology")
+    return True
+
+
 def run_lato2(
     input_mesh: str,
     output_path: str,
@@ -100,6 +147,10 @@ def run_lato2(
     vflow_steps: int = 24,
     tflow_steps: int = 50,
     cfg_strength: float = 3.0,
+    edge_threshold: float = 0.0,
+    simplify_faces: int = DEFAULT_SIMPLIFY_FACES,
+    fix_winding: bool = True,
+    double_sided: bool = False,
     seed: int = 42,
     keep_input_frame: bool = True,
     timeout: Optional[int] = 1800,
@@ -113,7 +164,17 @@ def run_lato2(
         vert_num: Target vertex count for V-Flow, clamped by LATO.2 to [200, 5000].
         vflow_steps / tflow_steps: Euler steps for the two flows.
         cfg_strength: Classifier-free guidance on the rendered view condition.
-        seed: Random seed.
+        edge_threshold: Logit cutoff for the topology flow's edge predictor
+            (`logits > threshold`, so 0.0 means p > 0.5). Raise it to prune
+            low-confidence edges, which cuts spurious overlapping triangles at
+            the cost of more holes.
+        simplify_faces: Decimate the input to about this many faces first; 0
+            disables. LATO.2 is tuned for ~11k-face inputs.
+        fix_winding: Attempt to make face orientation consistent afterwards.
+        double_sided: Write the GLB material with `doubleSided: true`. Off by
+            default so you see the mesh as it really is. Turn it on to hide the
+            see-through holes that backface culling exposes - it is a display
+            workaround, not a repair. See the comment at the call site.
         keep_input_frame: Map the result back onto the input mesh's position and
             scale. Turn off to get LATO.2's normalised [-0.5, 0.5] output.
         timeout: Seconds before the subprocess is killed; None to wait forever.
@@ -133,7 +194,8 @@ def run_lato2(
     try:
         # LATO.2 takes a directory, so hand it one holding just this mesh.
         staged = mesh_dir / Path(input_mesh).name
-        shutil.copy2(input_mesh, staged)
+        if not (simplify_faces and _decimate(input_mesh, str(staged), simplify_faces)):
+            shutil.copy2(input_mesh, staged)
 
         cmd = [
             sys.executable, str(LATO2_RUNNER),
@@ -143,6 +205,7 @@ def run_lato2(
             "--vflow_steps", str(vflow_steps),
             "--tflow_steps", str(tflow_steps),
             "--cfg_strength", str(cfg_strength),
+            "--edge_threshold", str(edge_threshold),
             "--seed", str(seed),
             # Each DataLoader worker builds its own Open3D offscreen renderer for
             # the conditioning view; on Windows that is a reliable way to hang.
@@ -167,8 +230,31 @@ def run_lato2(
 
         tri = trimesh.load(str(produced), process=False, force="mesh")
         if keep_input_frame:
-            center, max_extent = _input_frame(input_mesh)
+            # Frame comes from the staged file, which is what LATO.2 normalised.
+            center, max_extent = _input_frame(str(staged))
             tri.vertices = tri.vertices * max_extent + center
+        if fix_winding:
+            trimesh.repair.fix_normals(tri)
+
+        if double_sided:
+            # LATO.2 tiles the surface with overlapping triangles: measured on one
+            # asset, 73% of edges are shared by more than two faces, yet p99 of
+            # those faces sit within 0.7% of the bounding diagonal of the input
+            # surface - they are not stray geometry, the surface is genuinely
+            # multi-layered. Such a mesh has no consistent orientation to find
+            # (fix_normals reports success but leaves 50% of faces pointing
+            # inward), so the fix that actually works is to stop culling it.
+            from trimesh.visual.material import PBRMaterial
+
+            tri.visual = trimesh.visual.TextureVisuals(
+                material=PBRMaterial(
+                    name="lowpoly",
+                    baseColorFactor=[220, 220, 225, 255],
+                    metallicFactor=0.0,
+                    roughnessFactor=0.9,
+                    doubleSided=True,
+                )
+            )
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         tri.export(output_path)
@@ -190,6 +276,17 @@ if __name__ == "__main__":
     parser.add_argument("--vflow_steps", type=int, default=24)
     parser.add_argument("--tflow_steps", type=int, default=50)
     parser.add_argument("--cfg_strength", type=float, default=3.0)
+    parser.add_argument("--edge_threshold", type=float, default=0.0,
+                        help="Edge-predictor logit cutoff; raise to prune spurious faces.")
+    parser.add_argument("--simplify_faces", type=int, default=DEFAULT_SIMPLIFY_FACES,
+                        help=f"Decimate the input to ~N faces first, 0 to disable "
+                             f"(default: {DEFAULT_SIMPLIFY_FACES}).")
+    parser.add_argument("--no_fix_winding", action="store_true",
+                        help="Leave LATO.2's inconsistent face orientation as-is.")
+    parser.add_argument("--double_sided", action="store_true",
+                        help="Write a doubleSided material to hide the see-through holes. "
+                             "A display workaround, not a repair - the mesh stays "
+                             "non-orientable either way.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--raw_frame", action="store_true",
                         help="Leave the output in LATO.2's normalised [-0.5, 0.5] space.")
@@ -202,6 +299,10 @@ if __name__ == "__main__":
         vflow_steps=args.vflow_steps,
         tflow_steps=args.tflow_steps,
         cfg_strength=args.cfg_strength,
+        edge_threshold=args.edge_threshold,
+        simplify_faces=args.simplify_faces,
+        fix_winding=not args.no_fix_winding,
+        double_sided=args.double_sided,
         seed=args.seed,
         keep_input_frame=not args.raw_frame,
     )
