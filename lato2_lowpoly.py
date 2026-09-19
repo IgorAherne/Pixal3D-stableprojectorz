@@ -1,0 +1,207 @@
+# lato2_lowpoly.py
+# File: lato2_lowpoly.py
+"""
+Retopologise a generated Pixal3D mesh into a low-poly one with LATO.2.
+
+LATO.2 factorises mesh generation into a vertex flow (V-Flow, which places a
+controllable number of vertices) and a topology flow (T-Flow, which predicts the
+connectivity between them), conditioned on a rendered view encoded by DINOv2.
+
+It lives in third_party/lato2 - a git submodule, or the same files unpacked from
+the release zip - and is driven as a subprocess rather than imported, for two
+reasons:
+
+  * LATO.2 owns the top-level package names `models`, `modules`, `utils` and
+    `dataset`. Putting its folder on sys.path inside the Pixal3D process would
+    shadow anything else answering to those names.
+  * Its ~3.6 GB of weights are released the moment the process exits, which
+    matters when the Pixal3D pipeline has just finished on the same GPU.
+
+Two things worth knowing about the output:
+
+  * LATO.2 emits vertices and faces only - no UVs, no materials. The low-poly
+    mesh does not inherit the high-poly's PBR texture.
+  * It works in a normalised [-0.5, 0.5] box. `run_lato2` maps the result back
+    onto the input mesh's own frame so the two line up when opened together.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Optional
+
+CODE_DIR = Path(__file__).parent.resolve()
+LATO2_DIR = CODE_DIR / "third_party" / "lato2"
+LATO2_SCRIPT = LATO2_DIR / "scripts" / "e2e_inference.py"
+# Wrapper that applies the Windows render patch, then runs the script above.
+LATO2_RUNNER = CODE_DIR / "lato2_run.py"
+LATO2_CKPT_DIR = CODE_DIR / "MODELS" / "lato2"
+
+CKPT_FILES = {
+    "vflow_ckpt": "vflow.pt",
+    "vvae_ckpt": "vvae.pt",
+    "offset_head_ckpt": "offset_head.pt",
+    "tflow_ckpt": "tflow.pt",
+    "tvae_ckpt": "tvae.pt",
+    "voxel_encoder_ckpt": "voxel_encoder.pt",
+}
+
+DEFAULT_VERT_NUM = 2000
+
+
+class Lato2Unavailable(RuntimeError):
+    """LATO.2 source or checkpoints are missing."""
+
+
+def lato2_available() -> bool:
+    """True when both the source and every checkpoint are in place."""
+    return LATO2_SCRIPT.exists() and all(
+        (LATO2_CKPT_DIR / name).exists() for name in CKPT_FILES.values()
+    )
+
+
+def _check_available():
+    if not LATO2_SCRIPT.exists():
+        raise Lato2Unavailable(
+            f"LATO.2 source not found at {LATO2_DIR}.\n"
+            "Run install.py, or `git submodule update --init third_party/lato2`."
+        )
+    missing = [n for n in CKPT_FILES.values() if not (LATO2_CKPT_DIR / n).exists()]
+    if missing:
+        raise Lato2Unavailable(
+            f"LATO.2 checkpoints missing from {LATO2_CKPT_DIR}: {missing}\n"
+            "Run install.py to download them."
+        )
+
+
+def _input_frame(mesh_path: str):
+    """Recover the centre/extent LATO.2 normalises the input mesh by.
+
+    Mirrors quantize_mesh_clustering in dataset/utils.py: vertices are mapped to
+    (v - center) / max_extent, and the exported mesh stays in that space.
+    """
+    import numpy as np
+    import trimesh
+
+    mesh = trimesh.load(mesh_path, process=False, force="mesh")
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    bbox_min, bbox_max = verts.min(axis=0), verts.max(axis=0)
+    center = (bbox_min + bbox_max) / 2.0
+    max_extent = max(float((bbox_max - bbox_min).max()), 1e-7)
+    return center, max_extent
+
+
+def run_lato2(
+    input_mesh: str,
+    output_path: str,
+    vert_num: int = DEFAULT_VERT_NUM,
+    vflow_steps: int = 24,
+    tflow_steps: int = 50,
+    cfg_strength: float = 3.0,
+    seed: int = 42,
+    keep_input_frame: bool = True,
+    timeout: Optional[int] = 1800,
+) -> str:
+    """Generate a low-poly mesh from `input_mesh` and write it to `output_path`.
+
+    Args:
+        input_mesh: High-poly mesh (.glb/.obj/.ply/.stl/.gltf/.off).
+        output_path: Where to write the low-poly mesh. The extension decides the
+            format (trimesh handles .glb/.obj/.ply).
+        vert_num: Target vertex count for V-Flow, clamped by LATO.2 to [200, 5000].
+        vflow_steps / tflow_steps: Euler steps for the two flows.
+        cfg_strength: Classifier-free guidance on the rendered view condition.
+        seed: Random seed.
+        keep_input_frame: Map the result back onto the input mesh's position and
+            scale. Turn off to get LATO.2's normalised [-0.5, 0.5] output.
+        timeout: Seconds before the subprocess is killed; None to wait forever.
+    """
+    _check_available()
+
+    import trimesh
+
+    input_mesh = str(Path(input_mesh).resolve())
+    stem = Path(input_mesh).stem
+
+    work_dir = Path(tempfile.mkdtemp(prefix="pixal3d_lato2_"))
+    mesh_dir = work_dir / "in"
+    out_dir = work_dir / "out"
+    mesh_dir.mkdir()
+
+    try:
+        # LATO.2 takes a directory, so hand it one holding just this mesh.
+        staged = mesh_dir / Path(input_mesh).name
+        shutil.copy2(input_mesh, staged)
+
+        cmd = [
+            sys.executable, str(LATO2_RUNNER),
+            "--mesh_dir", str(mesh_dir),
+            "--out_dir", str(out_dir),
+            "--vert_num", str(vert_num),
+            "--vflow_steps", str(vflow_steps),
+            "--tflow_steps", str(tflow_steps),
+            "--cfg_strength", str(cfg_strength),
+            "--seed", str(seed),
+            # Each DataLoader worker builds its own Open3D offscreen renderer for
+            # the conditioning view; on Windows that is a reliable way to hang.
+            "--num_workers", "0",
+            "--batch_size", "1",
+            "--dino_hub_dir", str(LATO2_CKPT_DIR / "dinov2"),
+        ]
+        for flag, name in CKPT_FILES.items():
+            cmd += [f"--{flag}", str(LATO2_CKPT_DIR / name)]
+
+        print(f"[LATO.2] Retopologising {input_mesh} (vert_num={vert_num})...")
+        result = subprocess.run(cmd, cwd=str(LATO2_DIR), timeout=timeout)
+        if result.returncode != 0:
+            raise RuntimeError(f"LATO.2 exited with code {result.returncode}")
+
+        produced = out_dir / f"{stem}_pred.obj"
+        if not produced.exists():
+            raise RuntimeError(
+                f"LATO.2 produced no mesh at {produced}. "
+                "Too few generated vertices, or no faces decoded - see the log above."
+            )
+
+        tri = trimesh.load(str(produced), process=False, force="mesh")
+        if keep_input_frame:
+            center, max_extent = _input_frame(input_mesh)
+            tri.vertices = tri.vertices * max_extent + center
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        tri.export(output_path)
+        print(f"[LATO.2] Low-poly saved to: {output_path} "
+              f"({len(tri.vertices)} verts, {len(tri.faces)} faces)")
+        return output_path
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LATO.2 retopology for a Pixal3D mesh")
+    parser.add_argument("--input", required=True, help="High-poly mesh to retopologise")
+    parser.add_argument("--output", default=None, help="Output mesh (default: <input>_lowpoly.glb)")
+    parser.add_argument("--vert_num", type=int, default=DEFAULT_VERT_NUM,
+                        help=f"Target vertex count, clamped to [200, 5000] (default: {DEFAULT_VERT_NUM})")
+    parser.add_argument("--vflow_steps", type=int, default=24)
+    parser.add_argument("--tflow_steps", type=int, default=50)
+    parser.add_argument("--cfg_strength", type=float, default=3.0)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--raw_frame", action="store_true",
+                        help="Leave the output in LATO.2's normalised [-0.5, 0.5] space.")
+    args = parser.parse_args()
+
+    out = args.output or str(Path(args.input).with_name(Path(args.input).stem + "_lowpoly.glb"))
+    run_lato2(
+        args.input, out,
+        vert_num=args.vert_num,
+        vflow_steps=args.vflow_steps,
+        tflow_steps=args.tflow_steps,
+        cfg_strength=args.cfg_strength,
+        seed=args.seed,
+        keep_input_frame=not args.raw_frame,
+    )

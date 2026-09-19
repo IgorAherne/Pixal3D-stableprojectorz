@@ -1,0 +1,3 @@
+[submodule "third_party/lato2"]
+	path = third_party/lato2
+	url = https://github.com/IgorAherne/LATO2-stableprojectorz.git

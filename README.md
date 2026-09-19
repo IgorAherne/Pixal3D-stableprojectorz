@@ -20,7 +20,8 @@ Any other Python or torch version will fail to import the native extensions.
 | local wheels | `cumesh`, `flex_gemm`, `o_voxel`, `nvdiffrast`, `nvdiffrec_render` from `whl/` |
 | downloaded wheels | `natten` (for the NAF upsampler) — 136 MB, too big for git |
 | MoGe-2 | pinned commit, `--no-deps`, plus `utils3d_moge` |
-| weights | Pixal3D checkpoints (~29 GB), MoGe-2, NAF, DINOv3 and RMBG-2.0 |
+| LATO.2 | source into `third_party/lato2`, plus `spconv-cu126`, `torch_scatter`, `vox2seq` |
+| weights | Pixal3D checkpoints (~29 GB), MoGe-2, NAF, DINOv3, RMBG-2.0, LATO.2 (~3.6 GB) |
 
 Useful flags:
 
@@ -29,6 +30,7 @@ venv\Scripts\python.exe install.py --skip-models      :: packages only, no 29GB 
 venv\Scripts\python.exe install.py --models-only      :: resume just the weights download
 venv\Scripts\python.exe install.py --mv               :: also fetch the multi-view checkpoints (+17GB)
 venv\Scripts\python.exe install.py --dl-workers 4     :: more parallel streams (fast connections only)
+venv\Scripts\python.exe install.py --no-lato2         :: skip retopology (source, wheels and 3.6GB weights)
 venv\Scripts\python.exe install.py --no-pillow-simd   :: keep standard Pillow
 ```
 
@@ -57,6 +59,66 @@ python inference.py --image assets/images/0_img.png --output ./output.glb
 as plain zips into `MODELS/`. The loaders in
 [pixal3d/utils/local_models.py](pixal3d/utils/local_models.py) prefer that folder and only fall
 back to the HuggingFace repo id when it's missing.
+
+### Low-poly retopology (LATO.2)
+
+Every generation is followed by a [LATO.2](https://github.com/LoHhhha/LATO.2) pass that
+retopologises the high-poly result into an artist-style low-poly mesh, written alongside it:
+
+```
+output.glb           high-poly, 4K PBR texture
+output_lowpoly.glb   low-poly, geometry only
+```
+
+```bat
+python inference.py --image assets/images/0_img.png --output ./output.glb --low_vram
+python inference.py ... --lowpoly_verts 1200      :: target vertex count, clamped to [200, 5000]
+python inference.py ... --no_lowpoly              :: high-poly only
+```
+
+You can also run it on any existing mesh:
+
+```bat
+python lato2_lowpoly.py --input output.glb --output output_lowpoly.glb --vert_num 2000
+```
+
+Two things to expect. LATO.2 decodes **vertices and faces only** — the low-poly mesh has no UVs
+and does not inherit the high-poly's texture. And it works in a normalised box, so
+[lato2_lowpoly.py](lato2_lowpoly.py) maps the result back onto the input mesh's own position and
+scale; the two GLBs line up when opened together. Pass `--raw_frame` to keep LATO.2's own
+`[-0.5, 0.5]` output.
+
+It runs as a **subprocess**, not an import: LATO.2 owns the top-level package names `models`,
+`modules`, `utils` and `dataset`, and a separate process also guarantees its ~3.6 GB of weights
+are released afterwards. The trade-off is that model load is paid per call, which matters for
+batch use but not for a single generation.
+
+#### The conditioning renderer
+
+LATO.2 conditions on one white-model render of the input mesh, encoded by DINOv2. Upstream draws
+it with `open3d.visualization.rendering.OffscreenRenderer`, which **cannot work on Windows** —
+Open3D's python binding calls `EngineInstance::EnableHeadless()` unconditionally and the headless
+path is `#ifdef __linux__`, so it always raises `EGL Headless is not supported on this platform`.
+That holds for Open3D 0.17 through 0.19, so there's no version to fall back to.
+
+[lato2_render_patch.py](lato2_render_patch.py) replaces it with an **nvdiffrast** renderer, which
+Pixal3D already depends on and whose CUDA rasteriser needs no OpenGL context, window or display.
+[lato2_run.py](lato2_run.py) applies the patch and then runs upstream's `e2e_inference.py`
+untouched, so `third_party/lato2` stays a clean checkout of the pinned commit. Camera placement
+and the crop-to-object step are reused from LATO.2's own code, so framing is identical; only the
+shading model differs (Lambertian sun + ambient instead of Filament's PBR/IBL). Open3D is no
+longer installed at all.
+
+#### Submodule, but zip-friendly
+
+LATO.2 is a git submodule at `third_party/lato2`, so it can be developed independently. The
+installer never shells out to git:
+
+- **Release zip** — the files are already in `third_party/lato2`, so `install.py` leaves them alone.
+- **`git clone --recursive`** — same, the submodule is already populated.
+- **Plain `git clone`** — the folder is empty, so `install.py` downloads the pinned source archive.
+
+No submodule commands are ever required of a user.
 
 ### Troubleshooting
 

@@ -104,6 +104,56 @@ UTILS3D_MOGE_ARCHIVE = "https://github.com/EasternJournalist/utils3d-moge/archiv
 NAF_HUB_REPO = "valeoai/NAF"
 NAF_CHECKPOINT = "https://github.com/valeoai/NAF/releases/download/model/naf_release.pth"
 
+# LATO.2 retopologises the generated high-poly mesh into a low-poly one
+# (V-Flow vertices -> T-Flow connectivity). It is tracked as a git submodule under
+# third_party/lato2 for development, but the installer never shells out to git: if
+# the folder is already populated - by the release zip, or by `git clone
+# --recursive` - it is left alone, and only an empty folder triggers a fetch of the
+# pinned source archive.
+LATO2_COMMIT = "fbb1f5a5755e6db8700cf6922fd506830b7cdccd"
+LATO2_SOURCE_URLS = [
+    f"https://github.com/IgorAherne/LATO2-stableprojectorz/archive/{LATO2_COMMIT}.zip",
+]
+# Ungated, ~3.6 GB of *.pt weights.
+LATO2_CKPT_REPO = "0x4c48/LATO.2"
+# LATO.2 conditions on a rendered view encoded by DINOv2, pulled through torch.hub.
+LATO2_DINO_HUB_REPO = "facebookresearch/dinov2"
+# spconv is LATO.2's default sparse-conv backend. Unlike everything else here it is
+# NOT a torch extension - it declares no torch dependency and is tagged by CUDA
+# alone - so the official PyPI build is used instead of a torch-tagged mirror
+# wheel. There is no cu128 release, but CUDA minor-version compatibility makes the
+# cu126 binaries fine on a 12.8 driver. Installed *with* dependencies, because
+# spconv genuinely needs pccm, ccimport, cumm-cu126, pybind11 and fire to import.
+SPCONV_PACKAGE = "spconv-cu126==2.3.8"
+
+# The two CUDA extensions LATO.2 needs that Pixal3D itself doesn't: torch_scatter
+# and vox2seq (z-order / Hilbert serialization). `torchsparse` is only touched when
+# SPARSE_BACKEND=torchsparse, so it is skipped.
+LATO2_WHEELS = [
+    {
+        # From PyG's own wheel index rather than the community mirror: the
+        # community build's dist-info directory is named `torch-scatter-...`
+        # instead of `torch_scatter-...`, so pip reads the name as 'torch' and
+        # refuses it ("inconsistent name: expected 'torch-scatter', but metadata
+        # has 'torch'"). PyG publishes a correctly-packaged build for this exact
+        # torch/CUDA combination.
+        "name": "torch_scatter",
+        "filename": "torch_scatter-2.1.2+pt28cu128-cp311-cp311-win_amd64.whl",
+        "urls": [
+            f"{SPZ_WHEEL_MIRROR}/torch_scatter-2.1.2%2Bpt28cu128-cp311-cp311-win_amd64.whl",
+            "https://data.pyg.org/whl/torch-2.8.0%2Bcu128/torch_scatter-2.1.2%2Bpt28cu128-cp311-cp311-win_amd64.whl",
+        ],
+    },
+    {
+        "name": "vox2seq",
+        "filename": "vox2seq-0.0.0+cu128torch2.8-cp311-cp311-win_amd64.whl",
+        "urls": [
+            f"{SPZ_WHEEL_MIRROR}/vox2seq-0.0.0%2Bcu128torch2.8-cp311-cp311-win_amd64.whl",
+            "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/vox2seq-latest/vox2seq-0.0.0%2Bcu128torch2.8-cp311-cp311-win_amd64.whl",
+        ],
+    },
+]
+
 # HuggingFace repos pulled during install so the first run doesn't stall.
 PIXAL3D_REPO = "TencentARC/Pixal3D"
 MOGE_REPO = "Ruicheng/moge-2-vitl"
@@ -436,6 +486,147 @@ def download_naf():
     print("  NAF ready.")
 
 
+def _pip_install_wheel(wheel: Path, fatal: bool = True) -> bool:
+    # --no-deps: these wheels declare loose torch pins that would otherwise
+    # let pip replace the cu128 build with a CPU one from PyPI.
+    result = run_command_with_retry(
+        f'pip install --no-deps "{wheel}"', f"Installing {wheel.name}",
+        max_retries=MAX_RETRIES if fatal else 1, fatal=fatal,
+    )
+    return getattr(result, "returncode", 1) == 0
+
+
+def install_downloaded_wheel(spec: dict, whl_dir: Path, cc_major: Optional[int]):
+    """Install one wheel from the download table, preferring a local copy."""
+    # A copy already in whl/ wins, so you can ship your own build and so a
+    # re-run doesn't re-download a few hundred MB.
+    local = sorted(whl_dir.glob(f"{spec['name']}*.whl"))
+    if local:
+        wheel = local[0]
+        print(f"Installing: {wheel.name} (local)")
+        if _pip_install_wheel(wheel, fatal=False):
+            return
+        # A stale or malformed local wheel shouldn't wedge the install - a
+        # mis-named dist-info directory is enough for pip to reject one.
+        print(f"  {wheel.name} was rejected; falling back to the download mirror.")
+
+    if cc_major is not None and cc_major < spec.get("min_cc", 0):
+        print(f"Skipping {spec['name']}: {spec['skip_reason']}")
+        return
+
+    wheel = whl_dir / spec["filename"]
+    if not wheel.exists():
+        download_file(spec["urls"], wheel, spec["filename"])
+    print(f"Installing: {wheel.name}")
+    _pip_install_wheel(wheel)
+
+
+LATO2_DIR = CODE_DIR / "third_party" / "lato2"
+LATO2_MARKER = LATO2_DIR / "scripts" / "e2e_inference.py"
+LATO2_CKPT_DIR = CODE_DIR / "MODELS" / "lato2"
+LATO2_CKPT_FILES = ["vflow.pt", "vvae.pt", "offset_head.pt", "tflow.pt", "tvae.pt", "voxel_encoder.pt"]
+
+
+def ensure_lato2_source():
+    """Make sure third_party/lato2 holds the LATO.2 source.
+
+    Present already (release zip, or a recursive clone) -> leave it alone.
+    Empty -> download the pinned archive, so a plain `git clone` without
+    --recursive still ends up with a working install and no git executable is
+    ever required.
+    """
+    print("\n--- Checking LATO.2 source ---")
+    if LATO2_MARKER.exists():
+        print(f"[INFO] LATO.2 already present at {LATO2_DIR}, skipping download.")
+        return
+
+    LATO2_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="pixal3d_lato2_"))
+    try:
+        archive = tmp_dir / "lato2.zip"
+        download_file(LATO2_SOURCE_URLS, archive, "LATO.2 source")
+        with zipfile.ZipFile(str(archive)) as zf:
+            zf.extractall(str(tmp_dir))
+        # GitHub archives wrap everything in a <repo>-<sha>/ folder.
+        roots = [p for p in tmp_dir.iterdir() if p.is_dir()]
+        if len(roots) != 1:
+            raise InstallationError(f"Unexpected LATO.2 archive layout: {[p.name for p in roots]}")
+        for item in roots[0].iterdir():
+            target = LATO2_DIR / item.name
+            if target.exists():
+                continue
+            shutil.move(str(item), str(target))
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if not LATO2_MARKER.exists():
+        raise InstallationError(f"LATO.2 extracted but {LATO2_MARKER} is missing.")
+    print(f"  LATO.2 ready at {LATO2_DIR}")
+
+
+def download_lato2_models():
+    """Fetch the LATO.2 weights (~3.6 GB) plus its DINOv2 conditioning backbone.
+
+    Non-fatal: Pixal3D generates fine without them, only the low-poly retopology
+    step is unavailable.
+    """
+    print("\n--- Downloading LATO.2 weights (~3.6 GB) ---")
+    LATO2_CKPT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if all((LATO2_CKPT_DIR / f).exists() for f in LATO2_CKPT_FILES):
+        print("[INFO] LATO.2 checkpoints already present, skipping download.")
+    else:
+        try:
+            from huggingface_hub import snapshot_download
+            for attempt in range(HF_MAX_RETRIES):
+                try:
+                    snapshot_download(
+                        LATO2_CKPT_REPO,
+                        local_dir=str(LATO2_CKPT_DIR),
+                        allow_patterns=["*.pt"],
+                        max_workers=HF_DEFAULT_WORKERS,
+                    )
+                    break
+                except Exception as e:
+                    print(f"  Download interrupted (attempt {attempt + 1}/{HF_MAX_RETRIES}): {e}")
+                    if attempt == HF_MAX_RETRIES - 1:
+                        raise
+                    print(f"  Resuming in {RETRY_DELAY} seconds...")
+                    time.sleep(RETRY_DELAY)
+        except Exception as e:
+            print(f"\n  [WARNING] Could not download {LATO2_CKPT_REPO}: {e}")
+            print("  Pixal3D generation still works; only the low-poly output is unavailable.\n")
+            return False
+
+    missing = [f for f in LATO2_CKPT_FILES if not (LATO2_CKPT_DIR / f).exists()]
+    if missing:
+        print(f"  [WARNING] LATO.2 checkpoints missing: {missing}")
+        return False
+    print("  LATO.2 checkpoints ready.")
+
+    # DINOv2 encodes the conditioning render. LATO.2 keeps its own hub dir, so
+    # point torch.hub there and warm it now rather than on first generation.
+    print("  Fetching DINOv2 conditioning backbone...")
+    import torch
+    hub_dir = LATO2_CKPT_DIR / "dinov2"
+    hub_dir.mkdir(parents=True, exist_ok=True)
+    prev_dir = torch.hub.get_dir()
+    try:
+        torch.hub.set_dir(str(hub_dir))
+        torch.hub._get_cache_or_reload(
+            LATO2_DINO_HUB_REPO, force_reload=False, trust_repo=True,
+            calling_fn=None, verbose=True, skip_validation=False,
+        )
+        print("  DINOv2 hub checkout ready.")
+    except Exception as e:
+        print(f"  [WARNING] DINOv2 hub prefetch failed: {e}")
+        print("  It will be retried on first low-poly generation.")
+    finally:
+        torch.hub.set_dir(prev_dir)
+
+    return True
+
+
 def _has_flex_gemm_triton() -> bool:
     check = subprocess.run(
         f'"{sys.executable}" -c "import torch, flex_gemm.kernels as k; k.triton"',
@@ -550,6 +741,8 @@ def install_dependencies(args):
             # Resuming an interrupted weights download - the packages are already in.
             download_naf()
             download_hf_models(include_mv=args.mv, workers=args.dl_workers)
+            if not args.no_lato2:
+                download_lato2_models()
             print("\nModel downloads completed successfully!")
             return
 
@@ -599,7 +792,12 @@ def install_dependencies(args):
 
         # 3. Local Wheels (cumesh, flex_gemm, o_voxel, nvdiffrast, nvdiffrec_render)
         print("\n--- Installing Custom Wheels ---")
-        handled_elsewhere = ("pillow",) + tuple(spec["name"] for spec in DOWNLOAD_WHEELS)
+        handled_elsewhere = (
+            # spconv comes from PyPI, so ignore any stale mirror wheel left in whl/.
+            ("pillow", "spconv")
+            + tuple(spec["name"] for spec in DOWNLOAD_WHEELS)
+            + tuple(spec["name"] for spec in LATO2_WHEELS)
+        )
         for whl_file in sorted(whl_dir.glob("*.whl")):
             if whl_file.name.lower().startswith(handled_elsewhere):
                 continue
@@ -612,26 +810,27 @@ def install_dependencies(args):
         if cc_major is None:
             print("Warning: could not read GPU compute capability; assuming Ampere or newer.")
         for spec in DOWNLOAD_WHEELS:
-            # A copy already in whl/ wins, so you can ship your own build and so a
-            # re-run doesn't re-download a few hundred MB.
-            local = sorted(whl_dir.glob(f"{spec['name']}*.whl"))
-            if local:
-                wheel = local[0]
-                print(f"Installing: {wheel.name} (local)")
-            else:
-                if cc_major is not None and cc_major < spec["min_cc"]:
-                    print(f"Skipping {spec['name']}: {spec['skip_reason']}")
-                    continue
-                wheel = whl_dir / spec["filename"]
-                download_file(spec["urls"], wheel, spec["filename"])
-                print(f"Installing: {wheel.name}")
-
-            # --no-deps: these wheels declare loose torch pins that would otherwise
-            # let pip replace the cu128 build with a CPU one from PyPI.
-            run_command_with_retry(f'pip install --no-deps "{wheel}"', f"Installing {wheel.name}")
+            install_downloaded_wheel(spec, whl_dir, cc_major)
 
         # 4.5. Some flex_gemm builds omit the Triton kernels Pixal3D's conv needs
         ensure_flex_gemm_triton()
+
+        # 4.6. LATO.2 retopology: source (submodule contents, or the pinned
+        # archive) plus the three CUDA extensions Pixal3D doesn't already have.
+        if not args.no_lato2:
+            ensure_lato2_source()
+            print("\n--- Installing LATO.2 CUDA wheels ---")
+            for spec in LATO2_WHEELS:
+                install_downloaded_wheel(spec, whl_dir, cc_major)
+            # A mirror wheel named plain `spconv` would shadow the module that
+            # spconv-cu126 provides, so clear it out before installing.
+            subprocess.run(f'"{sys.executable}" -m pip uninstall -y spconv',
+                           shell=True, stdout=subprocess.DEVNULL)
+            run_command_with_retry(f"pip install {SPCONV_PACKAGE}", "Installing spconv")
+            # No open3d: LATO.2 only used it for the conditioning render, and its
+            # OffscreenRenderer cannot run on Windows at all (see
+            # lato2_render_patch.py). nvdiffrast does that job instead, which also
+            # spares the install ~70 MB plus an ipython/ipywidgets dependency tree.
 
         # 5. NAF upsampler weights (needs natten to be importable at runtime, not now)
         if not args.skip_models:
@@ -640,6 +839,8 @@ def install_dependencies(args):
         # 6. Pre-download the HuggingFace weights
         if not args.skip_models:
             download_hf_models(include_mv=args.mv, workers=args.dl_workers)
+            if not args.no_lato2:
+                download_lato2_models()
 
         # 7. Pillow last, so nothing pulls standard Pillow back in afterwards
         if args.no_pillow_simd:
@@ -703,6 +904,22 @@ def verify_installation():
                 print("[ERROR] No attention backend available (need flash_attn or xformers).")
                 ok = False
 
+            # LATO.2 is an optional post-step, so report but don't fail on it.
+            lato2_ckpts_ok = all((LATO2_CKPT_DIR / f).exists() for f in LATO2_CKPT_FILES)
+            if LATO2_MARKER.exists() and lato2_ckpts_ok:
+                for mod in ["spconv", "torch_scatter", "vox2seq", "nvdiffrast"]:
+                    try:
+                        __import__(mod)
+                        print(f"[OK] {mod} detected (LATO.2).")
+                    except ImportError:
+                        print(f"[WARNING] {mod} not found - LATO.2 low-poly output disabled.")
+                print("[OK] LATO.2 source and checkpoints detected.")
+            elif LATO2_MARKER.exists():
+                print("[WARNING] LATO.2 source present but checkpoints missing - "
+                      "low-poly output disabled.")
+            else:
+                print("[WARNING] LATO.2 not installed - low-poly output disabled.")
+
             # NATTEN drives the NAF upsampler; without libnatten the shape/tex
             # stages have no high-res DINOv3 features to condition on.
             try:
@@ -736,6 +953,9 @@ if __name__ == "__main__":
     parser.add_argument("--models-only", action="store_true",
                         help="Skip the python packages and only (re)download weights. "
                              "Use this to resume an interrupted weights download.")
+    parser.add_argument("--no-lato2", action="store_true",
+                        help="Skip LATO.2 entirely (source, CUDA wheels and its ~3.6GB weights). "
+                             "Pixal3D still generates; only the low-poly output is lost.")
     parser.add_argument("--dl-workers", type=int, default=HF_DEFAULT_WORKERS,
                         help=f"Parallel HuggingFace download streams (default {HF_DEFAULT_WORKERS}). "
                              f"Raise it to 4-8 on a fast connection; leave at 1 on a slow one, "

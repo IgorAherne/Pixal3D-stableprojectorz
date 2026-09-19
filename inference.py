@@ -2,6 +2,8 @@ import os
 import argparse
 import math
 import time
+from pathlib import Path
+from typing import Optional
 import torch
 import numpy as np
 import cv2
@@ -15,6 +17,8 @@ os.environ["FLEX_GEMM_AUTOTUNER_VERBOSE"] = '1'
 
 from pixal3d.pipelines import Pixal3DImageTo3DPipeline
 import o_voxel
+
+from lato2_lowpoly import DEFAULT_VERT_NUM, Lato2Unavailable, lato2_available, run_lato2
 
 # ============================================================================
 # Constants & Defaults
@@ -55,6 +59,26 @@ IMAGE_COND_CONFIGS = {
 # ============================================================================
 # Model Loading
 # ============================================================================
+
+def run_lowpoly(high_poly_path: str, output_path: Optional[str], vert_num: int, seed: int):
+    """Retopologise the generated mesh with LATO.2. Never fatal - the high-poly
+    GLB is already on disk by this point."""
+    if output_path is None:
+        p = Path(high_poly_path)
+        output_path = str(p.with_name(p.stem + "_lowpoly.glb"))
+
+    if not lato2_available():
+        print("[LATO.2] Skipping low-poly: LATO.2 is not installed. "
+              "Run install.py (without --no-lato2) to enable it.")
+        return None
+
+    try:
+        return run_lato2(high_poly_path, output_path, vert_num=vert_num, seed=seed)
+    except Exception as e:
+        print(f"[LATO.2] Low-poly generation failed: {e}")
+        print(f"[LATO.2] The high-poly mesh at {high_poly_path} is unaffected.")
+        return None
+
 
 def build_image_cond_model(config: dict):
     from pixal3d.trainers.flow_matching.mixins.image_conditioned_proj import DinoV3ProjFeatureExtractor
@@ -182,6 +206,9 @@ def run_inference(
     manual_fov: float = -1.0,
     low_vram: bool = False,
     resolution: int = -1,
+    lowpoly: bool = True,
+    lowpoly_path: Optional[str] = None,
+    lowpoly_verts: int = DEFAULT_VERT_NUM,
 ):
     # Load models
     pipeline = init_pipeline(model_path, low_vram=low_vram)
@@ -282,6 +309,13 @@ def run_inference(
     glb.export(output_path, extension_webp=True)
     print(f"[Done] GLB saved to: {output_path}")
 
+    # Retopology. Free the Pixal3D pipeline first: LATO.2 runs in its own process
+    # but still needs the GPU this one is holding.
+    if lowpoly:
+        del pipeline
+        torch.cuda.empty_cache()
+        run_lowpoly(output_path, lowpoly_path, vert_num=lowpoly_verts, seed=seed)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pixal3D Inference: Image to GLB")
@@ -298,6 +332,13 @@ if __name__ == "__main__":
                              "Reduces peak VRAM from ~18GB to ~10-12GB at the cost of slower inference.")
     parser.add_argument("--resolution", type=int, default=-1,
                         help="Pipeline resolution (1024 or 1536). Default: 1024 if --low_vram, else 1536.")
+    parser.add_argument("--no_lowpoly", action="store_true",
+                        help="Skip the LATO.2 retopology pass that follows generation.")
+    parser.add_argument("--lowpoly_output", type=str, default=None,
+                        help="Where to write the low-poly mesh (default: <output>_lowpoly.glb).")
+    parser.add_argument("--lowpoly_verts", type=int, default=DEFAULT_VERT_NUM,
+                        help=f"Target vertex count for LATO.2, clamped to [200, 5000] "
+                             f"(default: {DEFAULT_VERT_NUM}).")
 
     args = parser.parse_args()
 
@@ -309,4 +350,7 @@ if __name__ == "__main__":
         model_path=args.model_path,
         low_vram=args.low_vram,
         resolution=args.resolution,
+        lowpoly=not args.no_lowpoly,
+        lowpoly_path=args.lowpoly_output,
+        lowpoly_verts=args.lowpoly_verts,
     )

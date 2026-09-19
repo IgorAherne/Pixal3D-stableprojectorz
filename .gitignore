@@ -32,3 +32,6 @@ tmp
 # The cp311 wheels committed under whl/ are deliberately kept.
 /whl/natten-*.whl
 /whl/flash_attn-*.whl
+/whl/spconv-*.whl
+/whl/torch_scatter-*.whl
+/whl/vox2seq-*.whl
