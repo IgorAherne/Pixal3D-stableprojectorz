@@ -65,12 +65,16 @@ through a generation, in the shape decoder's `upsample`. Pixal3D's sparse conv d
 `masked_implicit_gemm_splitk` algorithm, which lives in a pure-python `flex_gemm/kernels/triton/`
 subpackage. Builds that omit it still import cleanly, because `flex_gemm/kernels/__init__.py`
 wraps the import in a bare `except ImportError: pass` — so the problem only surfaces minutes into
-a run. `install.py` now checks for it explicitly and swaps in a complete wheel. To fix an existing
-environment without a full re-run:
+a run. `install.py` now checks for it explicitly and copies the missing kernels in. To fix an
+existing environment without a full re-run, from the repo root:
 
 ```bat
-venv\Scripts\python.exe -m pip install --no-deps "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/flex_gemm-latest/flex_gemm-1.0.0%2Bcu128torch2.8-cp311-cp311-win_amd64.whl"
+venv\Scripts\python.exe -c "import install; install.ensure_flex_gemm_triton()"
 ```
+
+Only the pure-python subpackage is copied; the compiled `kernels/cuda` extension in `whl/` is
+left alone. The proper fix is to rebuild the `flex_gemm` wheel with `flex_gemm.kernels.triton`
+included in `packages`, after which this check just passes.
 
 ### GPU requirements
 

@@ -83,7 +83,10 @@ DOWNLOAD_WHEELS = [
 # because flex_gemm/kernels/__init__.py swallows the ImportError - the failure only
 # shows up mid-generation as:
 #   AttributeError: module 'flex_gemm.kernels' has no attribute 'triton'
-# Used only when the installed flex_gemm turns out to be missing those kernels.
+# Source for those kernels when the installed flex_gemm is missing them. Note this
+# wheel cannot be pip-installed: its dist-info directory is named `flex-gemm-...`
+# instead of `flex_gemm-...`, so pip reads the name as 'flex' and refuses it. We
+# only unzip the subpackage out of it, so that doesn't matter.
 FLEX_GEMM_COMPLETE = {
     "filename": "flex_gemm-1.0.0+cu128torch2.8-cp311-cp311-win_amd64.whl",
     "urls": [
@@ -442,34 +445,54 @@ def _has_flex_gemm_triton() -> bool:
 
 
 def ensure_flex_gemm_triton():
-    """Replace flex_gemm if the installed build has no Triton kernels.
+    """Graft the Triton kernels into flex_gemm if the installed build lacks them.
 
     Pixal3D's sparse conv defaults to the 'masked_implicit_gemm_splitk' algorithm,
     which lives in flex_gemm.kernels.triton. Catching it here beats discovering it
     several minutes into a generation, in the shape decoder's upsample.
+
+    Only the missing pure-python subpackage is copied in, rather than swapping the
+    whole wheel: it imports nothing but math/torch/triton/typing, so it is
+    independent of which build produced the compiled kernels/cuda pyd next to it.
     """
     print("\n--- Checking flex_gemm Triton kernels ---")
     if _has_flex_gemm_triton():
         print("[OK] flex_gemm ships the Triton kernels.")
         return
 
-    print("Installed flex_gemm has no Triton kernels. Fetching a complete build...")
-    # Deliberately not whl/: a second copy of flex_gemm there would make the
-    # local-wheel loop install both, in filename order.
+    print("Installed flex_gemm has no Triton kernels. Fetching them...")
+    located = subprocess.run(
+        f'"{sys.executable}" -c "import torch, flex_gemm.kernels as k; print(k.__path__[0])"',
+        shell=True, capture_output=True, text=True
+    )
+    if located.returncode != 0:
+        raise InstallationError(f"Could not locate flex_gemm.kernels: {located.stderr.strip()}")
+    kernels_dir = Path(located.stdout.strip())
+
     tmp_dir = Path(tempfile.mkdtemp(prefix="pixal3d_flexgemm_"))
     try:
-        dest = tmp_dir / FLEX_GEMM_COMPLETE["filename"]
-        download_file(FLEX_GEMM_COMPLETE["urls"], dest, dest.name)
-        run_command_with_retry(f'pip install --no-deps "{dest}"', f"Installing {dest.name}")
+        wheel = tmp_dir / FLEX_GEMM_COMPLETE["filename"]
+        download_file(FLEX_GEMM_COMPLETE["urls"], wheel, wheel.name)
+
+        prefix = "flex_gemm/kernels/triton/"
+        with zipfile.ZipFile(str(wheel)) as zf:
+            members = [n for n in zf.namelist() if n.startswith(prefix) and not n.endswith("/")]
+            if not members:
+                raise InstallationError(f"{wheel.name} does not contain {prefix}")
+            for name in members:
+                target = kernels_dir / "triton" / name[len(prefix):]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(zf.read(name))
+        print(f"  Copied {len(members)} files into {kernels_dir / 'triton'}")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     if not _has_flex_gemm_triton():
         raise InstallationError(
-            "flex_gemm still has no Triton kernels after replacing the wheel. "
-            "Sparse convolution will fail during generation."
+            "flex_gemm still has no Triton kernels. Sparse convolution will fail "
+            "during generation."
         )
-    print("[OK] flex_gemm replaced; Triton kernels available.")
+    print("[OK] flex_gemm Triton kernels installed.")
 
 
 def install_pillow_simd(whl_dir: Path):
