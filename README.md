@@ -241,6 +241,10 @@ Views need not be RGBA — any view without an alpha channel is matted with the 
 
 > **The first frame is the main view and should be the canonical front view** (camera at `(0, -d, 0)` looking at the origin with world +Z up), since every other view is placed relative to it. `inference_mv.py` warns if it is not.
 
+#### Batches in little memory: the staged engine
+
+`pixal3d/staged/` makes a whole batch of props part by part (cut-out, features, each sampler, the decoders), with only the networks of the running part on the card and none resting in RAM, and gives the results of `run()` / `run_mv()` for the same picture, seed and settings. It is a library for a host application that supplies the file handling through hooks; its API, parts, memory rules and checks are described in [docs/staged_engine.md](docs/staged_engine.md).
+
 ### Web Demo
 
 We provide a Gradio web demo for Pixal3D, which allows you to generate 3D meshes from images interactively.
