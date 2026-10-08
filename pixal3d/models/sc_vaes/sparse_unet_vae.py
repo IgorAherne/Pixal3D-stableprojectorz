@@ -44,6 +44,15 @@ def cast_norm_rows(feats: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return out
 
 
+class SiLUOverInput(nn.SiLU):
+    """
+    SiLU that overwrites its input when gradients are off: the same values without a second table of that
+    size. For right after a layer whose output nobody else holds, such as the first Linear of an MLP.
+    """
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.silu(input, inplace=not torch.is_grad_enabled())
+
+
 def forget_neighbors(x: sp.SparseTensor) -> None:
     """
     Drop the convolutions' neighbour tables of x's level (the flex_gemm backend keeps them in the level's
@@ -326,7 +335,7 @@ class SparseConvNeXtBlock3d(nn.Module):
         self.conv = sp.SparseConv3d(channels, channels, 3)
         self.mlp = nn.Sequential(
             nn.Linear(channels, int(channels * mlp_ratio)),
-            nn.SiLU(),
+            SiLUOverInput(),
             zero_module(nn.Linear(int(channels * mlp_ratio), channels)),
         )
 
