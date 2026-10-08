@@ -303,6 +303,17 @@ class SparseResBlockC2S3d(nn.Module):
         if pred_subdiv:
             self.to_subdiv = sp.SparseLinear(channels, 8)
         self.updown = sp.SparseChannel2Spatial(2)
+        self.lean = False       # set through the decoder's `lean`
+
+    def trim(self) -> None:
+        """
+        With `lean` set, give PyTorch's unused blocks back to the driver. This block goes from the coarse
+        level's tables to ones four times their size: a fine table carved out of a block a coarse one left
+        behind strands the rest of that block, and under a memory cap the decode then fails with memory to
+        spare. No value depends on it.
+        """
+        if self.lean:
+            torch.cuda.empty_cache()
 
     def _forward(self, x: sp.SparseTensor, subdiv: sp.SparseTensor = None) -> sp.SparseTensor:
         if self.pred_subdiv:
@@ -312,11 +323,15 @@ class SparseResBlockC2S3d(nn.Module):
         h = self.conv1(h)
         if not torch.is_grad_enabled():
             forget_neighbors(x)     # conv1 is the last convolution on the coarse voxels
+        self.trim()
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
+        self.trim()
         x = self.updown(x, subdiv_binarized)
+        self.trim()
         h = h.replace(norm_rows(self.norm2, h.feats))
         h = h.replace(F.silu(h.feats))
+        self.trim()
         h = self.conv2(h)
         h = add_into(h, self.skip_connection(x))
         if self.pred_subdiv:
@@ -544,6 +559,21 @@ class SparseUnetVaeDecoder(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
+
+    @property
+    def lean(self) -> bool:
+        """
+        Whether PyTorch's cache is emptied between the levels and between the steps of the up-blocks (see
+        trim). Off by default; the staged engine sets it.
+        """
+        return self._lean
+
+    @lean.setter
+    def lean(self, value: bool) -> None:
+        self._lean = bool(value)
+        for module in self.modules():
+            if module is not self and hasattr(module, 'lean'):
+                module.lean = self._lean
 
     def trim(self) -> None:
         """
