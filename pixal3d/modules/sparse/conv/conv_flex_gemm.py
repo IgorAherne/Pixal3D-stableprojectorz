@@ -7,6 +7,9 @@ import flex_gemm
 from flex_gemm.ops.spconv import sparse_submanifold_conv3d
 
 
+BACKWARD_ONLY = ('valid_signal_i', 'valid_signal_o')    # of flex_gemm's neighbour cache
+
+
 def sparse_conv3d_init(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, padding=None, bias=True, indice_key=None):
     assert stride == 1 and (padding is None), 'Currently flex_gemm implementation only support submanifold sparse convolution (stride=1, padding=None)'
     
@@ -54,8 +57,13 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
     )
     
     if neighbor_cache is None:
+        if not torch.is_grad_enabled():
+            # Tables only the backward pass reads (about 120 bytes per voxel).
+            for name in BACKWARD_ONLY:
+                if hasattr(neighbor_cache_, name):
+                    delattr(neighbor_cache_, name)
         x.register_spatial_cache(neighbor_cache_key, neighbor_cache_)
-    
+
     out = x.replace(out)
     return out
 
