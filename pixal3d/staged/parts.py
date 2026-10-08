@@ -169,12 +169,11 @@ def _denormalised(slat: SparseTensor, normalization: dict) -> SparseTensor:
 
 
 def _steps(ctx: PartContext, prop: PropState, part: str, mode: str) -> Callable[[int, int], None]:
-    """A sampler's step callback: progress, the next prop's inputs on their way to the card (not when memory is
-    tight), and a cancel check point."""
+    """A sampler's step callback: progress, the next prop's inputs on their way to the card (when memory is
+    tight they wait for their prop's turn, and what was sent ahead comes back), and a cancel check point."""
     def callback(step: int, total: int) -> None:
         ctx.emit(Event("step", part, prop.id, step, total))
-        if mode == "normal":
-            ctx.store.pump()
+        ctx.store.pump(upload=mode == "normal")
         ctx.check()
 
     return callback
@@ -356,7 +355,7 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
     if request.request_hash:
         store.checkpoint(prop.id, request.request_hash,
                          {"coords": stored["coords"], "res": stored["res"], "shape_slat": shape_feats,
-                          "tex_slat": tex_feats}, dict(store.get_small(prop.id, "notes")))
+                          "tex_slat": tex_feats}, prop.noted(store.get_small(prop.id, "notes")))
 
 
 def decoders_fit(tokens: int, limit_mib: int) -> bool:
@@ -373,7 +372,7 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> None:
     resolution = int(stored["res"][0])
     shape_feats = store.get_small(prop.id, "shape_slat")["feats"].to(device)
     tex_feats = store.get_small(prop.id, "tex_slat")["feats"].to(device)
-    notes = dict(store.get_small(prop.id, "notes"))
+    notes = prop.noted(store.get_small(prop.id, "notes"))
     capped = mode != "uncapped"
 
     # Phase 1, the decoders. Weights go onto the card before anything else of the phase.

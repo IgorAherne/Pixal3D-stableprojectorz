@@ -124,6 +124,7 @@ class PropState:
     part: str = ""                  # the last part begun
     resumed: bool = False           # its latents came from a checkpoint: only "finish" runs
     views: int = 0                  # pictures the cut-out stored (image_0 ..)
+    slow: list = field(default_factory=list)        # parts that needed the memory cap lifted
     seconds: float = 0.0            # GPU-thread seconds of its own prop-parts
     resolution: int = 0             # the resolution used, known after "finish"
     result: dict | None = None      # what hooks.finish returned
@@ -140,6 +141,10 @@ class PropState:
     @property
     def over(self) -> bool:
         return self.state in ("done", "failed", "cancelled")
+
+    def noted(self, notes: dict) -> dict:
+        """The prop's notes as the hook and the checkpoint get them: with the parts that ran with the cap lifted."""
+        return {**notes, "slow": list(self.slow)}
 
 
 @dataclass
@@ -235,7 +240,7 @@ class StagedRunner:
                 prop.resumed = True
                 ctx.emit(Event("prop_resumed", "finish", prop.id))
             else:
-                store.put_small(prop.id, "notes", {"slow": []})
+                store.put_small(prop.id, "notes", {})
         for prop in self.props:
             if prop.kind == "mv" and not prop.resumed and not ctx.engine.multiview:
                 self._fail(prop, "", ("mv_missing", "The multi-view networks are not installed.", ""))
@@ -257,7 +262,7 @@ class StagedRunner:
         except KeyError:
             return False
         notes = dict(checkpoint.get("notes") or {})
-        notes["slow"] = list(notes.get("slow") or [])
+        prop.slow = list(notes.get("slow") or [])
         store = self.ctx.store
         store.put_small(prop.id, "coords_hr", {"coords": coords, "res": res})
         store.put_small(prop.id, "shape_slat", {"feats": shape_slat})
@@ -393,7 +398,7 @@ class StagedRunner:
             for mode in MODES:
                 if mode == "uncapped":
                     loader.clear_cap()
-                    self._note_slow(prop, part)
+                    prop.slow = [*(name for name in prop.slow if name != part), part]
                     ctx.emit(Event("prop_spilled", part, prop.id))
                 elif part != "finish":                  # "finish" sets its own cap, once per phase
                     loader.set_cap(NATIVE_RESERVE[part])
@@ -426,8 +431,7 @@ class StagedRunner:
             prop.state = "resting"
             ctx.emit(Event("prop_rest", part, prop.id))
             return
-        notes = store.get_small(prop.id, "notes")
-        prop.result = {**(prop.result or {}), "slow": list(notes.get("slow") or []), "seconds": prop.seconds,
+        prop.result = {**(prop.result or {}), "slow": list(prop.slow), "seconds": prop.seconds,
                        "resolution": prop.resolution, "resumed": prop.resumed}
         store.close_prop(prop.id)
         prop.state = "done"
@@ -436,12 +440,6 @@ class StagedRunner:
     def _discard(self, prop: PropState, keys: tuple[str, ...]) -> None:
         if keys:
             self.ctx.store.discard(prop.id, *keys)
-
-    def _note_slow(self, prop: PropState, part: str) -> None:
-        store = self.ctx.store
-        notes = dict(store.get_small(prop.id, "notes"))
-        notes["slow"] = [*(name for name in notes.get("slow") or [] if name != part), part]
-        store.put_small(prop.id, "notes", notes)
 
     def _fail(self, prop: PropState, part: str, failure: tuple[str, str, str]) -> None:
         kind, detail, trace = failure

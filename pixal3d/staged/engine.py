@@ -24,7 +24,6 @@ import json
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-import psutil
 import torch
 
 from ..pipelines import samplers
@@ -32,7 +31,6 @@ from . import parts
 from .runner import PartContext, PipelineArgs, StagedRunner
 from .types import EngineOptions, Event, Hooks, PropRequest
 
-MIB = 1 << 20
 # The engine's network names and the keys of a pipeline file's "models". The four flow networks exist once per
 # kind ("ss_flow.sv" from pipeline.json, "ss_flow.mv" from pipeline_mv.json); the decoders serve both kinds.
 FLOWS = {"ss_flow": "sparse_structure_flow_model", "lr_flow": "shape_slat_flow_model_512",
@@ -73,15 +71,6 @@ def _builder_file(name: str, build: Callable[[str], Any]) -> Path | None:
     file = {"rembg": Path(paths.rembg) / "model.safetensors", "moge": Path(paths.moge),
             "dino": Path(paths.dino) / "model.safetensors", "naf": Path(paths.naf_weights)}[name]
     return file if file.is_file() else None
-
-
-def _store_sizes(ram_mib: int | None) -> tuple[int, int]:
-    """(RAM cache of the store, size of one of its pinned slots) in MiB: smaller on a PC with 16 GiB or less."""
-    total = psutil.virtual_memory().total // MIB
-    small = total <= 16 * 1024 + 512
-    if ram_mib is None:
-        ram_mib = 256 if small else min(768, total * 5 // 100)
-    return ram_mib, 128 if small else 256
 
 
 class StagedEngine:
@@ -137,9 +126,9 @@ class StagedEngine:
         store_factory = self._store_factory
         if store_factory is None:
             from .store import PropStore as store_factory
-        ram_mib, slot_mib = _store_sizes(self.options.store_ram_mib)
-        store = store_factory(Path(work_dir), self.device, ram_mib=ram_mib, slots=2, slot_mib=slot_mib,
-                              on_event=self._relay)
+        # None for a size: the store's own choice for this PC (smaller on one with 16 GiB of RAM or less)
+        store = store_factory(Path(work_dir), self.device, ram_mib=self.options.store_ram_mib, slots=2,
+                              slot_mib=None, on_event=self._relay)
         ctx = PartContext(engine=self, loader=self.loader, store=store, hooks=self.hooks, options=self.options,
                           emit=on_event, cancelled=cancelled, pipeline_args=self.pipeline_args, device=self.device)
         self._store, self._ctx, self._on_event = store, ctx, on_event

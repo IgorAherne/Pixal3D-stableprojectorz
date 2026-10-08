@@ -107,7 +107,7 @@ Everything a prop needs later lies in the batch's `PropStore`, under the prop's 
 
 | key | content |
 |---|---|
-| `request`, `notes` | the request's numbers; `{"slow": [...], "ss_retries", "ss_blocked", ...}` |
+| `request`, `notes` | the request's numbers; what the hooks noted (`ss_retries`, `ss_blocked`, ...). The finish hook and the checkpoint get the notes with `slow`: the parts that ran with the cap lifted |
 | `image_<i>`, `prep` | the prepared pictures (PIL); `{"meta": ..., "camera": {...}}` |
 | `dino512`, `dino1024` | `z` [V,1029,1024] / [V,4101,1024] float32: DINOv3's tokens, computed once per input size |
 | `cond_ss` | `global` [1,5,1024], `proj` [1,4096,1024] bfloat16 |
