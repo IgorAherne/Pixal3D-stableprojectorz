@@ -1,12 +1,16 @@
 """NAF (the guided feature upsampler) one attention head at a time, read only where the caller needs it.
 
-`naf(image, lr_features, target_size)` builds the whole upsampled map [B, C, T, T] - 4 GiB at T = 1024 for DINOv3's
-1024 channels, next to as much again for the enlarged values and 5 GiB for the position rotation of the guide - and
-the caller then reads a few thousand points of it. NAF's heads do not see each other: the rotation (RoPE) is
-element-wise with the same angles for every head, the keys are an average pool per channel, the values are copied
-by a nearest resize, and the attention kernel works a head at a time. So `naf_sampled` runs RoPE, the key pool, the
-resize and the attention for one head, hands that head's map [B, C / heads, T, T] to `sample` and keeps only what
-`sample` returns. The numbers are those of the whole call; a quarter of the map exists at any time.
+`naf(image, lr_features, target_size)` builds the whole upsampled map [B, C, T, T] and the caller then reads a few
+thousand points of it. At T = 1024 with DINOv3's 1024 channels that call takes 12.4 GiB on the card: the map is
+4 GiB, the values enlarged to its size another 4, the queries and the keys 1 GiB each in two layouts; before that,
+the position rotation (RoPE) of the guide's map holds 4.9 GiB.
+
+NAF's heads do not see each other: the rotation is element-wise with the same angles for every head, the keys are
+an average pool per channel, the values are copied by a nearest resize, and the attention kernel works a head at a
+time. So `naf_sampled` runs RoPE, the key pool, the resize and the attention for one head, hands that head's map
+[B, C / heads, T, T] to `sample` and keeps only what `sample` returns. The values are those of the whole call, bit
+for bit; the largest moment is one head's attention - at T = 1024 the guide's map (1 GiB), that head's queries and
+keys (0.25 GiB each), its values and its output (1 GiB each).
 """
 
 from __future__ import annotations
