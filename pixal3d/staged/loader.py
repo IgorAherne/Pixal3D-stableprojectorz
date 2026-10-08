@@ -299,22 +299,32 @@ class NetworkLoader:
         self._emit("net_load", name=name, bytes_read=0, bytes=size)
 
         buffer = _staging_buffer(self.device.type == "cuda")
+        # Tensors the model keeps in another dtype than the file's (the flows: fp32 to bf16) are cast on the
+        # device. They all pass through ONE block there, taken before any weight: uploaded into blocks of their
+        # own they would leave a hole behind every kept tensor (165 MiB of holes in a flow model).
+        passing = max((header[key].nbytes for key in keys if header[key].torch_dtype != want[key][0]
+                       and header[key].nbytes <= buffer.numel()), default=0)
+        scratch = torch.empty(passing, dtype=torch.uint8, device=self.device) if passing else None
         done, told = 0, time.monotonic()
         reader = stfile.iter_tensors(source.file, buffer, keys)
         try:
             for key, info, data in reader:
-                if isinstance(data, torch.Tensor):
-                    tensor = data.to(self.device, copy=True)        # blocking: the buffer is free again at once
-                else:
+                cast = info.torch_dtype != want[key][0]
+                if not isinstance(data, torch.Tensor):              # larger than the buffer: piece by piece
                     flat = torch.empty(info.nbytes, dtype=torch.uint8, device=self.device)
                     at = 0
                     for piece in data:
                         flat[at:at + piece.numel()].copy_(piece)
                         at += piece.numel()
                     tensor = stfile.as_tensor(flat, info)
-                if tensor.dtype != want[key][0]:
-                    tensor = tensor.to(want[key][0])                # cast on the device (the flows: fp32 to bf16)
-                state[key] = tensor
+                elif cast and info.nbytes:
+                    tensor = stfile.as_tensor(scratch[:info.nbytes], info)
+                    tensor.copy_(data)
+                else:
+                    tensor = data.to(self.device, copy=True)
+                if cast:
+                    tensor = tensor.to(want[key][0])
+                state[key] = tensor                                 # the copies block: the buffer is free again
                 done += info.nbytes
                 now = time.monotonic()
                 if now - told >= 1.0:
