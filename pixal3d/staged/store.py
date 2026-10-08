@@ -1076,21 +1076,20 @@ class PropStore:
     def _verified(self, folder: Path, request_hash: str) -> dict | None:
         """The checkpoint in a prop's folder when it is the one of this request and whole: its notes, its size and
         the bytes a buffer needs to hold its tensors."""
-        data = folder / f"{CHECKPOINT}.safetensors"
+        data, text = folder / f"{CHECKPOINT}.safetensors", folder / f"{CHECKPOINT}.json"
         try:
-            record = json.loads((folder / f"{CHECKPOINT}.json").read_text(encoding="utf-8"))
+            record = json.loads(text.read_text(encoding="utf-8"))
             if not isinstance(record, dict) or record.get("request_hash") != request_hash:
                 return None
             size = os.path.getsize(data)
             if record.get("bytes") != size or record.get("sha256") != _sha256(data):
                 return None
-            header = stfile.read_header(data)
-        except (OSError, ValueError, KeyError):
+            need = sum(_aligned(info.end - info.start) for info in stfile.read_header(data).values())
+            notes = record.get("notes")
+            return {"notes": notes if isinstance(notes, dict) else {}, "bytes": size + os.path.getsize(text),
+                    "need": need}
+        except Exception:                               # whatever is wrong with it: it is not a checkpoint to trust
             return None
-        notes = record.get("notes")
-        return {"notes": notes if isinstance(notes, dict) else {}, "bytes": size + os.path.getsize(
-                    folder / f"{CHECKPOINT}.json"),
-                "need": sum(_aligned(info.end - info.start) for info in header.values())}
 
     def _clear(self, folder: Path, keep: tuple[str, ...] = ()) -> list[str]:
         """Delete the store's files in a prop's folder (but `keep`), then the folder when nothing is left in it.
