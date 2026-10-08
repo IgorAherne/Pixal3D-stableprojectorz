@@ -30,9 +30,11 @@ Events (`on_event`, called on the loading thread, must not block), all plain dic
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import gc
 import itertools
 import json
+import os
 import threading
 import time
 import traceback
@@ -61,6 +63,7 @@ COMPUTED: dict[str, frozenset[str]] = {}
 
 _staging: dict[bool, torch.Tensor] = {}
 _staging_pinned_bytes = 0
+_driver_cards: dict[int, Any] = {}  # card index -> (NVML library, its handle of the card), None: cannot be asked
 
 
 @dataclass
@@ -138,6 +141,7 @@ class NetworkLoader:
                 module.requires_grad_(False)
                 if self.device.type == "cuda":
                     torch.cuda.synchronize(self.device)
+                    torch.cuda.empty_cache()            # the blocks the file's fp32 tensors passed through
         except BaseException as error:
             module = None
             state.clear()
@@ -182,12 +186,19 @@ class NetworkLoader:
         """Limit what PyTorch may reserve to what the card has free right now, less `native_reserve_mib` (memory
         the coming work takes outside PyTorch's allocator) and the safety margin. PyTorch then reuses its cache
         before it grows and raises torch.OutOfMemoryError instead of spilling into shared memory. Returns the
-        MiB PyTorch may reserve from now on."""
+        MiB PyTorch may reserve from now on.
+
+        "Free" is the smaller of two figures. CUDA's own (mem_get_info) is, under Windows, what the system grants
+        this process: it does not move when another program fills the card. The driver's (NVML, what nvidia-smi
+        shows) counts every program. Where the driver cannot be asked, CUDA's figure stands alone."""
         if self.device.type != "cuda":
             return 0
         safety = self.safety_mib if safety_mib is None else safety_mib
         card = self._card()
         free, total = torch.cuda.mem_get_info(card)
+        seen = _driver_free(card)
+        if seen is not None:
+            free = min(free, seen)
         budget = free + torch.cuda.memory_reserved(card) - (safety + native_reserve_mib) * MIB
         if self.max_vram_mib:
             budget = min(budget, (self.max_vram_mib - CONTEXT_MIB - safety - native_reserve_mib) * MIB)
@@ -376,6 +387,49 @@ def _on_meta(model: nn.Module) -> list[str]:
     """Names of the parameters and buffers that have no memory."""
     return [name for name, tensor in itertools.chain(model.named_parameters(), model.named_buffers())
             if tensor.is_meta]
+
+
+class _DriverMemory(ctypes.Structure):
+    """NVML's nvmlMemory_t, in bytes."""
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+
+def _driver_free(card: int) -> int | None:
+    """Bytes free on the card as the driver counts them over all programs (NVML), or None when it cannot be
+    asked: no NVML library, or more than one card and none with this card's UUID."""
+    if card not in _driver_cards:
+        _driver_cards[card] = _driver_card(card)
+    if _driver_cards[card] is None:
+        return None
+    library, handle = _driver_cards[card]
+    memory = _DriverMemory()
+    if library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)) != 0:
+        return None
+    return int(memory.free)
+
+
+def _driver_card(card: int) -> tuple[Any, Any] | None:
+    """NVML and its handle of the card CUDA numbers `card`: found by the card's UUID (the two number cards in
+    different orders), or the only card there is."""
+    try:
+        if os.name == "nt":
+            system = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "nvml.dll"
+            library = ctypes.WinDLL(str(system) if system.is_file() else "nvml.dll")
+        else:
+            library = ctypes.CDLL("libnvidia-ml.so.1")
+        if library.nvmlInit_v2() != 0:
+            return None
+        handle, count = ctypes.c_void_p(), ctypes.c_uint(0)
+        uuid = getattr(torch.cuda.get_device_properties(card), "uuid", None)
+        if uuid is not None and library.nvmlDeviceGetHandleByUUID(f"GPU-{uuid}".encode("ascii"),
+                                                                  ctypes.byref(handle)) == 0:
+            return library, handle
+        if (library.nvmlDeviceGetCount_v2(ctypes.byref(count)) == 0 and count.value == 1
+                and library.nvmlDeviceGetHandleByIndex_v2(ctypes.c_uint(0), ctypes.byref(handle)) == 0):
+            return library, handle
+    except (OSError, AttributeError):
+        pass
+    return None
 
 
 def _staging_buffer(pinned: bool) -> torch.Tensor:
