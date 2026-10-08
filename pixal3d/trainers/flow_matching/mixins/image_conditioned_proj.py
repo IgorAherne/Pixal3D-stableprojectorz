@@ -21,6 +21,10 @@ from ....utils.dist_utils import read_file_dist
 from ....utils.local_models import resolve_local_model
 
 
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
 # =============================================================================
 # Projection Utilities
 # =============================================================================
@@ -185,7 +189,8 @@ class ProjGrid(nn.Module):
         distance: torch.Tensor,
         mesh_scale: torch.Tensor,
         transform_matrix: Optional[torch.Tensor] = None,
-        BHWC: bool = True
+        BHWC: bool = True,
+        point_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Project 3D grid points to image and sample features.
@@ -197,9 +202,11 @@ class ProjGrid(nn.Module):
             mesh_scale: Mesh scale factor, shape [B]
             transform_matrix: Optional camera transform matrix, shape [B, 4, 4]
             BHWC: Whether features_map is in BHWC format
+            point_index: Optional rows of the grid to sample, shape [K]: (x * R + y) * R + z for
+                the grid point (x, y, z); the features are then read at those K points only
             
         Returns:
-            Projected features, shape [B, grid_resolution³, C]
+            Projected features, shape [B, grid_resolution³, C] ([B, K, C] with point_index)
         """
         if BHWC:
             B, H, W, C = features_map.shape
@@ -222,6 +229,8 @@ class ProjGrid(nn.Module):
         
         # Normalize to [-1, 1] for grid_sample
         image_points_norm = (image_points + 0.5) / self.image_resolution * 2 - 1
+        if point_index is not None:
+            image_points_norm = image_points_norm[:, point_index]
         
         if BHWC:
             features_map = features_map.permute(0, 3, 1, 2)  # [B, C, H, W]
@@ -360,6 +369,7 @@ class ProjGridMV(ProjGrid):
         mesh_scale: torch.Tensor,
         transform_matrix: Optional[torch.Tensor] = None,
         BHWC: bool = True,
+        point_index: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if BHWC:
             B, H, W, C = features_map.shape
@@ -381,6 +391,8 @@ class ProjGridMV(ProjGrid):
         )
 
         image_points_norm = (image_points + 0.5) / self.image_resolution * 2 - 1
+        if point_index is not None:
+            image_points_norm = image_points_norm[:, point_index]
 
         if BHWC:
             features_map = features_map.permute(0, 3, 1, 2)  # [B, C, H, W]
@@ -435,6 +447,272 @@ def compute_relative_calc_mat(
 
 
 # =============================================================================
+# From DINOv3 Tokens to View-Aligned Features
+# =============================================================================
+# The steps of the two extractors below as functions, so that a caller who already
+# holds DINOv3's tokens (pipelines/proj_cond.py) runs exactly what the extractors run.
+
+def pictures_to_tensor(images: List[Image.Image], size: int) -> torch.Tensor:
+    """
+    PIL images as one batch, resized to the extractor's input size.
+
+    Args:
+        images: list of PIL images
+        size: side of the square the images are resized to (LANCZOS)
+
+    Returns:
+        torch.Tensor, shape [B, 3, size, size], float32 in [0, 1], on the CPU
+    """
+    images = [i.resize((size, size), Image.LANCZOS) for i in images]
+    images = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in images]
+    images = [torch.from_numpy(i).permute(2, 0, 1).float() for i in images]
+    return torch.stack(images)
+
+
+def dino_tokens(model: nn.Module, image: torch.Tensor) -> torch.Tensor:
+    """
+    DINOv3's tokens after the final layer norm.
+
+    Args:
+        model: DINOv3ViTModel
+        image: ImageNet-normalized images, shape [B, 3, H, W]
+
+    Returns:
+        torch.Tensor, shape [B, 1 + num_register_tokens + num_patches, D]
+    """
+    image = image.to(model.embeddings.patch_embeddings.weight.dtype)
+    hidden_states = model.embeddings(image, bool_masked_pos=None)
+    position_embeddings = model.rope_embeddings(image)
+
+    for layer_module in model.layer:
+        hidden_states = layer_module(
+            hidden_states,
+            position_embeddings=position_embeddings,
+        )
+
+    return F.layer_norm(hidden_states, hidden_states.shape[-1:])
+
+
+def split_tokens(z: torch.Tensor, num_reg: int, patch_number: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Split DINOv3's tokens into the global tokens and the patch tokens as a map.
+
+    Args:
+        z: tokens, shape [B, 1 + num_reg + patch_number², D]
+        num_reg: number of register tokens
+        patch_number: patches per image side
+
+    Returns:
+        z_global: CLS + register tokens, shape [B, 1 + num_reg, D]
+        z_patchtokens_spatial: shape [B, patch_number, patch_number, D]
+    """
+    z_clstoken = z[:, 0:1]  # [B, 1, D]
+    z_regtokens = z[:, 1:1 + num_reg]  # [B, num_reg, D]
+    z_patchtokens = z[:, 1 + num_reg:]  # [B, num_patches, D]
+    z_patchtokens_spatial = z_patchtokens.reshape(
+        z.shape[0], patch_number, patch_number, -1
+    )  # [B, h, w, D]
+    z_global = torch.cat([z_clstoken, z_regtokens], dim=1)  # [B, 1+num_reg, D]
+    return z_global, z_patchtokens_spatial
+
+
+def project_view(
+    proj_grid: ProjGrid,
+    z_patchtokens_spatial: torch.Tensor,
+    camera_angle_x: torch.Tensor,
+    distance: torch.Tensor,
+    mesh_scale: torch.Tensor,
+    transform_matrix: Optional[torch.Tensor] = None,
+    image_for_naf: Optional[torch.Tensor] = None,
+    naf_model: Optional[nn.Module] = None,
+    naf_target_size: Optional[Tuple[int, int]] = None,
+    point_index: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    View-aligned features of one batch of images: DINOv3's patch map sampled at the
+    grid's points and, with a NAF model, NAF's upsampled map sampled at the same points.
+
+    Args:
+        proj_grid: ProjGrid (or ProjGridMV when transform_matrix is given)
+        z_patchtokens_spatial: DINOv3 patch tokens, shape [B, h, w, D]
+        camera_angle_x: Camera FOV angle, shape [B]
+        distance: Camera distance, shape [B]
+        mesh_scale: Mesh scale factor, shape [B]
+        transform_matrix: Optional camera transform matrix, shape [B, 4, 4]
+        image_for_naf: NAF's guide, the unnormalized image [B, 3, H, W] in [0, 1]
+        naf_model: NAF upsampler; None for the low-resolution branch alone
+        naf_target_size: Target spatial size for NAF upsampling (H', W')
+        point_index: Optional rows of the grid to sample, shape [K]
+
+    Returns:
+        torch.Tensor, shape [B, K, D] without NAF or [B, K, 2D] with it (concat of lr and hr),
+        K = grid_resolution³ unless point_index is given
+    """
+    # --- Low-resolution branch: sample from DINOv3 patch feature map ---
+    z_proj_lr = proj_grid(
+        z_patchtokens_spatial,
+        camera_angle_x,
+        distance,
+        mesh_scale,
+        transform_matrix,
+        point_index=point_index,
+    )  # [B, K, D]
+    if naf_model is None:
+        return z_proj_lr
+
+    # --- High-resolution branch (NAF): upsample then sample ---
+    # NAF expects: guide [B, 3, H, W], lr_features [B, C, h, w], target_size (H', W')
+    lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)  # [B, D, h, w]
+    hr_features = naf_model(
+        image_for_naf, lr_features_bchw, naf_target_size
+    )  # [B, D, H', W']
+
+    # Sample from high-res feature map using same projection coordinates
+    z_proj_hr = proj_grid(
+        hr_features,
+        camera_angle_x,
+        distance,
+        mesh_scale,
+        transform_matrix,
+        BHWC=False,  # hr_features is [B, C, H', W']
+        point_index=point_index,
+    )  # [B, K, D]
+
+    # Concatenate lr and hr: [B, K, D*2]
+    return torch.cat([z_proj_lr, z_proj_hr], dim=-1)
+
+
+def tokens_to_features(
+    proj_grid: ProjGrid,
+    z: torch.Tensor,
+    num_reg: int,
+    patch_number: int,
+    camera_angle_x: torch.Tensor,
+    distance: torch.Tensor,
+    mesh_scale: torch.Tensor,
+    transform_matrix: Optional[torch.Tensor] = None,
+    image_for_naf: Optional[torch.Tensor] = None,
+    naf_model: Optional[nn.Module] = None,
+    naf_target_size: Optional[Tuple[int, int]] = None,
+    point_index: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    What DinoV3ProjFeatureExtractor returns, from DINOv3's tokens of its images.
+
+    Args:
+        z: DINOv3 tokens, shape [B, 1 + num_reg + patch_number², D]
+        (the others as in project_view)
+
+    Returns:
+        Tuple of (global_features [B, 1 + num_reg, D], proj_features [B, K, D or 2D])
+    """
+    z_global, z_patchtokens_spatial = split_tokens(z, num_reg, patch_number)
+    z_proj = project_view(
+        proj_grid, z_patchtokens_spatial, camera_angle_x, distance, mesh_scale, transform_matrix,
+        image_for_naf=image_for_naf, naf_model=naf_model, naf_target_size=naf_target_size,
+        point_index=point_index,
+    )
+    return z_global, z_proj
+
+
+def view_tokens_to_features(
+    proj_grid: ProjGridMV,
+    z: torch.Tensor,
+    num_reg: int,
+    patch_number: int,
+    camera_angle_x: torch.Tensor,
+    distance: torch.Tensor,
+    mesh_scale: torch.Tensor,
+    transform_matrix: torch.Tensor,
+    image_for_naf: Optional[torch.Tensor] = None,
+    naf_model: Optional[nn.Module] = None,
+    naf_target_size: Optional[Tuple[int, int]] = None,
+    multiview_fusion: str = "average",
+    point_index: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    What DinoV3ProjMultiViewFeatureExtractor returns, from DINOv3's tokens of all views.
+
+    Args:
+        proj_grid: ProjGridMV
+        z: DINOv3 tokens of the flattened views, shape [B*V, 1 + num_reg + patch_number², D]
+        camera_angle_x: [B, V]
+        distance: [B, V]
+        mesh_scale: [B]
+        transform_matrix: [B, V, 4, 4] (c2w, index 0 = main view)
+        image_for_naf: NAF's guide, the flattened unnormalized views [B*V, 3, H, W]
+        naf_model: NAF upsampler; None for the low-resolution branch alone
+        naf_target_size: Target spatial size for NAF upsampling (H', W')
+        multiview_fusion: "average" or "attention" (see DinoV3ProjMultiViewFeatureExtractor)
+        point_index: Optional rows of the grid to sample, shape [K]
+
+    Returns:
+        (z_global, z_proj) — shapes depend on multiview_fusion; K rows instead of R^3 with point_index.
+    """
+    B, V = transform_matrix.shape[:2]
+
+    # Compute per-view calc_mat = F @ inv(C_0) @ C_i  -> [B, V, 4, 4]
+    calc_mat = compute_relative_calc_mat(
+        transform_matrix, distance, proj_grid.front_view_transform_matrix
+    )
+
+    z_global_all, z_patchtokens_spatial = split_tokens(z, num_reg, patch_number)
+
+    camera_angle_x_flat = camera_angle_x.reshape(B * V)
+    distance_flat = distance.reshape(B * V)
+    # mesh_scale is shared per object -> expand to per-view then flatten.
+    mesh_scale_flat = mesh_scale[:, None].expand(B, V).reshape(B * V)
+    calc_mat_flat = calc_mat.reshape(B * V, 4, 4)
+
+    # Project each view (loop over V to bound peak memory).
+    # A per-view projection is [B, R^3, C], which at R=64 / C=2048 is 2 GiB
+    # in fp32. Averaging accumulates in place so peak stays at one view
+    # instead of growing with V (a list + stack would cost 2*V*2 GiB, i.e.
+    # ~40 GiB at V=9, which both starves the denoiser and makes the step's
+    # peak depend on N -- something the elastic memory controller models
+    # purely from token count and therefore mispredicts).
+    fuse_by_average = multiview_fusion == "average"
+    z_proj_acc = None                     # average: running sum
+    per_view_proj = [] if not fuse_by_average else None  # attention: keep V
+    for v in range(V):
+        idx = torch.arange(v, B * V, V, device=z.device)
+        z_view = project_view(
+            proj_grid,
+            z_patchtokens_spatial[idx],
+            camera_angle_x_flat[idx],
+            distance_flat[idx],
+            mesh_scale_flat[idx],
+            calc_mat_flat[idx],
+            image_for_naf=image_for_naf[idx] if naf_model is not None else None,
+            naf_model=naf_model,
+            naf_target_size=naf_target_size,
+            point_index=point_index,
+        )  # [B, K, C]
+        if fuse_by_average:
+            if z_proj_acc is None:
+                # Without NAF the projection is a permuted view, so make the
+                # accumulator contiguous before adding into it in place.
+                z_proj_acc = z_view.contiguous()
+            else:
+                z_proj_acc.add_(z_view)
+                del z_view
+        else:
+            per_view_proj.append(z_view)
+
+    # z_global per view: [B, V, 1+num_reg, D]
+    z_global_all = z_global_all.reshape(B, V, z_global_all.shape[-2], z_global_all.shape[-1])
+
+    if fuse_by_average:
+        z_proj = z_proj_acc.div_(V)                             # [B, K, C]
+        z_global = z_global_all.mean(dim=1)                     # [B, 1+num_reg, D]
+    else:  # attention
+        z_proj = torch.stack(per_view_proj, dim=2)  # [B, K, V, C]
+        z_global = z_global_all.reshape(B, V * z_global_all.shape[2], z_global_all.shape[3])
+
+    return z_global, z_proj
+
+
+# =============================================================================
 # DINOv3 Feature Extractor with Projection
 # =============================================================================
 
@@ -457,6 +735,8 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         grid_resolution: Resolution of the 3D projection grid (default: 16)
         use_naf_upsample: Whether to use NAF to upsample features (default: False)
         naf_target_size: Target spatial size for NAF upsampling (default: [128, 128])
+        model: A DINOv3ViTModel to use instead of loading model_name (several extractors
+            can then share one copy of the weights)
     """
     def __init__(
         self, 
@@ -465,6 +745,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         grid_resolution: int = 16,
         use_naf_upsample: bool = False,
         naf_target_size: Optional[List[int]] = None,
+        model: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.model_name = model_name
@@ -480,14 +761,16 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         
         # Load DINOv3 model (frozen, no trainable params in this module).
         # Prefer the copy bundled in MODELS/dinov3 over the HuggingFace mirror.
-        target_path, use_local = resolve_local_model(model_name, "dinov3")
-        self.model = DINOv3ViTModel.from_pretrained(target_path, local_files_only=use_local)
+        if model is None:
+            target_path, use_local = resolve_local_model(model_name, "dinov3")
+            model = DINOv3ViTModel.from_pretrained(target_path, local_files_only=use_local)
+        self.model = model
         self.model.eval()
         self.model.requires_grad_(False)
         
         # Image transform (only normalize, no resize - assume already resized)
         self.transform = transforms.Compose([
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ])
         
         # Get patch info
@@ -548,17 +831,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
     
     def extract_features(self, image: torch.Tensor) -> torch.Tensor:
         """Extract features using DINOv3."""
-        image = image.to(self.model.embeddings.patch_embeddings.weight.dtype)
-        hidden_states = self.model.embeddings(image, bool_masked_pos=None)
-        position_embeddings = self.model.rope_embeddings(image)
-
-        for layer_module in self.model.layer:
-            hidden_states = layer_module(
-                hidden_states,
-                position_embeddings=position_embeddings,
-            )
-
-        return F.layer_norm(hidden_states, hidden_states.shape[-1:])
+        return dino_tokens(self.model, image)
     
     def forward(
         self,
@@ -567,6 +840,7 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         distance: Optional[torch.Tensor] = None,
         mesh_scale: Optional[torch.Tensor] = None,
         transform_matrix: Optional[torch.Tensor] = None,
+        point_index: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Extract view-aligned features from the image.
@@ -577,11 +851,14 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             distance: Camera distance [B]
             mesh_scale: Mesh scale factor [B]
             transform_matrix: Optional camera transform matrix [B, 4, 4]
+            point_index: Optional rows of the projection grid [K]; the proj features are
+                then extracted at those K grid points only
         
         Returns:
             Tuple of (global_features, proj_features):
             - global_features: [B, num_global_tokens, embed_dim]
-            - proj_features: [B, grid_resolution³, proj_channels]
+            - proj_features: [B, grid_resolution³, proj_channels] ([B, K, proj_channels]
+              with point_index)
               where proj_channels = embed_dim (no NAF) or embed_dim*2 (with NAF)
         """
         # Handle input types
@@ -589,18 +866,12 @@ class DinoV3ProjFeatureExtractor(nn.Module):
             assert image.ndim == 4, "Image tensor should be batched (B, C, H, W)"
         elif isinstance(image, list):
             assert all(isinstance(i, Image.Image) for i in image), "Image list should be list of PIL images"
-            image = [i.resize((self.image_size, self.image_size), Image.LANCZOS) for i in image]
-            image = [np.array(i.convert('RGB')).astype(np.float32) / 255 for i in image]
-            image = [torch.from_numpy(i).permute(2, 0, 1).float() for i in image]
-            image = torch.stack(image).cuda()
+            image = pictures_to_tensor(image, self.image_size).cuda()
         else:
             raise ValueError(f"Unsupported type of image: {type(image)}")
         
-        B = image.shape[0]
-        
         # Keep a copy of the unnormalized image for NAF guide
-        if self.use_naf_upsample:
-            image_for_naf = image.clone()  # [B, 3, H, W], in [0, 1] range
+        image_for_naf = image.clone() if self.use_naf_upsample else None  # [B, 3, H, W], in [0, 1] range
         
         # Apply transform (ImageNet normalization)
         image = self.transform(image)
@@ -609,55 +880,28 @@ class DinoV3ProjFeatureExtractor(nn.Module):
         with torch.no_grad():
             z = self.extract_features(image)
             
-            # Split into CLS token, register tokens, and patch tokens
-            z_clstoken = z[:, 0:1]  # [B, 1, D]
-            num_reg = getattr(self.model.config, 'num_register_tokens', 4)
-            z_regtokens = z[:, 1:1+num_reg]  # [B, num_reg, D]
-            z_patchtokens = z[:, 1+num_reg:]  # [B, num_patches, D]
-            
-            # Reshape patch tokens to spatial grid: [B, h, w, D]
-            z_patchtokens_spatial = z_patchtokens.reshape(
-                B, self.patch_number, self.patch_number, -1
-            )  # [B, h, w, D]
-            
             if camera_angle_x is None or distance is None or mesh_scale is None:
                 raise ValueError("camera_angle_x, distance, and mesh_scale must be provided")
-            
-            # --- Low-resolution branch: sample from DINOv3 patch feature map ---
-            z_proj_lr = self.proj_grid(
-                z_patchtokens_spatial, 
-                camera_angle_x, 
-                distance, 
-                mesh_scale,
-                transform_matrix
-            )  # [B, grid_res³, D]
-            
-            # --- High-resolution branch (NAF): upsample then sample ---
+
             if self.use_naf_upsample:
                 self._load_naf()
-                # NAF expects: guide [B, 3, H, W], lr_features [B, C, h, w], target_size (H', W')
-                lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)  # [B, D, h, w]
-                hr_features = self.naf_model(
-                    image_for_naf, lr_features_bchw, self.naf_target_size
-                )  # [B, D, H', W']
-                
-                # Sample from high-res feature map using same projection coordinates
-                z_proj_hr = self.proj_grid(
-                    hr_features,
-                    camera_angle_x,
-                    distance,
-                    mesh_scale,
-                    transform_matrix,
-                    BHWC=False  # hr_features is [B, C, H', W']
-                )  # [B, grid_res³, D]
-                
-                # Concatenate lr and hr: [B, grid_res³, D*2]
-                z_proj = torch.cat([z_proj_lr, z_proj_hr], dim=-1)
-            else:
-                z_proj = z_proj_lr  # [B, grid_res³, D]
-                
-            # Combine global tokens
-            z_global = torch.cat([z_clstoken, z_regtokens], dim=1)  # [B, 1+num_reg, D]
+
+            # CLS + register tokens, and the patch tokens projected to the 3D grid
+            # (lr: DINOv3's patch map; hr with NAF: its upsampled map; concatenated)
+            z_global, z_proj = tokens_to_features(
+                self.proj_grid,
+                z,
+                getattr(self.model.config, 'num_register_tokens', 4),
+                self.patch_number,
+                camera_angle_x,
+                distance,
+                mesh_scale,
+                transform_matrix,
+                image_for_naf=image_for_naf,
+                naf_model=self.naf_model if self.use_naf_upsample else None,
+                naf_target_size=self.naf_target_size,
+                point_index=point_index,
+            )
         
         # proj_linear has been moved to per-block ProjectAttention
         # z_proj stays in proj_channels, each block will project independently
@@ -737,22 +981,6 @@ class DinoV3ProjMultiViewFeatureExtractor(DinoV3ProjFeatureExtractor):
             image_resolution=self.image_size,
         )
 
-    def _project_single_view(self, z_patchtokens_spatial, image_for_naf,
-                             camera_angle_x_v, distance_v, mesh_scale_v, calc_mat_v):
-        """Project one view's DINOv3 features to the 3D grid. Returns [b, R^3, C]."""
-        z_proj_lr = self.proj_grid(
-            z_patchtokens_spatial, camera_angle_x_v, distance_v, mesh_scale_v, calc_mat_v
-        )
-        if self.use_naf_upsample:
-            self._load_naf()
-            lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)
-            hr_features = self.naf_model(image_for_naf, lr_features_bchw, self.naf_target_size)
-            z_proj_hr = self.proj_grid(
-                hr_features, camera_angle_x_v, distance_v, mesh_scale_v, calc_mat_v, BHWC=False
-            )
-            return torch.cat([z_proj_lr, z_proj_hr], dim=-1)  # [b, R^3, 2D]
-        return z_proj_lr  # [b, R^3, D]
-
     def forward(
         self,
         image: torch.Tensor,
@@ -760,6 +988,7 @@ class DinoV3ProjMultiViewFeatureExtractor(DinoV3ProjFeatureExtractor):
         distance: Optional[torch.Tensor] = None,
         mesh_scale: Optional[torch.Tensor] = None,
         transform_matrix: Optional[torch.Tensor] = None,
+        point_index: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -768,6 +997,8 @@ class DinoV3ProjMultiViewFeatureExtractor(DinoV3ProjFeatureExtractor):
             distance: [B, V]
             mesh_scale: [B]
             transform_matrix: [B, V, 4, 4] (c2w, index 0 = main view)
+            point_index: Optional rows of the projection grid [K]; z_proj then has
+                those K grid points instead of all R^3
         Returns:
             (z_global, z_proj) — shapes depend on multiview_fusion (see class doc).
         """
@@ -776,75 +1007,33 @@ class DinoV3ProjMultiViewFeatureExtractor(DinoV3ProjFeatureExtractor):
         if camera_angle_x is None or distance is None or mesh_scale is None or transform_matrix is None:
             raise ValueError("camera_angle_x, distance, mesh_scale, transform_matrix must be provided")
 
-        # Compute per-view calc_mat = F @ inv(C_0) @ C_i  -> [B, V, 4, 4]
-        calc_mat = compute_relative_calc_mat(
-            transform_matrix, distance, self.proj_grid.front_view_transform_matrix
-        )
-
         # Flatten B*V and run DINOv3 once.
         img_flat = image.reshape(B * V, *image.shape[2:])  # [B*V, 3, H, W]
-        if self.use_naf_upsample:
-            image_for_naf = img_flat.clone()
+        image_for_naf = img_flat.clone() if self.use_naf_upsample else None
         img_norm = self.transform(img_flat)
 
         with torch.no_grad():
             z = self.extract_features(img_norm)
-            z_clstoken = z[:, 0:1]
-            num_reg = getattr(self.model.config, 'num_register_tokens', 4)
-            z_regtokens = z[:, 1:1 + num_reg]
-            z_patchtokens = z[:, 1 + num_reg:]
-            z_patchtokens_spatial = z_patchtokens.reshape(
-                B * V, self.patch_number, self.patch_number, -1
+
+            if self.use_naf_upsample:
+                self._load_naf()
+
+            # Project the SAME 3D grid through each view's relative pose and fuse the views.
+            z_global, z_proj = view_tokens_to_features(
+                self.proj_grid,
+                z,
+                getattr(self.model.config, 'num_register_tokens', 4),
+                self.patch_number,
+                camera_angle_x,
+                distance,
+                mesh_scale,
+                transform_matrix,
+                image_for_naf=image_for_naf,
+                naf_model=self.naf_model if self.use_naf_upsample else None,
+                naf_target_size=self.naf_target_size,
+                multiview_fusion=self.multiview_fusion,
+                point_index=point_index,
             )
-
-            camera_angle_x_flat = camera_angle_x.reshape(B * V)
-            distance_flat = distance.reshape(B * V)
-            # mesh_scale is shared per object -> expand to per-view then flatten.
-            mesh_scale_flat = mesh_scale[:, None].expand(B, V).reshape(B * V)
-            calc_mat_flat = calc_mat.reshape(B * V, 4, 4)
-
-            # Project each view (loop over V to bound peak memory).
-            # A per-view projection is [B, R^3, C], which at R=64 / C=2048 is 2 GiB
-            # in fp32. Averaging accumulates in place so peak stays at one view
-            # instead of growing with V (a list + stack would cost 2*V*2 GiB, i.e.
-            # ~40 GiB at V=9, which both starves the denoiser and makes the step's
-            # peak depend on N -- something the elastic memory controller models
-            # purely from token count and therefore mispredicts).
-            fuse_by_average = self.multiview_fusion == "average"
-            z_proj_acc = None                     # average: running sum
-            per_view_proj = [] if not fuse_by_average else None  # attention: keep V
-            for v in range(V):
-                idx = torch.arange(v, B * V, V, device=z.device)
-                img_naf_v = image_for_naf[idx] if self.use_naf_upsample else None
-                z_view = self._project_single_view(
-                    z_patchtokens_spatial[idx],
-                    img_naf_v,
-                    camera_angle_x_flat[idx],
-                    distance_flat[idx],
-                    mesh_scale_flat[idx],
-                    calc_mat_flat[idx],
-                )
-                if fuse_by_average:
-                    if z_proj_acc is None:
-                        # Without NAF the projection is a permuted view, so make the
-                        # accumulator contiguous before adding into it in place.
-                        z_proj_acc = z_view.contiguous()
-                    else:
-                        z_proj_acc.add_(z_view)
-                        del z_view
-                else:
-                    per_view_proj.append(z_view)
-
-            # z_global per view: [B, V, 1+num_reg, D]
-            z_global_all = torch.cat([z_clstoken, z_regtokens], dim=1)  # [B*V, 1+num_reg, D]
-            z_global_all = z_global_all.reshape(B, V, z_global_all.shape[-2], z_global_all.shape[-1])
-
-            if fuse_by_average:
-                z_proj = z_proj_acc.div_(V)                             # [B, R^3, C]
-                z_global = z_global_all.mean(dim=1)                     # [B, 1+num_reg, D]
-            else:  # attention
-                z_proj = torch.stack(per_view_proj, dim=2)  # [B, R^3, V, C]
-                z_global = z_global_all.reshape(B, V * z_global_all.shape[2], z_global_all.shape[3])
 
         return z_global, z_proj
 
