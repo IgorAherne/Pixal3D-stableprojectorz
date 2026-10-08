@@ -8,6 +8,25 @@ from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
 
 
+NORM_ROWS = 2 ** 18     # a table above this many rows is normalised a slab of rows at a time
+
+
+def norm_rows(norm: LayerNorm32, feats: torch.Tensor) -> torch.Tensor:
+    """
+    `norm(feats)` for a table of any size.
+
+    LayerNorm32 makes a float32 copy and a float32 result of the whole table it is given. Every row is
+    normalised on its own, so a big table goes through a slab of rows at a time, straight into a result of
+    the table's dtype. The table is normalised whole when gradients are wanted or autocast is on.
+    """
+    if feats.shape[0] <= NORM_ROWS or torch.is_grad_enabled() or torch.is_autocast_enabled():
+        return norm(feats)
+    out = torch.empty_like(feats)
+    for start in range(0, feats.shape[0], NORM_ROWS):
+        out[start:start + NORM_ROWS] = norm(feats[start:start + NORM_ROWS])
+    return out
+
+
 class SparseResBlock3d(nn.Module):
     def __init__(
         self,
@@ -240,13 +259,13 @@ class SparseResBlockC2S3d(nn.Module):
     def _forward(self, x: sp.SparseTensor, subdiv: sp.SparseTensor = None) -> sp.SparseTensor:
         if self.pred_subdiv:
             subdiv = self.to_subdiv(x)
-        h = x.replace(self.norm1(x.feats))
+        h = x.replace(norm_rows(self.norm1, x.feats))
         h = h.replace(F.silu(h.feats))
         h = self.conv1(h)
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
         x = self.updown(x, subdiv_binarized)
-        h = h.replace(self.norm2(h.feats))
+        h = h.replace(norm_rows(self.norm2, h.feats))
         h = h.replace(F.silu(h.feats))
         h = self.conv2(h)
         h = h + self.skip_connection(x)
@@ -283,7 +302,7 @@ class SparseConvNeXtBlock3d(nn.Module):
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = self.conv(x)
-        h = h.replace(self.norm(h.feats))
+        h = h.replace(norm_rows(self.norm, h.feats))
         h = h.replace(self.mlp(h.feats))
         return h + x
     
