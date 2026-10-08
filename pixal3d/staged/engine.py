@@ -1,0 +1,198 @@
+"""The staged engine: Pixal3D's cascade run part by part over a whole batch of props, with only the networks of the
+running part on the card.
+
+    engine = StagedEngine(EngineOptions(pipeline_dir=snapshot, builders=default_builders(default_paths(models))),
+                          hooks)                 # reads the two pipeline files; loads nothing, touches no card
+    results = engine.run(requests, work_dir, on_event=record, cancelled=stop.is_set)     # on the GPU thread
+    engine.release()                             # before anything else needs the card (the reference pipeline)
+    engine.close()                               # at exit
+
+The engine is the glue: a NetworkLoader that knows where every network lies (loader.py), a PropStore per batch in
+the batch's work folder (store.py), the parts (parts.py) and the runner that orders them (runner.py). The caller's
+hooks do everything that touches a prop's files (types.Hooks). Results are those of the reference pipelines
+(Pixal3DImageTo3DPipeline.run, Pixal3DMVImageTo3DPipeline.run_mv) for the same picture, seed and settings.
+
+`engine.sample_sparse_structure` is the one attribute a caller may wrap (a guard that looks at the sparse
+structure and draws it again): part `ss` calls it through the engine, positionally, as the reference's run() calls
+the pipeline's method of that name.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+from pathlib import Path
+from typing import Any, Callable, Iterator
+
+import psutil
+import torch
+
+from ..pipelines import samplers
+from . import parts
+from .runner import PartContext, PipelineArgs, StagedRunner
+from .types import EngineOptions, Event, Hooks, PropRequest
+
+MIB = 1 << 20
+# The engine's network names and the keys of a pipeline file's "models". The four flow networks exist once per
+# kind ("ss_flow.sv" from pipeline.json, "ss_flow.mv" from pipeline_mv.json); the decoders serve both kinds.
+FLOWS = {"ss_flow": "sparse_structure_flow_model", "lr_flow": "shape_slat_flow_model_512",
+         "hr_flow": "shape_slat_flow_model_1024", "tex_flow": "tex_slat_flow_model_1024"}
+DECODERS = {"ss_dec": "sparse_structure_decoder", "shape_dec": "shape_slat_decoder", "tex_dec": "tex_slat_decoder"}
+SAMPLERS = {"ss": "sparse_structure_sampler", "shape": "shape_slat_sampler", "tex": "tex_slat_sampler"}
+BUILDERS = ("rembg", "moge", "dino", "naf")
+
+
+def _pipeline_file(path: Path) -> dict:
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)["args"]
+
+
+def _checkpoint_present(checkpoint: Path) -> bool:
+    return Path(f"{checkpoint}.json").is_file() and Path(f"{checkpoint}.safetensors").is_file()
+
+
+def _pipeline_args(config: dict) -> PipelineArgs:
+    """The samplers and numbers of a pipeline file, as Pixal3DImageTo3DPipeline.from_pretrained reads them."""
+    return PipelineArgs(
+        samplers={stage: getattr(samplers, config[key]["name"])(**config[key]["args"])
+                  for stage, key in SAMPLERS.items()},
+        sampler_params={stage: config[key]["params"] for stage, key in SAMPLERS.items()},
+        shape_normalization=config["shape_slat_normalization"],
+        tex_normalization=config["tex_slat_normalization"],
+        pbr_attr_layout={"base_color": slice(0, 3), "metallic": slice(3, 4), "roughness": slice(4, 5),
+                         "alpha": slice(5, 6)},
+    )
+
+
+def _builder_file(name: str, build: Callable[[str], Any]) -> Path | None:
+    """The weights file one of staged.builders' builders reads (it carries its ModelPaths), so that the loader
+    can read it ahead; None for any other builder."""
+    paths = next((arg for arg in getattr(build, "args", ()) if hasattr(arg, "naf_weights")), None)
+    if paths is None:
+        return None
+    file = {"rembg": Path(paths.rembg) / "model.safetensors", "moge": Path(paths.moge),
+            "dino": Path(paths.dino) / "model.safetensors", "naf": Path(paths.naf_weights)}[name]
+    return file if file.is_file() else None
+
+
+def _store_sizes(ram_mib: int | None) -> tuple[int, int]:
+    """(RAM cache of the store, size of one of its pinned slots) in MiB: smaller on a PC with 16 GiB or less."""
+    total = psutil.virtual_memory().total // MIB
+    small = total <= 16 * 1024 + 512
+    if ram_mib is None:
+        ram_mib = 256 if small else min(768, total * 5 // 100)
+    return ram_mib, 128 if small else 256
+
+
+class StagedEngine:
+    def __init__(self, options: EngineOptions, hooks: Hooks, *, loader_factory: Callable[..., Any] | None = None,
+                 store_factory: Callable[..., Any] | None = None):
+        """Reads the pipeline files, tells the loader where the networks lie and builds the samplers. No weights
+        are read and CUDA is not initialised. The two factories replace NetworkLoader and PropStore (tests)."""
+        self.options = options
+        self.hooks = hooks
+        self.device = options.device
+        folder = Path(options.pipeline_dir)
+        files = {"sv": _pipeline_file(folder / "pipeline.json")}
+        if (folder / "pipeline_mv.json").is_file():
+            multi = _pipeline_file(folder / "pipeline_mv.json")
+            if all(_checkpoint_present(folder / multi["models"][key]) for key in FLOWS.values()):
+                files["mv"] = multi
+        self.multiview = "mv" in files      # pipeline_mv.json and its four checkpoints are on disk
+        self.pipeline_args = {kind: _pipeline_args(config) for kind, config in files.items()}
+
+        if loader_factory is None:
+            from .loader import NetworkLoader as loader_factory
+        self._store_factory = store_factory
+        self.loader = loader_factory(options.device, prefetch=options.prefetch, max_vram_mib=options.max_vram_mib,
+                                     on_event=self._relay)
+        for kind, config in files.items():
+            for name, key in FLOWS.items():
+                self.loader.register_checkpoint(f"{name}.{kind}", folder / config["models"][key])
+        for name, key in DECODERS.items():
+            self.loader.register_checkpoint(name, folder / files["sv"]["models"][key])
+        for name in BUILDERS:
+            build = options.builders[name]
+            self.loader.register_builder(name, build, _builder_file(name, build))
+
+        self._store: Any = None             # the store, context and event callback of the batch that runs
+        self._ctx: PartContext | None = None
+        self._on_event: Callable[[Event], None] | None = None
+        self._draw: Callable[..., torch.Tensor] | None = None
+
+    def run(self, props: list[PropRequest], work_dir: Path, *, on_event: Callable[[Event], None],
+            cancelled: Callable[[], bool], wave_size: int | None = None, resume: bool = False) -> dict[str, dict]:
+        """Make the props. Call on the GPU thread; blocks until every prop is done, failed or cancelled.
+
+        -> {prop id: {"state": "done", "result": {...}} | {"state": "failed", "error": {"kind", "detail"}}
+                     | {"state": "cancelled"}}. A result carries what hooks.finish returned and "slow" (the parts
+        that needed the memory cap lifted; empty for a prop that stayed inside it), "seconds", "resolution",
+        "resumed". Raises BatchBroken when the card cannot be used any more.
+
+        work_dir is emptied first; with resume=True the latents a killed run left there for these props
+        (same id and request_hash) are kept, and those props are only decoded and saved.
+        wave_size: props that go through the parts together (None: the options' value; 0: all of them)."""
+        if self._store is not None:
+            raise RuntimeError("the staged engine runs one batch at a time")
+        store_factory = self._store_factory
+        if store_factory is None:
+            from .store import PropStore as store_factory
+        ram_mib, slot_mib = _store_sizes(self.options.store_ram_mib)
+        store = store_factory(Path(work_dir), self.device, ram_mib=ram_mib, slots=2, slot_mib=slot_mib,
+                              on_event=self._relay)
+        ctx = PartContext(engine=self, loader=self.loader, store=store, hooks=self.hooks, options=self.options,
+                          emit=on_event, cancelled=cancelled, pipeline_args=self.pipeline_args, device=self.device)
+        self._store, self._ctx, self._on_event = store, ctx, on_event
+        runner = StagedRunner(ctx, parts, check_rng=self.options.check_rng)
+        try:
+            with torch.no_grad():
+                results = runner.run(list(props), resume=resume,
+                                     wave_size=self.options.wave_size if wave_size is None else wave_size)
+        except BaseException:
+            with contextlib.suppress(Exception):    # the card may be unusable: the first failure is the one to tell
+                store.close()
+            raise
+        finally:
+            self._store = self._ctx = self._on_event = self._draw = None
+        store.close()
+        return results
+
+    def sample_sparse_structure(self, cond: dict, resolution: int, num_samples: int = 1,
+                                sampler_params: dict | None = None) -> torch.Tensor:
+        """One draw of the sparse structure of the prop part `ss` is working on: coords [N0,4] int32 on the card.
+        `cond` is {"cond": {"global", "proj"}, "neg_cond": {...}}; `sampler_params` are laid over the pipeline
+        file's. A wrapper put on the engine under this name is what `ss` calls."""
+        if self._draw is None:
+            raise RuntimeError("sample_sparse_structure can only be called while part 'ss' works on a prop")
+        return self._draw(cond, resolution, num_samples, sampler_params)
+
+    @contextlib.contextmanager
+    def drawing(self, draw: Callable[..., torch.Tensor]) -> Iterator[None]:
+        """Part `ss` around its call of sample_sparse_structure: `draw` makes the draws for its prop."""
+        self._draw = draw
+        try:
+            yield
+        finally:
+            self._draw = None
+
+    def _relay(self, event: dict) -> None:
+        """An event of the loader or the store ({"kind": "net_load", "name", ...}), handed on to the caller."""
+        if self._on_event is None:
+            return
+        detail = {name: value for name, value in event.items() if name not in ("kind", "prop_id")}
+        self._on_event(Event(str(event.get("kind", "")), self._ctx.part if self._ctx is not None else "",
+                             event.get("prop_id"), detail=detail))
+
+    def release(self) -> None:
+        """Drop every network and lift the memory cap: the card is as if the engine had never run."""
+        self.loader.prefetch(None)
+        self.loader.drop_all()
+        if self.loader.capped():
+            self.loader.clear_cap()
+
+    def close(self) -> None:
+        """release(), then stop the loader's and the store's threads."""
+        self.release()
+        self.loader.close()
+        if self._store is not None:
+            self._store.close()
