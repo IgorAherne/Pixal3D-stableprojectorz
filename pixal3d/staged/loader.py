@@ -61,7 +61,7 @@ LOADS_KEPT = 256                    # stats() remembers this many loads
 # as they do when the reference loads the file with strict=False. None of Pixal3D's eleven files needs it.
 COMPUTED: dict[str, frozenset[str]] = {}
 
-_staging: dict[bool, torch.Tensor] = {}
+_staging: dict[bool, torch.Tensor] = {}     # the process's read buffer: page-locked (True) / ordinary memory (False)
 _staging_pinned_bytes = 0
 _driver_cards: dict[int, Any] = {}  # card index -> (NVML library, its handle of the card), None: cannot be asked
 
