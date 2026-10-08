@@ -93,6 +93,13 @@ class FlowEulerSampler(Sampler):
         pred_x_prev = x_t - (t - t_prev) * pred_v
         return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
 
+    def _euler_step(self, model, x_t, t: float, t_prev: float, cond: Optional[Any] = None, **kwargs):
+        """
+        x_{t-1} alone: the step of sample_once without its prediction of x_0.
+        """
+        pred_v = self._inference_model(model, x_t, t, cond, **kwargs)
+        return x_t - (t - t_prev) * pred_v
+
     @torch.no_grad()
     def sample(
         self,
@@ -103,6 +110,8 @@ class FlowEulerSampler(Sampler):
         rescale_t: float = 1.0,
         verbose: bool = True,
         tqdm_desc: str = "Sampling",
+        keep_trajectory: bool = True,
+        step_callback: Optional[Callable[[int, int], None]] = None,
         **kwargs
     ):
         """
@@ -116,6 +125,10 @@ class FlowEulerSampler(Sampler):
             rescale_t: The rescale factor for t.
             verbose: If True, show a progress bar.
             tqdm_desc: A customized tqdm desc.
+            keep_trajectory: If False, only the samples are returned: the two lists stay empty
+                and the prediction of x_0 is not computed.
+            step_callback: Called as step_callback(step, steps) after every step (step counts from 1).
+                What it raises ends the sampling.
             **kwargs: Additional arguments for model_inference.
 
         Returns:
@@ -131,11 +144,16 @@ class FlowEulerSampler(Sampler):
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
         try:
-            for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
-                out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
-                sample = out.pred_x_prev
-                ret.pred_x_t.append(out.pred_x_prev)
-                ret.pred_x_0.append(out.pred_x_0)
+            for step, (t, t_prev) in enumerate(tqdm(t_pairs, desc=tqdm_desc, disable=not verbose), start=1):
+                if keep_trajectory:
+                    out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
+                    sample = out.pred_x_prev
+                    ret.pred_x_t.append(out.pred_x_prev)
+                    ret.pred_x_0.append(out.pred_x_0)
+                else:
+                    sample = self._euler_step(model, sample, t, t_prev, cond, **kwargs)
+                if step_callback is not None:
+                    step_callback(step, steps)
         finally:
             self._model_time = None
         ret.samples = sample
