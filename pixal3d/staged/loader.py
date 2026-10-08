@@ -186,19 +186,20 @@ class NetworkLoader:
         if self.device.type != "cuda":
             return 0
         safety = self.safety_mib if safety_mib is None else safety_mib
-        free, total = torch.cuda.mem_get_info(self.device)
-        budget = free + torch.cuda.memory_reserved(self.device) - (safety + native_reserve_mib) * MIB
+        card = self._card()
+        free, total = torch.cuda.mem_get_info(card)
+        budget = free + torch.cuda.memory_reserved(card) - (safety + native_reserve_mib) * MIB
         if self.max_vram_mib:
             budget = min(budget, (self.max_vram_mib - CONTEXT_MIB - safety - native_reserve_mib) * MIB)
         fraction = min(max(budget / total, 0.05), 1.0)
-        torch.cuda.set_per_process_memory_fraction(fraction, self.device)
+        torch.cuda.set_per_process_memory_fraction(fraction, card)
         self._cap_mib = int(fraction * total) // MIB
         return self._cap_mib
 
     def clear_cap(self) -> None:
         """Lift the limit: PyTorch may grow as far as the driver lets it."""
         if self._cap_mib is not None:
-            torch.cuda.set_per_process_memory_fraction(1.0, self.device)
+            torch.cuda.set_per_process_memory_fraction(1.0, self._card())
         self._cap_mib = None
 
     def capped(self) -> bool:
@@ -241,6 +242,10 @@ class NetworkLoader:
             return self._sources[name]
         except KeyError:
             raise KeyError(f"no network is registered as {name!r} (registered: {sorted(self._sources)})") from None
+
+    def _card(self) -> int:
+        """The index of the card (torch's memory-fraction call does not take a bare "cuda")."""
+        return self.device.index if self.device.index is not None else torch.cuda.current_device()
 
     def _free_name(self, name: str) -> None:
         if name in self._modules:
