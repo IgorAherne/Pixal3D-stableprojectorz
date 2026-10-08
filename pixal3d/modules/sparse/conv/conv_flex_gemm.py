@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from .. import SparseTensor
 from . import config
+from . import lean_cache
 import flex_gemm
 from flex_gemm.ops.spconv import sparse_submanifold_conv3d
 
@@ -45,18 +46,23 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
     Co, Kd, Kh, Kw, Ci = self.weight.shape
     neighbor_cache_key = f'SubMConv3d_neighbor_cache_{Kw}x{Kh}x{Kd}_dilation{self.dilation}'
     neighbor_cache = x.get_spatial_cache(neighbor_cache_key)
+    shape = torch.Size([*x.shape, *x.spatial_shape])
+    cached = neighbor_cache is not None
+    if not cached:
+        # The forward-only cache where it applies; None leaves the building to flex_gemm.
+        neighbor_cache = lean_cache.build(x.coords, shape, tuple(self.weight.shape[1:4]), self.dilation)
     
     out, neighbor_cache_ = sparse_submanifold_conv3d(
         x.feats,
         x.coords,
-        torch.Size([*x.shape, *x.spatial_shape]),
+        shape,
         self.weight,
         self.bias,
         neighbor_cache,
         self.dilation
     )
     
-    if neighbor_cache is None:
+    if not cached:
         if not torch.is_grad_enabled():
             # Tables only the backward pass reads (about 120 bytes per voxel).
             for name in BACKWARD_ONLY:
