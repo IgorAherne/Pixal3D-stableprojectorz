@@ -368,23 +368,21 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> None:
     decode = _decode()
     store, loader, device = ctx.store, ctx.loader, ctx.device
     stored = store.get_small(prop.id, "coords_hr")
-    coords = stored["coords"].to(device)
     resolution = int(stored["res"][0])
-    shape_feats = store.get_small(prop.id, "shape_slat")["feats"].to(device)
-    tex_feats = store.get_small(prop.id, "tex_slat")["feats"].to(device)
     notes = prop.noted(store.get_small(prop.id, "notes"))
     capped = mode != "uncapped"
 
-    # Phase 1, the decoders. Weights go onto the card before anything else of the phase.
+    # Phase 1, the decoders. A decoder's weights go onto the card before the latents it decodes.
     limit = loader.set_cap(NATIVE_RESERVE["finish"], safety_mib=FINISH_SAFETY_MIB) if capped else 0
-    together = mode == "normal" and decoders_fit(coords.shape[0], limit)
+    together = mode == "normal" and decoders_fit(stored["coords"].shape[0], limit)
     ctx.check()
-    if together:
-        _decoder(ctx, "shape_dec")
-        _decoder(ctx, "tex_dec")
-    elif loader.get("tex_dec") is not None:         # left by an attempt that failed with both on the card
+    if not together and loader.get("tex_dec") is not None:      # left by an attempt that failed with both loaded
         loader.drop("tex_dec")
-    mesh, subs = decode.decode_shape(_decoder(ctx, "shape_dec"), shape_feats, coords, resolution)
+    for name in LAZY["finish"] if together else LAZY["finish"][:1]:
+        _decoder(ctx, name)
+    coords = stored["coords"].to(device)
+    shape_feats = store.get_small(prop.id, "shape_slat")["feats"].to(device)
+    mesh, subs = decode.decode_shape(loader.get("shape_dec"), shape_feats, coords, resolution)
     del shape_feats
     if together:
         loader.trim()
@@ -392,7 +390,9 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> None:
         loader.drop("shape_dec")
     ctx.emit(Event("step", "finish", prop.id, 1, 3))
     ctx.check()
-    tex_coords, attrs = decode.decode_texture(_decoder(ctx, "tex_dec"), tex_feats, coords, subs)
+    _decoder(ctx, "tex_dec")
+    tex_feats = store.get_small(prop.id, "tex_slat")["feats"].to(device)
+    tex_coords, attrs = decode.decode_texture(loader.get("tex_dec"), tex_feats, coords, subs)
     del tex_feats, subs, coords
     loader.drop(*(name for name in LAZY["finish"] if loader.get(name) is not None))
     ctx.emit(Event("step", "finish", prop.id, 2, 3))
