@@ -572,6 +572,17 @@ class SparseUnetVaeDecoder(nn.Module):
             else:
                 return h
     
+    @staticmethod
+    def child_coords(block: nn.Module, x: sp.SparseTensor) -> torch.Tensor:
+        """
+        The coords the up-block `block` would give its output for the input x, rows in the same order.
+        They follow from the block's subdivision of x alone, so only that is computed: the subdivision
+        table is sent through the block's own upsampling in place of the features.
+        """
+        subdiv = block.to_subdiv(x)
+        subdiv = subdiv.replace(subdiv.feats > 0)
+        return block.updown(subdiv, subdiv).coords
+
     def upsample(self, x: sp.SparseTensor, upsample_times: int) -> torch.Tensor:
         assert self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with upsampling"
         
@@ -582,6 +593,8 @@ class SparseUnetVaeDecoder(nn.Module):
                 return h.coords
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
+                    if i == upsample_times - 1:
+                        return self.child_coords(block, h)
                     h, sub = block(h)
                     self.trim()
                 else:
