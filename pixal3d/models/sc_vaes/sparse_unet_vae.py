@@ -475,7 +475,7 @@ class SparseUnetVaeDecoder(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-    def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None, return_subs: bool = False) -> sp.SparseTensor:
+    def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[Union[sp.SparseTensor, torch.Tensor]]] = None, return_subs: bool = False) -> sp.SparseTensor:
         assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
         assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
         
@@ -492,7 +492,11 @@ class SparseUnetVaeDecoder(nn.Module):
                         h, sub = block(h)
                         subs.append(sub)
                     else:
-                        h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
+                        guide = guide_subs[i] if guide_subs is not None else None
+                        if isinstance(guide, torch.Tensor):
+                            # A bare table [n, 8] (logits or booleans), rows in the order of this level's voxels.
+                            guide = h.replace(guide)
+                        h = block(h, subdiv=guide)
                 else:
                     h = block(h)
         h = h.type(x.dtype)
