@@ -270,12 +270,20 @@ class SparseStructureFlowModel(nn.Module):
         Args:
             x: Input tensor [B, C, D, H, W]
             t: Timestep tensor [B]
-            cond: Conditioning tensor. For "cross" mode: [B, N, D]. 
-                  For "proj" mode: dict {'global': global_cond, 'proj': proj_cond} 
+            cond: Conditioning tensor. For "cross" mode: [B, N, D].
+                  For "proj" mode: dict {'global': global_cond, 'proj': proj_cond}
                   or tuple of (global_cond, proj_cond)
-        
+
         Returns:
             Output tensor [B, C, D, H, W]
+
+        Note:
+            The memory layout of proj_cond is part of the result. Every block's proj_linear runs
+            one fused addmm on a contiguous [B, N, D] tensor, but a matmul followed by the bias on
+            a permuted view, and the two round differently in bf16. ProjGrid.forward returns such
+            a view (x.permute(0, 2, 1)); the multi-view extractor returns a contiguous tensor.
+            Pass proj_cond in the layout its extractor gave it: a copy made contiguous, or read
+            back from a file, has the same values and gives another sample.
         """
         assert [*x.shape] == [x.shape[0], self.in_channels, *[self.resolution] * 3], \
                 f"Input shape mismatch, got {x.shape}, expected {[x.shape[0], self.in_channels, *[self.resolution] * 3]}"
