@@ -510,13 +510,14 @@ class PropStore:
             return
         try:
             notes_text = json.dumps(notes)
-        except (TypeError, ValueError) as error:
-            self._warn("checkpoint", f"the notes of {prop_id} cannot be written as JSON: {error}", prop_id)
+            resting = {name: _resting(tensor) for name, tensor in tensors.items()}
+        except (TypeError, ValueError, AttributeError) as error:
+            self._warn("checkpoint", f"the checkpoint of {prop_id} was not written (its notes must be JSON, its "
+                                     f"latents tensors): {error}", prop_id)
             return
         self._cancel_where(lambda job: job.kind == "checkpoint" and job.prop_id == prop_id)
         self._submit("checkpoint", prop_id=prop_id, prop=prop, path=prop.folder / f"{CHECKPOINT}.safetensors",
-                     lent={name: _resting(tensor) for name, tensor in tensors.items()},
-                     args=(str(request_hash), notes_text))
+                     lent=resting, args=(str(request_hash), notes_text))
 
     # =================================================================================================================
     # GPU thread: items
