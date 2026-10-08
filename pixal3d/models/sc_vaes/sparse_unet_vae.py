@@ -27,6 +27,23 @@ def norm_rows(norm: LayerNorm32, feats: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def cast_norm_rows(feats: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """
+    `F.layer_norm(feats.type(dtype))` over the channels, for a table of any size.
+
+    A big table is cast and normalised a slab of rows at a time (every row is normalised on its own), so the
+    cast copy of the whole table never exists beside the result. Whole when gradients are wanted.
+    """
+    if feats.shape[0] <= NORM_ROWS or torch.is_grad_enabled():
+        feats = feats.type(dtype)
+        return F.layer_norm(feats, feats.shape[-1:])
+    out = torch.empty(feats.shape, dtype=dtype, device=feats.device)
+    for start in range(0, feats.shape[0], NORM_ROWS):
+        rows = feats[start:start + NORM_ROWS].type(dtype)
+        out[start:start + NORM_ROWS] = F.layer_norm(rows, rows.shape[-1:])
+    return out
+
+
 class SparseResBlock3d(nn.Module):
     def __init__(
         self,
@@ -518,8 +535,7 @@ class SparseUnetVaeDecoder(nn.Module):
                         h = block(h, subdiv=guide)
                 else:
                     h = block(h)
-        h = h.type(x.dtype)
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+        h = h.replace(cast_norm_rows(h.feats, x.dtype))
         h = self.output_layer(h)
         if self.training and self.pred_subdiv:
             return h, subs_gt, subs
