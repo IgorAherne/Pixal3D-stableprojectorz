@@ -53,6 +53,17 @@ class SiLUOverInput(nn.SiLU):
         return F.silu(input, inplace=not torch.is_grad_enabled())
 
 
+def add_into(h: sp.SparseTensor, other: sp.SparseTensor) -> sp.SparseTensor:
+    """
+    `h + other`, feature rows added one to one. Without gradients the sum is written into h's own table
+    instead of a third one, so h must be a result nobody else holds (a convolution's output).
+    """
+    if torch.is_grad_enabled() or h.feats.dtype != other.feats.dtype or h.feats.shape != other.feats.shape:
+        return h + other
+    h.feats.add_(other.feats)
+    return h
+
+
 def forget_neighbors(x: sp.SparseTensor) -> None:
     """
     Drop the convolutions' neighbour tables of x's level (the flex_gemm backend keeps them in the level's
@@ -307,7 +318,7 @@ class SparseResBlockC2S3d(nn.Module):
         h = h.replace(norm_rows(self.norm2, h.feats))
         h = h.replace(F.silu(h.feats))
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = add_into(h, self.skip_connection(x))
         if self.pred_subdiv:
             return h, subdiv
         else:
