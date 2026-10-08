@@ -233,6 +233,7 @@ class PropStore:
         self._work_dir = Path(work_dir)
         self._device = torch.device(device)
         self._cuda = self._device.type == "cuda"
+        self._card = self._device.index             # for torch.cuda's calls; None ("cuda"): the current device
         self._ram_limit = int(ram_mib) * MIB
         self._slot_count = int(slots)
         self._slot_bytes = int(slot_mib) * MIB
@@ -700,7 +701,7 @@ class PropStore:
             item.slot, slot.item, slot.views = None, None, None
             if direct:
                 slot.event = torch.cuda.Event()
-                slot.event.record(torch.cuda.current_stream(self._device))
+                slot.event.record(torch.cuda.current_stream(self._card))
                 slot.state = UPLOADING
             else:
                 slot.state = FREE
@@ -711,12 +712,12 @@ class PropStore:
         stay under PyTorch's cap; with no cap set, the item and the headroom fit into the card's free memory."""
         if not self._cuda:
             return True
-        fraction = torch.cuda.get_per_process_memory_fraction(self._device)
+        fraction = torch.cuda.get_per_process_memory_fraction(self._card)
         if fraction < 1.0:
             if not self._total:
-                self._total = torch.cuda.get_device_properties(self._device).total_memory
-            return torch.cuda.memory_reserved(self._device) + nbytes + UPLOAD_HEADROOM <= int(fraction * self._total)
-        return nbytes + UPLOAD_HEADROOM <= torch.cuda.mem_get_info(self._device)[0]
+                self._total = torch.cuda.get_device_properties(self._card).total_memory
+            return torch.cuda.memory_reserved(self._card) + nbytes + UPLOAD_HEADROOM <= int(fraction * self._total)
+        return nbytes + UPLOAD_HEADROOM <= torch.cuda.mem_get_info(self._card)[0]
 
     def _upload_ahead(self) -> None:
         for slot in self._slots:
