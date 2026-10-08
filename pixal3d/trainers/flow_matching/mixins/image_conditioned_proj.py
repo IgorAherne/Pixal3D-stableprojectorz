@@ -19,6 +19,7 @@ import torch.distributed as dist
 from ....utils import dist_utils
 from ....utils.dist_utils import read_file_dist
 from ....utils.local_models import resolve_local_model
+from ....modules.naf_sliced import naf_sampled
 
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -561,25 +562,28 @@ def project_view(
         return z_proj_lr
 
     # --- High-resolution branch (NAF): upsample then sample ---
+    # NAF's map [B, D, H', W'] is 4 GiB at H' = 1024 and only K of its points are read, so it is
+    # made and sampled one attention head at a time, straight into the hr half of the result.
+    D = z_proj_lr.shape[-1]
+    z_proj = z_proj_lr.new_empty(*z_proj_lr.shape[:-1], 2 * D)
+    z_proj[..., :D] = z_proj_lr
+    del z_proj_lr
     # NAF expects: guide [B, 3, H, W], lr_features [B, C, h, w], target_size (H', W')
     lr_features_bchw = z_patchtokens_spatial.permute(0, 3, 1, 2)  # [B, D, h, w]
-    hr_features = naf_model(
-        image_for_naf, lr_features_bchw, naf_target_size
-    )  # [B, D, H', W']
-
-    # Sample from high-res feature map using same projection coordinates
-    z_proj_hr = proj_grid(
-        hr_features,
-        camera_angle_x,
-        distance,
-        mesh_scale,
-        transform_matrix,
-        BHWC=False,  # hr_features is [B, C, H', W']
-        point_index=point_index,
-    )  # [B, K, D]
-
-    # Concatenate lr and hr: [B, K, D*2]
-    return torch.cat([z_proj_lr, z_proj_hr], dim=-1)
+    naf_sampled(
+        naf_model, image_for_naf, lr_features_bchw, naf_target_size,
+        lambda hr_features: proj_grid(
+            hr_features,
+            camera_angle_x,
+            distance,
+            mesh_scale,
+            transform_matrix,
+            BHWC=False,  # hr_features is [B, C, H', W']
+            point_index=point_index,
+        ),
+        out=z_proj[..., D:],
+    )
+    return z_proj  # [B, K, D*2]
 
 
 def tokens_to_features(
