@@ -21,9 +21,20 @@ class TimestepEmbedder(nn.Module):
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
         self.frequency_embedding_size = frequency_embedding_size
+        self._freqs = {}
 
     @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
+    def frequencies(dim, max_period=10000):
+        """
+        The dim // 2 frequencies of the sinusoidal timestep embeddings, as a CPU tensor.
+        """
+        half = dim // 2
+        return torch.exp(
+            -np.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        )
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000, freqs=None):
         """
         Create sinusoidal timestep embeddings.
 
@@ -32,23 +43,34 @@ class TimestepEmbedder(nn.Module):
                 These may be fractional.
             dim: the dimension of the output.
             max_period: controls the minimum frequency of the embeddings.
+            freqs: frequencies(dim, max_period) on the device of t, when the caller keeps them.
 
         Returns:
             an (N, D) Tensor of positional embeddings.
         """
         # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
-        freqs = torch.exp(
-            -np.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
+        if freqs is None:
+            freqs = TimestepEmbedder.frequencies(dim, max_period).to(device=t.device)
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
+    def _frequencies_on(self, device, max_period=10000):
+        """
+        The frequencies on the device, uploaded once per device: they are always computed on the CPU,
+        where exp() may round the last bit otherwise than on the card.
+        """
+        key = (self.frequency_embedding_size, max_period, device)
+        freqs = self._freqs.get(key)
+        if freqs is None:
+            freqs = self.frequencies(self.frequency_embedding_size, max_period).to(device=device)
+            self._freqs[key] = freqs
+        return freqs
+
     def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size, freqs=self._frequencies_on(t.device))
         t_emb = self.mlp(t_freq)
         return t_emb
 
