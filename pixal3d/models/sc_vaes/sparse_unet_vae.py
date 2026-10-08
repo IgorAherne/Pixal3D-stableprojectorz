@@ -44,6 +44,17 @@ def cast_norm_rows(feats: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     return out
 
 
+def forget_neighbors(x: sp.SparseTensor) -> None:
+    """
+    Drop the convolutions' neighbour tables of x's level (the flex_gemm backend keeps them in the level's
+    spatial cache, shared by every tensor of the level). For after the level's last convolution, when
+    gradients are off; a convolution that came later would build them again.
+    """
+    level = x.get_spatial_cache()
+    for key in [key for key in level if key.startswith('SubMConv3d_neighbor_cache')]:
+        del level[key]
+
+
 class SparseResBlock3d(nn.Module):
     def __init__(
         self,
@@ -279,6 +290,8 @@ class SparseResBlockC2S3d(nn.Module):
         h = x.replace(norm_rows(self.norm1, x.feats))
         h = h.replace(F.silu(h.feats))
         h = self.conv1(h)
+        if not torch.is_grad_enabled():
+            forget_neighbors(x)     # conv1 is the last convolution on the coarse voxels
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
         x = self.updown(x, subdiv_binarized)
@@ -455,6 +468,7 @@ class SparseUnetVaeDecoder(nn.Module):
         self.pred_subdiv = pred_subdiv
         self.dtype = torch.float16 if use_fp16 else torch.float32
         self.low_vram = False
+        self.lean = False       # True: PyTorch's cache is emptied between the levels (see trim)
         
         self.output_layer = sp.SparseLinear(model_channels[-1], out_channels)
         self.from_latent = sp.SparseLinear(latent_channels, model_channels[0])
@@ -511,6 +525,15 @@ class SparseUnetVaeDecoder(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
+    def trim(self) -> None:
+        """
+        With `lean` set, give PyTorch's unused blocks back to the driver. Called between the levels: each
+        level's tables are several times larger than the last one's, and under a memory cap they would have
+        to be carved out of the smaller blocks the level before left behind. No value depends on it.
+        """
+        if self.lean:
+            torch.cuda.empty_cache()
+
     def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[Union[sp.SparseTensor, torch.Tensor]]] = None, return_subs: bool = False) -> sp.SparseTensor:
         assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
         assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
@@ -533,8 +556,12 @@ class SparseUnetVaeDecoder(nn.Module):
                             # A bare table [n, 8] (logits or booleans), rows in the order of this level's voxels.
                             guide = h.replace(guide)
                         h = block(h, subdiv=guide)
+                    self.trim()
                 else:
                     h = block(h)
+        if not torch.is_grad_enabled():
+            forget_neighbors(h)     # nothing after the blocks convolves
+            self.trim()
         h = h.replace(cast_norm_rows(h.feats, x.dtype))
         h = self.output_layer(h)
         if self.training and self.pred_subdiv:
@@ -556,6 +583,7 @@ class SparseUnetVaeDecoder(nn.Module):
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
                     h, sub = block(h)
+                    self.trim()
                 else:
                     h = block(h)
        
