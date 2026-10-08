@@ -1,12 +1,31 @@
 from typing import *
 import torch
-from .. import VarLenTensor
+from .. import VarLenTensor, SparseTensor
 from .. import config
 
 
 __all__ = [
     'sparse_scaled_dot_product_attention',
 ]
+
+
+def _cu_seqlens(owner: VarLenTensor, seqlen: List[int], device: torch.device) -> torch.Tensor:
+    """
+    The cumulative sequence lengths flash_attn takes: an int32 tensor [len(seqlen) + 1] on the device.
+
+    They depend on the layout alone, so they are kept in the cache that `owner` shares with every
+    tensor made from it by replace(): a layout is uploaded once, not at every attention call.
+    """
+    key = ('cu_seqlens', tuple(seqlen), device)
+    sparse = isinstance(owner, SparseTensor)
+    cu_seqlens = owner.get_spatial_cache(key) if sparse else owner._cache.get(key)
+    if cu_seqlens is None:
+        cu_seqlens = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(seqlen), dim=0)]).int().to(device)
+        if sparse:
+            owner.register_spatial_cache(key, cu_seqlens)
+        else:
+            owner._cache[key] = cu_seqlens
+    return cu_seqlens
 
 
 @overload
@@ -96,6 +115,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
         assert isinstance(qkv, VarLenTensor), f"qkv must be a VarLenTensor, got {type(qkv)}"
         assert len(qkv.shape) == 4 and qkv.shape[1] == 3, f"Invalid shape for qkv, got {qkv.shape}, expected [N, *, 3, H, C]"
         device = qkv.device
+        owner = qkv
 
         s = qkv
         q_seqlen = [qkv.layout[i].stop - qkv.layout[i].start for i in range(qkv.shape[0])]
@@ -110,6 +130,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
                f"Invalid types, got {type(q)} and {type(kv)}"
         assert q.shape[0] == kv.shape[0], f"Batch size mismatch, got {q.shape[0]} and {kv.shape[0]}"
         device = q.device
+        owner = q if isinstance(q, VarLenTensor) else kv
 
         if isinstance(q, VarLenTensor):
             assert len(q.shape) == 3, f"Invalid shape for q, got {q.shape}, expected [N, *, H, C]"
@@ -142,6 +163,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
                f"Invalid types, got {type(q)}, {type(k)}, and {type(v)}"
         assert q.shape[0] == k.shape[0] == v.shape[0], f"Batch size mismatch, got {q.shape[0]}, {k.shape[0]}, and {v.shape[0]}"
         device = q.device
+        owner = q if isinstance(q, VarLenTensor) else k
 
         if isinstance(q, VarLenTensor):
             assert len(q.shape) == 3, f"Invalid shape for q, got {q.shape}, expected [N, *, H, Ci]"
@@ -184,9 +206,9 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
     elif config.ATTN == 'flash_attn':
         if 'flash_attn' not in globals():
             import flash_attn
-        cu_seqlens_q = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(q_seqlen), dim=0)]).int().to(device)
+        cu_seqlens_q = _cu_seqlens(owner, q_seqlen, device)
         if num_all_args in [2, 3]:
-            cu_seqlens_kv = torch.cat([torch.tensor([0]), torch.cumsum(torch.tensor(kv_seqlen), dim=0)]).int().to(device)
+            cu_seqlens_kv = _cu_seqlens(owner, kv_seqlen, device)
         if num_all_args == 1:
             out = flash_attn.flash_attn_varlen_qkvpacked_func(qkv, cu_seqlens_q, max(q_seqlen))
         elif num_all_args == 2:
