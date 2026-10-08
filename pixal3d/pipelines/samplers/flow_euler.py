@@ -20,6 +20,7 @@ class FlowEulerSampler(Sampler):
         sigma_min: float,
     ):
         self.sigma_min = sigma_min
+        self._model_time = None
 
     def _eps_to_xstart(self, x_t, t, eps):
         assert x_t.shape == eps.shape
@@ -41,8 +42,20 @@ class FlowEulerSampler(Sampler):
     def _xstart_to_pred(self, x_t, t, x_0):
         return ((1 - self.sigma_min) * x_t - x_0) / (self.sigma_min + (1 - self.sigma_min) * t)
 
+    def _timestep(self, t, batch_size, device):
+        """
+        The timestep the model takes: 1000 * t for every item of the batch, made on the device.
+
+        The two passes of a guided step ask for the same one, so the last one made is kept
+        (until sample() ends).
+        """
+        key = (t, batch_size, device)
+        if self._model_time is None or self._model_time[0] != key:
+            self._model_time = (key, torch.full((batch_size,), 1000 * t, dtype=torch.float32, device=device))
+        return self._model_time[1]
+
     def _inference_model(self, model, x_t, t, cond=None, **kwargs):
-        t = torch.tensor([1000 * t] * x_t.shape[0], device=x_t.device, dtype=torch.float32)
+        t = self._timestep(t, x_t.shape[0], x_t.device)
         return model(x_t, t, cond, **kwargs)
 
     def _get_model_prediction(self, model, x_t, t, cond=None, **kwargs):
@@ -117,11 +130,14 @@ class FlowEulerSampler(Sampler):
         t_seq = t_seq.tolist()
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
-        for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
-            out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
-            sample = out.pred_x_prev
-            ret.pred_x_t.append(out.pred_x_prev)
-            ret.pred_x_0.append(out.pred_x_0)
+        try:
+            for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
+                out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
+                sample = out.pred_x_prev
+                ret.pred_x_t.append(out.pred_x_prev)
+                ret.pred_x_0.append(out.pred_x_0)
+        finally:
+            self._model_time = None
         ret.samples = sample
         return ret
 
