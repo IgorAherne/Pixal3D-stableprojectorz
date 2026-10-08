@@ -170,7 +170,7 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
         model,
         noise,
         cond,
-        neg_cond,
+        neg_cond: Optional[Any] = None,
         steps: int = 50,
         rescale_t: float = 1.0,
         guidance_strength: float = 3.0,
@@ -184,7 +184,7 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
             model: The model to sample from.
             noise: The initial noise tensor.
             cond: conditional information.
-            neg_cond: negative conditional information.
+            neg_cond: negative conditional information. Not read (may be None) when guidance_strength is 1.
             steps: The number of steps to sample.
             rescale_t: The rescale factor for t.
             guidance_strength: The strength of classifier-free guidance.
@@ -210,7 +210,7 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
         model,
         noise,
         cond,
-        neg_cond,
+        neg_cond: Optional[Any] = None,
         steps: int = 50,
         rescale_t: float = 1.0,
         guidance_strength: float = 3.0,
@@ -225,7 +225,7 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
             model: The model to sample from.
             noise: The initial noise tensor.
             cond: conditional information.
-            neg_cond: negative conditional information.
+            neg_cond: negative conditional information. Not read (may be None) when guidance_strength is 1.
             steps: The number of steps to sample.
             rescale_t: The rescale factor for t.
             guidance_strength: The strength of classifier-free guidance.
