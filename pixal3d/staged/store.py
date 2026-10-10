@@ -107,9 +107,13 @@ def _ours(name: str) -> bool:
 
 
 def _resting(tensor: torch.Tensor) -> torch.Tensor:
-    """A tensor as the store keeps it in RAM: detached, on the CPU, contiguous (the helper thread writes a file
-    straight from its memory). A blocking copy for a tensor on the card; a CPU tensor is kept as it is."""
-    value = tensor.detach().cpu()
+    """A tensor as the store keeps it in RAM: detached, contiguous, and always memory of the store's own - the
+    helper thread writes a file straight out of it, for as long as that takes, while the caller goes on using what
+    it handed in. A blocking copy for a tensor on the card; a copy for one already in RAM as well."""
+    value = tensor.detach()
+    if value.device.type == "cpu":
+        return value.clone(memory_format=torch.contiguous_format)
+    value = value.cpu()
     return value if value.is_contiguous() else value.contiguous()
 
 
@@ -164,24 +168,25 @@ class _Slot:
 
 class _Item:
     """One large item of one prop: where its bytes are, and who is working on them."""
-    __slots__ = ("prop", "key", "path", "layout", "nbytes", "need", "ram", "spill", "unspillable", "on_disk",
-                 "file_bytes", "wanted", "unstageable", "slot", "device", "upload", "touch")
+    __slots__ = ("prop", "key", "path", "names", "layout", "nbytes", "need", "ram", "spill", "stays_in_ram",
+                 "on_disk", "file_bytes", "wanted", "skip_slot", "slot", "device", "upload", "touch")
 
     def __init__(self, prop: "_Prop", key: str, tensors: dict[str, torch.Tensor]):
         self.prop = prop
         self.key = key
         self.path = prop.folder / f"{key}.safetensors"
+        self.names = list(tensors)                          # its tensors, in the order they were put
         self.layout = [(name, tensor.dtype, tuple(tensor.shape), tensor.numel() * tensor.element_size())
                        for name, tensor in tensors.items()]
         self.nbytes = sum(size for _, _, _, size in self.layout)
         self.need = sum(_aligned(size) for _, _, _, size in self.layout)     # bytes of a slot it takes
         self.ram: dict[str, torch.Tensor] | None = None     # the copy in the RAM cache
         self.spill: _Job | None = None                      # being written to its file
-        self.unspillable = False                            # the write failed or the drive is full: stays in RAM
+        self.stays_in_ram = False                           # the write failed or the drive is full: never written
         self.on_disk = False
         self.file_bytes = 0
         self.wanted = False                                 # asked for with want() and not yet taken
-        self.unstageable = False                            # bringing it into a slot failed: take() reads it itself
+        self.skip_slot = False                              # bringing it into a slot failed: take() copies it itself
         self.slot: _Slot | None = None                      # the slot being filled for it or holding it
         self.device: dict[str, torch.Tensor] | None = None  # uploaded ahead, not yet taken
         self.upload: tuple[_Slot, Any] | None = None        # the slot and event of that upload
@@ -201,11 +206,11 @@ class _Prop:
 
 
 class _Job:
-    """One piece of work for the helper thread, and what it reports back. `lent` and `buffer` are tensors of the
-    GPU thread (`dst`: addresses inside a slot): the helper reads and fills their memory, the GPU thread alone lets
-    go of them."""
+    """One piece of work for the helper thread, and what it reports back. `lent`, `buffer` and `views` are tensors
+    of the GPU thread (`dst`: addresses inside a slot): the helper reads and fills their memory, the GPU thread
+    alone lets go of them."""
     __slots__ = ("kind", "prop_id", "key", "path", "prop", "item", "slot", "lent", "dst", "names", "buffer",
-                 "args", "started", "cancelled", "finished", "error", "result")
+                 "views", "args", "started", "cancelled", "finished", "error", "result")
 
     def __init__(self, kind: str, **fields: Any):
         for name in self.__slots__:
@@ -253,6 +258,7 @@ class PropStore:
         self._running: _Job | None = None
         self._thread: threading.Thread | None = None
         self._stop = False
+        self._broken: str | None = None         # the helper thread stopped by itself: no file work will be done
         self._closed = False
         self._halt = threading.Event()              # cuts the helper's waits between two tries of a delete short
 
@@ -277,15 +283,6 @@ class PropStore:
     @property
     def work_dir(self) -> Path:
         return self._work_dir
-
-    @work_dir.setter
-    def work_dir(self, folder: Path) -> None:
-        """Another batch's folder. Only between batches: with no prop open and the file work done."""
-        if self._props:
-            raise RuntimeError("the work folder cannot change while props are open")
-        self.flush()
-        self._work_dir = Path(folder)
-        self._forget_checkpoints()
 
     def begin(self, keep: dict[str, str]) -> dict[str, dict]:
         """Start of a batch. Forgets every prop still open and empties the work folder of the store's files,
@@ -368,14 +365,20 @@ class PropStore:
         if self._slots:
             for slot in self._slots:
                 self._synchronise(slot)
+            # Every buffer goes back to the spare pool - a page-locked block that is dropped is lost for the life
+            # of the process. Only one the helper thread may still be filling stays behind, and only while that
+            # thread is alive.
+            busy = self._thread is not None and self._thread.is_alive()
             with _spare_lock:
                 _spare.setdefault((self._slot_bytes, self._cuda), []).extend(
-                    slot.buf for slot in self._slots if slot.state == FREE)
+                    slot.buf for slot in self._slots if slot.state != FILLING or not busy)
         self._slots = None
         self._pinned_bytes = 0
 
     def stats(self) -> dict:
-        """Bytes in the RAM cache, page-locked, on disk and uploaded ahead; counts of spills, uploads and warnings."""
+        """Bytes in the RAM cache, page-locked, on disk and uploaded ahead; counts of spills, uploads and warnings.
+        `disk_bytes` is advisory: a spill whose item was discarded while it was being written is not counted,
+        although its file is there until the helper thread has deleted it."""
         return {"ram_bytes": self._ram_bytes, "ram_limit": self._ram_limit, "peak_ram_bytes": self._peak_ram_bytes,
                 "spilling_bytes": self._spilling_bytes, "small_bytes": self._small_bytes,
                 "pinned_bytes": self._pinned_bytes,
@@ -435,7 +438,7 @@ class PropStore:
         if self._slots is None:
             self._make_slots()
         item.touch = self._tick_clock()
-        if (item.wanted or item.unstageable or item.device is not None or item.slot is not None
+        if (item.wanted or item.skip_slot or item.device is not None or item.slot is not None
                 or not self._slots or item.need > self._slot_bytes):
             return
         item.wanted = True
@@ -607,7 +610,8 @@ class PropStore:
     def _make_room(self) -> None:
         """Wait while writes that are under way still hold the RAM cache over its budget."""
         deadline = time.monotonic() + PATIENCE
-        while self._spilling_bytes and self._ram_bytes > self._ram_limit and time.monotonic() < deadline:
+        while (self._spilling_bytes and self._ram_bytes > self._ram_limit and self._broken is None
+               and time.monotonic() < deadline):
             self._tick()
             if self._spilling_bytes and self._ram_bytes > self._ram_limit:
                 self._nap()
@@ -619,7 +623,7 @@ class PropStore:
         if over <= 0:
             return
         for item in sorted(self._cache, key=lambda entry: entry.touch):
-            if item.spill is not None or item.unspillable or item.wanted or item.slot is not None:
+            if item.spill is not None or item.stays_in_ram or item.wanted or item.slot is not None:
                 continue
             item.spill = self._submit("spill", prop_id=item.prop.id, key=item.key, path=item.path, item=item,
                                       lent=item.ram, args=item.nbytes)
@@ -662,10 +666,10 @@ class PropStore:
             views = self._views(slot, item)
             moves = [(views[name].data_ptr(), item.ram[name].data_ptr(), size) for name, _, _, size in item.layout]
             slot.job = self._submit("fill", prop_id=item.prop.id, key=item.key, item=item, slot=slot,
-                                    lent=item.ram, dst=moves, result=views)
+                                    lent=item.ram, dst=moves, views=views)
         else:
             slot.job = self._submit("fill", prop_id=item.prop.id, key=item.key, item=item, slot=slot,
-                                    path=item.path, names=[name for name, _, _, _ in item.layout], buffer=slot.buf)
+                                    path=item.path, names=item.names, buffer=slot.buf)
         return slot.job
 
     def _assign(self) -> None:
@@ -732,7 +736,7 @@ class PropStore:
                 refused = str(error).splitlines()[0]
             if refused is not None:
                 self._unwant(item)
-                item.unstageable = True
+                item.skip_slot = True
                 self._warn("upload", f"{item.key} of {item.prop.id} was not uploaded ahead: {refused}",
                            item.prop.id, item.key)
                 continue
@@ -777,7 +781,7 @@ class PropStore:
         if not item.on_disk:
             raise RuntimeError(f"{item.key} of {item.prop.id} is neither in RAM nor on disk")
         slot = None
-        if self._slots and not item.unstageable and item.need <= self._slot_bytes:
+        if self._slots and not item.skip_slot and item.need <= self._slot_bytes:
             slot = next((slot for slot in self._slots if slot.state == FREE), None)
             if slot is None:
                 slot = next((slot for slot in self._slots if slot.state == UPLOADING), None)
@@ -788,10 +792,13 @@ class PropStore:
             self._await(job, f"{item.key} of {item.prop.id} to be read")
             if job.error is not None:
                 raise _as_exception(job.error)
+            if item.slot is None:               # another report let the prop fail while this read ran, and the
+                self._open(item.prop.id)        # item went with it: say why, in the words the artist is shown
+                raise RuntimeError(f"{item.key} of {item.prop.id} was dropped while it was being read")
             return self._issue(item.slot)
         buffer = torch.empty(item.need, dtype=torch.uint8)
         job = self._submit("read", prop_id=item.prop.id, key=item.key, path=item.path,
-                           names=[name for name, _, _, _ in item.layout], buffer=buffer)
+                           names=item.names, buffer=buffer)
         self._await(job, f"{item.key} of {item.prop.id} to be read")
         views, job.result = job.result, None
         if job.error is not None:
@@ -799,7 +806,7 @@ class PropStore:
         problem = _mismatch(item, views)
         if problem:
             raise RuntimeError(f"{item.path}: {problem}")
-        return {name: self._copy(views[name]) for name, _, _, _ in item.layout}
+        return {name: self._copy(views[name]) for name in item.names}
 
     # =================================================================================================================
     # GPU thread: the helper thread's queue and its reports
@@ -849,6 +856,9 @@ class PropStore:
             self._tick()
             if job.finished:
                 return
+            if self._broken is not None:
+                raise RuntimeError(f"Pixal3D's temporary files: the thread that reads and writes them stopped "
+                                   f"({self._broken}), waiting for {what}")
             if time.monotonic() > deadline:
                 raise TimeoutError(f"Pixal3D's temporary files: waited {PATIENCE:.0f} s for {what}")
             self._nap()
@@ -860,11 +870,15 @@ class PropStore:
             with self._cv:
                 if not self._jobs and self._running is None and not self._done:
                     return
-                if time.monotonic() > deadline:
+                if self._broken is not None or time.monotonic() > deadline:
                     break
                 if not self._done:
                     self._cv.wait(WAIT)
-        self._warn("flush", f"the store's file work was not done after {patience:.0f} s")
+        if self._broken is not None:
+            self._warn("flush", f"the store's file work was left undone: the thread that does it stopped "
+                                f"({self._broken})")
+        else:
+            self._warn("flush", f"the store's file work was not done after {patience:.0f} s")
 
     def _tick(self) -> None:
         """One round of housekeeping, without waiting: reports, finished copies, free slots, the budget."""
@@ -888,7 +902,7 @@ class PropStore:
     def _finish(self, job: _Job) -> None:
         """Handle one report of the helper thread (or a job taken back before it ran): the one place where the
         GPU thread lets go of what the job was lent."""
-        job.lent, job.dst, job.buffer = None, None, None
+        job.lent, job.dst, job.buffer, job.views = None, None, None, None
         if job.kind == "spill":
             self._spilled(job)
         elif job.kind == "fill":
@@ -914,7 +928,7 @@ class PropStore:
         if job.cancelled:
             return
         if job.error is not None:
-            item.unspillable = True
+            item.stays_in_ram = True
             self._warn("spill", f"{item.key} of {item.prop.id} stays in RAM: {job.error[1]}", item.prop.id, item.key)
             if _ram_available() < RAM_FLOOR:
                 self._fail(item.prop, DISK_MESSAGE, "disk")
@@ -938,14 +952,14 @@ class PropStore:
         problem = job.error[1] if job.error is not None else _mismatch(item, views)
         if problem:
             slot.state, slot.item, item.slot = FREE, None, None
-            item.unstageable = True
+            item.skip_slot = True
             self._unwant(item)
             if job.error is None:
                 job.error = ("RuntimeError", f"{item.path}: {problem}")
             self._warn("stage", f"{item.key} of {item.prop.id} could not be staged: {problem}", item.prop.id,
                        item.key)
             return
-        slot.views, slot.state = {name: views[name] for name, _, _, _ in item.layout}, STAGED
+        slot.views, slot.state = {name: views[name] for name in item.names}, STAGED
         slot.direct = slot.pinned and all(view.is_pinned() for view in views.values() if view.numel())
         if slot.pinned and not slot.direct and not self._unpinned_noted:
             self._unpinned_noted = True
@@ -969,20 +983,26 @@ class PropStore:
     # =================================================================================================================
 
     def _helper(self) -> None:
-        while True:
-            with self._cv:
-                while not self._jobs and not self._stop:
-                    self._cv.wait()
-                if not self._jobs:
-                    return
-                job = self._jobs.popleft()
-                job.started = True
-                self._running = job
-            self._work(job)
-            with self._cv:                      # the report is read under this lock: by then this thread holds
-                self._running = None            # nothing of the job any more
-                self._done.append(job)
-                del job
+        try:
+            while True:
+                with self._cv:
+                    while not self._jobs and not self._stop:
+                        self._cv.wait()
+                    if not self._jobs:
+                        return
+                    job = self._jobs.popleft()
+                    job.started = True
+                    self._running = job
+                self._work(job)
+                with self._cv:                  # the report is read under this lock: by then this thread holds
+                    self._running = None        # nothing of the job any more
+                    self._done.append(job)
+                    del job
+                    self._cv.notify_all()
+        except BaseException as error:          # the work itself cannot raise (_work catches it), the queue around
+            with self._cv:                      # it can; nobody restarts this thread, so the waits of the GPU
+                self._broken = f"{type(error).__name__}: {error}"    # thread give up at once from now on
+                self._running = None
                 self._cv.notify_all()
 
     def _work(self, job: _Job) -> None:
@@ -1005,19 +1025,20 @@ class PropStore:
             raise _Refused(f"only {free // MIB} MiB are free on the drive of {folder}")
         return stfile.write(job.path, job.lent)
 
+    def _do_read(self, job: _Job) -> dict[str, torch.Tensor]:
+        """A file into a buffer of the GPU thread's; the report says where in it the item's tensors lie."""
+        return stfile.read_into(job.path, job.names, job.buffer)
+
     def _do_fill(self, job: _Job) -> dict[str, torch.Tensor] | None:
         """Bring an item into a slot: its file read into the slot, or its bytes copied from the RAM cache to where
         the GPU thread laid its tensors out in the slot (plain memory copies: a torch copy would start a team of
-        worker threads for this thread)."""
+        worker threads for this thread). The report is where the tensors lie, as for a read."""
         if job.lent is None:
-            return stfile.read_into(job.path, job.names, job.buffer)
+            return self._do_read(job)
         for target, source, size in job.dst:
             if size:
                 ctypes.memmove(target, source, size)
-        return job.result
-
-    def _do_read(self, job: _Job) -> dict[str, torch.Tensor]:
-        return stfile.read_into(job.path, job.names, job.buffer)
+        return job.views
 
     def _do_checkpoint(self, job: _Job) -> int:
         request_hash, notes_text = job.args
@@ -1153,7 +1174,7 @@ def _small_size(value: Any) -> int:
 
 def _mismatch(item: _Item, views: dict[str, torch.Tensor]) -> str | None:
     """What is wrong with the tensors read back from an item's file, or None: they must be the ones put."""
-    if set(views) != {name for name, _, _, _ in item.layout}:
+    if set(views) != set(item.names):
         return f"the file holds {sorted(views)}, not the item's tensors"
     for name, dtype, shape, _ in item.layout:
         if views[name].dtype != dtype or tuple(views[name].shape) != shape:

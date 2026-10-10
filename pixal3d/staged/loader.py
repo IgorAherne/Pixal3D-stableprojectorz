@@ -61,7 +61,7 @@ LOADS_KEPT = 256                    # stats() remembers this many loads
 # as they do when the reference loads the file with strict=False. None of Pixal3D's eleven files needs it.
 COMPUTED: dict[str, frozenset[str]] = {}
 
-_staging: dict[bool, torch.Tensor] = {}     # the process's read buffer: page-locked (True) / ordinary memory (False)
+_staging: dict[bool, torch.Tensor] = {}     # the process's one read buffer, under True once the card has asked
 _staging_pinned_bytes = 0
 _driver_cards: dict[int, Any] = {}  # card index -> (NVML library, its handle of the card), None: cannot be asked
 
@@ -443,23 +443,29 @@ def _driver_card(card: int) -> tuple[Any, Any] | None:
 
 
 def _staging_buffer(pinned: bool) -> torch.Tensor:
-    """The process's one read buffer. Page-locked when the target is the card, so that uploads from it are plain
-    copies; allocated once and kept for the life of the process, because torch rounds a pinned block up to a power
-    of two and never returns it to the system, and because allocating one is a CUDA call that belongs to the
-    thread that owns the card. When the system refuses to lock the pages the buffer is ordinary memory (the same
-    values, a little slower)."""
+    """The process's one read buffer. Page-locked when the card asks for it, so that uploads from it are plain
+    copies, and that one buffer then serves loads onto the CPU as well; allocated once and kept for the life of
+    the process, because torch rounds a pinned block up to a power of two and never returns it to the system, and
+    because allocating one is a CUDA call that belongs to the thread that owns the card. When the system refuses
+    to lock the pages the buffer is ordinary memory (the same values, a little slower)."""
     global _staging_pinned_bytes
-    buffer = _staging.get(pinned)
-    if buffer is None:
-        if pinned:
-            try:
-                buffer = torch.empty(BUFFER_BYTES, dtype=torch.uint8, pin_memory=True)
-                _staging_pinned_bytes = BUFFER_BYTES
-            except RuntimeError:
-                buffer = None
+    buffer = _staging.get(True)
+    if buffer is not None:
+        return buffer
+    if not pinned:
+        buffer = _staging.get(False)
+        if buffer is None:
+            buffer = _staging[False] = torch.empty(BUFFER_BYTES, dtype=torch.uint8)
+        return buffer
+    try:
+        buffer = torch.empty(BUFFER_BYTES, dtype=torch.uint8, pin_memory=True)
+        _staging_pinned_bytes = BUFFER_BYTES
+    except RuntimeError:
+        buffer = _staging.get(False)
         if buffer is None:
             buffer = torch.empty(BUFFER_BYTES, dtype=torch.uint8)
-        _staging[pinned] = buffer
+    _staging.clear()                        # with it goes the buffer of an earlier load onto the CPU, if there was one
+    _staging[True] = buffer
     return buffer
 
 
