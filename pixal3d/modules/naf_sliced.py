@@ -43,10 +43,14 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
     image [B, 3, H, W] in 0..1; lr_features [B, C, h, w]; sample(fmap [B, C / heads, T, T]) -> [B, K, C / heads];
     returns [B, K, C] (written into `out` when given). Same operations as NAF's own code: model/naf.py:37-52 and
     105-117, layers/rope.py:137-174, layers/attentions.py:55-74.
+
+    `sample` is given one head's map; on the fall-back below, where the whole map is built at once, it is given
+    all the channels in one call instead. Both callers sample each channel on its own, so that makes no
+    difference to them.
     """
     na2d = _attention_of(naf)
     if na2d is None:
-        rows = sample(naf(image, lr_features, target_size))
+        rows = sample(naf(image, lr_features, target_size))      # an older natten: no kernel to call per head
         if out is None:
             return rows
         out.copy_(rows)
@@ -54,6 +58,10 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
 
     encoder, attention = naf.image_encoder, naf.upsampler
     heads = attention.num_heads
+    if lr_features.shape[1] % heads:
+        raise ValueError(f"NAF's {lr_features.shape[1]} channels do not divide into {heads} heads")
+    # NAF's own guard, its target cross-indexed as it is there: a map wider than four times the one asked for is
+    # brought down first. Copied rather than tidied, so a target that is not square behaves as it does in NAF.
     if image.shape[-2] > 4 * target_size[0] or image.shape[-1] > 4 * target_size[1]:
         image = F.interpolate(
             image,
@@ -66,6 +74,8 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
         )
     x = encoder.forward_encoder(image, target_size)                         # the guide's map before RoPE
     batch, channels, height, width = x.shape
+    if channels % heads:
+        raise ValueError(f"the guide's {channels} channels do not divide into {heads} heads")
 
     rope = encoder.rope
     by_head = rope.num_heads == heads

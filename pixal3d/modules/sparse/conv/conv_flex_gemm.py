@@ -8,7 +8,7 @@ import flex_gemm
 from flex_gemm.ops.spconv import sparse_submanifold_conv3d
 
 
-BACKWARD_ONLY = ('valid_signal_i', 'valid_signal_o')    # of flex_gemm's neighbour cache
+BACKWARD_ONLY = ('valid_signal_i', 'valid_signal_o', 'valid_signal_seg')   # of flex_gemm's neighbour cache
 
 
 def sparse_conv3d_init(self, in_channels, out_channels, kernel_size, stride=1, dilation=1, padding=None, bias=True, indice_key=None):
@@ -44,7 +44,9 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
 
     # check if neighbor map is already computed
     Co, Kd, Kh, Kw, Ci = self.weight.shape
-    neighbor_cache_key = f'SubMConv3d_neighbor_cache_{Kw}x{Kh}x{Kd}_dilation{self.dilation}'
+    # A cache built with gradients off has the backward's tables stripped, so the two kinds get their own key.
+    neighbor_cache_key = (f'SubMConv3d_neighbor_cache_{Kw}x{Kh}x{Kd}_dilation{self.dilation}'
+                          f'{"_forward" if not torch.is_grad_enabled() else ""}')
     neighbor_cache = x.get_spatial_cache(neighbor_cache_key)
     shape = torch.Size([*x.shape, *x.spatial_shape])
     cached = neighbor_cache is not None

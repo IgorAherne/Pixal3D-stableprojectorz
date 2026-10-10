@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -178,10 +179,11 @@ class StagedEngine:
         self.loader.drop_all()
         if self.loader.capped():
             self.loader.clear_cap()
+        proj_cond = sys.modules.get("pixal3d.pipelines.proj_cond")      # only the parts import it, and lazily
+        if proj_cond is not None:
+            proj_cond.clear_grids()
 
     def close(self) -> None:
-        """release(), then stop the loader's and the store's threads."""
+        """release(), then stop the loader's thread. The store's belongs to a batch and is stopped with it."""
         self.release()
         self.loader.close()
-        if self._store is not None:
-            self._store.close()

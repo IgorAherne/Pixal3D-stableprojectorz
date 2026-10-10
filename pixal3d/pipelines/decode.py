@@ -34,8 +34,9 @@ def settle(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
     What a decode returns was allocated while PyTorch's cache held the decoder's far larger blocks: each
     result sits in a corner of one of them and keeps the whole block reserved for as long as it lives (1.5 GiB
     for the 1536 golden prop's mesh, which the texture decode then cannot use). The results are copied to the
-    CPU, the cache is emptied, and they are copied back. `tensors` must hold the only references to them; the
-    list is emptied.
+    CPU, the cache is emptied, and they are copied back. `tensors` must hold the only references to them, and
+    each must already be laid out row by row: a copy keeps a tensor's layout only while it is dense, and
+    downstream a layout decides a sample. The list is emptied.
     """
     device = tensors[0].device
     host = [tensor.cpu() for tensor in tensors]

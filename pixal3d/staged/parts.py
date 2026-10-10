@@ -37,8 +37,27 @@ from typing import Any, Callable
 import torch
 
 from ..modules.sparse import SparseTensor
-from .runner import FINISH_SAFETY_MIB, NATIVE_RESERVE, PartContext, PropState, glb_reserve
-from .types import DecodedMesh, Event, PropFailed
+from .runner import PartContext, PropState
+from .types import PARTS, DecodedMesh, Event, PropFailed
+
+# MiB outside PyTorch's allocator while a part runs (cuBLAS / cuDNN handles, flash_attn, natten, flex_gemm work
+# areas; for "finish" its decode phase, which adds cumesh's fill_holes). The loader's cap leaves this much free.
+NATIVE_RESERVE = {**{part: 200 for part in PARTS if part != "finish"}, "finish": 300}
+# Both phases of "finish" leave more of the card alone than the other parts do: the page's viewer may load a
+# finished model while the next prop is decoded.
+FINISH_SAFETY_MIB = 500
+
+# Parts whose networks run cuDNN convolutions. cuDNN quietly takes another algorithm when the work area of its
+# first choice cannot be allocated, and another algorithm rounds differently: under the cap the same seed could
+# give another cut-out, camera or conditioning without any error. PyTorch counts the failed allocation, so a
+# counter that moved during such a part is treated as an out-of-memory failure of that attempt. Nothing inside
+# such a part may swallow an out-of-memory of its own (see `_steps`), or the count would mean two things.
+CONV_PARTS = frozenset({"cutout", "camera", "features", "cond_lr", "cond_hr", "ss"})
+# Parts that draw from the CPU random generator; each starts from the state its predecessor stored.
+DRAWING_PARTS = frozenset({"ss", "lr", "hr", "tex"})
+# Parts after which PyTorch's cache is given back at once: the conditioning passes and the up-sampling decoder
+# leave large freed blocks that the next prop's part does not reuse.
+TRIMMED_PARTS = frozenset({"features", "cond_lr", "upsample", "cond_hr"})
 
 # The networks a group's `enter` loads, in loading order ({kind} = "sv" | "mv"), and those a part loads itself when
 # a prop first needs them.
@@ -65,6 +84,12 @@ SPENT = {"ss": ("cond_ss",), "cond_lr": ("dino512",), "lr": ("cond_lr", "rng_ss"
 DECODER_MIB = 905
 VOXELS_PER_TOKEN = 311
 DECODE_MIB_PER_KVOXEL = 0.80
+
+
+def glb_reserve(faces: int) -> int:
+    """MiB of native memory the caller's finish hook needs for a decoded mesh of `faces` faces (to_glb: the
+    nvdiffrast context, one BVH at a time, cumesh)."""
+    return 2300 + 60 * faces // 1_000_000
 
 
 def networks(part: str, kind: str) -> tuple[str, ...]:
@@ -152,6 +177,21 @@ def _bf16(cond: dict) -> dict:
     return {name: value.type(torch.bfloat16) for name, value in cond.items()}
 
 
+def _as_reference_layout(cond: dict, multi: bool) -> dict:
+    """The dense conditioning laid out in memory as the reference pipelines hand it to the sparse-structure flow.
+
+    Its first linear layer runs one fused addmm on a contiguous [B, N, D] input, and a matmul plus a separate bias
+    add on a permuted view; in bfloat16 the two round differently in every block, so the layout decides the sample.
+    Single view reaches the flow as the permuted view ProjGrid.forward ends with, multi view as a contiguous
+    tensor. Anything the store gives back is contiguous (it writes its files straight from its own memory), so the
+    single-view layout is made again here. It is already right for a tensor that never left the card.
+    """
+    if multi:
+        return cond
+    proj = cond["proj"]
+    return {**cond, "proj": proj.transpose(1, 2).contiguous().transpose(1, 2)}
+
+
 def _token_cond(cond: dict, coords: torch.Tensor, negative: bool = True) -> dict:
     """{"cond", "neg_cond"} of a sparse stage: the stored rows on the prop's coords, and zeros of the same form."""
     pair = {"cond": {"global": cond["global"], "proj": SparseTensor(feats=cond["proj"], coords=coords)},
@@ -170,10 +210,17 @@ def _denormalised(slat: SparseTensor, normalization: dict) -> SparseTensor:
 
 def _steps(ctx: PartContext, prop: PropState, part: str, mode: str) -> Callable[[int, int], None]:
     """A sampler's step callback: progress, the next prop's inputs on their way to the card (when memory is
-    tight they wait for their prop's turn, and what was sent ahead comes back), and a cancel check point."""
+    tight they wait for their prop's turn, and what was sent ahead comes back), and a cancel check point.
+
+    Nothing is sent ahead from inside a part whose convolutions the runner watches: the store refuses an
+    upload that does not fit by catching the out-of-memory itself, and the runner reads the same counter to
+    decide whether cuDNN quietly changed its plan. Only `ss` is both, and it gives up the overlap.
+    """
+    upload = mode == "normal" and part not in CONV_PARTS
+
     def callback(step: int, total: int) -> None:
         ctx.emit(Event("step", part, prop.id, step, total))
-        ctx.store.pump(upload=mode == "normal")
+        ctx.store.pump(upload=upload)
         ctx.check()
 
     return callback
@@ -237,7 +284,7 @@ def draw_sparse_structure(ctx: PartContext, prop: PropState, mode: str, cond: di
 
 def ss(ctx: PartContext, prop: PropState, mode: str) -> None:
     store, request = ctx.store, prop.req
-    cond = ctx.take(prop, "cond_ss")
+    cond = _as_reference_layout(ctx.take(prop, "cond_ss"), prop.req.multi)
     pair = {"cond": cond, "neg_cond": _proj_cond().negative(cond)}
     draw = functools.partial(draw_sparse_structure, ctx, prop, mode)
     torch.manual_seed(request.seed)

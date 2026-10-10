@@ -668,13 +668,9 @@ def view_tokens_to_features(
     mesh_scale_flat = mesh_scale[:, None].expand(B, V).reshape(B * V)
     calc_mat_flat = calc_mat.reshape(B * V, 4, 4)
 
-    # Project each view (loop over V to bound peak memory).
-    # A per-view projection is [B, R^3, C], which at R=64 / C=2048 is 2 GiB
-    # in fp32. Averaging accumulates in place so peak stays at one view
-    # instead of growing with V (a list + stack would cost 2*V*2 GiB, i.e.
-    # ~40 GiB at V=9, which both starves the denoiser and makes the step's
-    # peak depend on N -- something the elastic memory controller models
-    # purely from token count and therefore mispredicts).
+    # Project each view in turn. Averaging adds each one into the running sum in place, so the largest moment
+    # is one view's rows, not all V of them (keeping them to stack at the end would cost V times as much: at
+    # R=64 and C=2048 a dense view alone is 2 GiB in fp32). Attention fusion does need them all and says so.
     fuse_by_average = multiview_fusion == "average"
     z_proj_acc = None                     # average: running sum
     per_view_proj = [] if not fuse_by_average else None  # attention: keep V

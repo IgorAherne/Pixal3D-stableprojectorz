@@ -21,8 +21,8 @@ def norm_rows(norm: LayerNorm32, feats: torch.Tensor) -> torch.Tensor:
     """
     if feats.shape[0] <= NORM_ROWS or torch.is_grad_enabled() or torch.is_autocast_enabled():
         return norm(feats)
-    out = torch.empty_like(feats)
-    for start in range(0, feats.shape[0], NORM_ROWS):
+    out = torch.empty(feats.shape, dtype=feats.dtype, device=feats.device)   # as LayerNorm32 returns it: rows
+    for start in range(0, feats.shape[0], NORM_ROWS):                         # laid out one after the other
         out[start:start + NORM_ROWS] = norm(feats[start:start + NORM_ROWS])
     return out
 
@@ -32,9 +32,11 @@ def cast_norm_rows(feats: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
     `F.layer_norm(feats.type(dtype))` over the channels, for a table of any size.
 
     A big table is cast and normalised a slab of rows at a time (every row is normalised on its own), so the
-    cast copy of the whole table never exists beside the result. Whole when gradients are wanted.
+    cast copy of the whole table never exists beside the result. The table is cast and normalised whole when
+    gradients are wanted or autocast is on (autocast runs layer_norm in its own dtype, which a slab written
+    into a result of `dtype` would narrow).
     """
-    if feats.shape[0] <= NORM_ROWS or torch.is_grad_enabled():
+    if feats.shape[0] <= NORM_ROWS or torch.is_grad_enabled() or torch.is_autocast_enabled():
         feats = feats.type(dtype)
         return F.layer_norm(feats, feats.shape[-1:])
     out = torch.empty(feats.shape, dtype=dtype, device=feats.device)
@@ -69,9 +71,13 @@ def forget_neighbors(x: sp.SparseTensor) -> None:
     Drop the convolutions' neighbour tables of x's level (the flex_gemm backend keeps them in the level's
     spatial cache, shared by every tensor of the level). For after the level's last convolution, when
     gradients are off; a convolution that came later would build them again.
+
+    The level's cache holds other things under keys of other types (the attention's sequence lengths are
+    kept there under a tuple), so only the string keys are examined.
     """
     level = x.get_spatial_cache()
-    for key in [key for key in level if key.startswith('SubMConv3d_neighbor_cache')]:
+    for key in [key for key in level
+                if isinstance(key, str) and key.startswith('SubMConv3d_neighbor_cache')]:
         del level[key]
 
 

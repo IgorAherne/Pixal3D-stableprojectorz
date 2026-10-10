@@ -33,34 +33,10 @@ from .types import PARTS, BatchBroken, Cancelled, Event, PropFailed, PropRequest
 MODES = ("normal", "tight", "uncapped")
 KINDS = ("mv", "sv")                # the order inside every part: multi-view props first
 
-# MiB outside PyTorch's allocator while a part runs (cuBLAS / cuDNN handles, flash_attn, natten, flex_gemm work
-# areas; for "finish" its decode phase, which adds cumesh's fill_holes). The loader's cap leaves this much free.
-NATIVE_RESERVE = {**{part: 200 for part in PARTS if part != "finish"}, "finish": 300}
-# Both phases of "finish" leave more of the card alone than the other parts do: the page's viewer may load a
-# finished model while the next prop is decoded.
-FINISH_SAFETY_MIB = 500
-
-# Parts whose networks run cuDNN convolutions. cuDNN quietly takes another algorithm when the work area of its
-# first choice cannot be allocated, and another algorithm rounds differently: under the cap the same seed could
-# give another cut-out, camera or conditioning without any error. PyTorch counts the failed allocation, so a
-# counter that moved during such a part is treated as an out-of-memory failure of that attempt.
-CONV_PARTS = frozenset({"cutout", "camera", "features", "cond_lr", "cond_hr", "ss"})
-# Parts that draw from the CPU random generator; each starts from the state its predecessor stored.
-DRAWING_PARTS = frozenset({"ss", "lr", "hr", "tex"})
-# Parts after which PyTorch's cache is given back at once: the conditioning passes and the up-sampling decoder
-# leave large freed blocks that the next prop's part does not reuse.
-TRIMMED_PARTS = frozenset({"features", "cond_lr", "upsample", "cond_hr"})
-
 # Texts of a failure after which the CUDA context may be gone for good; a probe allocation decides.
 BROKEN_CONTEXT = ("cuda error", "device-side assert", "unspecified launch failure")
 OOM_TEXTS = ("out of memory", "alloc_failed", "cuda error: 2[", "cudamalloc")
 RAM_TEXTS = ("paging file", "defaultcpuallocator")
-
-
-def glb_reserve(faces: int) -> int:
-    """MiB of native memory the caller's finish hook needs for a decoded mesh of `faces` faces (to_glb: the
-    nvdiffrast context, one BVH at a time, cumesh)."""
-    return 2300 + 60 * faces // 1_000_000
 
 
 def classify(exc: BaseException) -> str:
@@ -90,9 +66,11 @@ def describe(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def num_ooms() -> int:
-    """PyTorch's own count of failed allocations on the card (a host-side counter, no sync)."""
-    return int(torch.cuda.memory_stats().get("num_ooms", 0))
+def num_ooms(device: str) -> int:
+    """PyTorch's own count of failed allocations on `device` (a host-side counter, no sync); 0 off the card."""
+    if torch.device(device).type != "cuda":
+        return 0
+    return int(torch.cuda.memory_stats(device).get("num_ooms", 0))
 
 
 def probe(device: str) -> bool:
@@ -172,7 +150,9 @@ class PartContext:
         return held
 
     def args(self, prop: PropState) -> PipelineArgs:
-        return self.pipeline_args[prop.kind]
+        """The settings of the prop's pipeline file. A resumed multi-view prop runs only "finish", which needs
+        nothing a multi-view file says, and the files may be gone by then: it falls back to the single-view one."""
+        return self.pipeline_args.get(prop.kind) or self.pipeline_args["sv"]
 
     def check(self) -> None:
         """A cancel check point."""
@@ -201,25 +181,49 @@ class StagedRunner:
         Raises BatchBroken when the card cannot be used any more; nothing is cleaned up then."""
         ctx = self.ctx
         self._begin(requests, wave_size, resume)
-        stopped = False
+        stopped, failure = False, None
         try:
             for index in range(len(self.waves)):
                 self._wave(index)
         except Cancelled:
             stopped = True
-        ctx.inputs.clear()
-        ctx.part = ""
-        ctx.loader.drop_all()
-        if stopped:
-            for prop in self.props:
-                if not prop.over:
-                    prop.state = "cancelled"
-                    ctx.store.close_prop(prop.id)
-        ctx.loader.prefetch(None)
-        if ctx.loader.capped():
-            ctx.loader.clear_cap()
-        ctx.store.flush()
+        except (BatchBroken, KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException as exc:
+            failure = (classify(exc), describe(exc), traceback.format_exc())
+        failure = self._settle() or failure
+        for prop in self.props:
+            if prop.over:
+                continue
+            if failure is not None:
+                self._fail(prop, prop.part, failure)
+            elif stopped:
+                prop.state = "cancelled"
+                ctx.store.close_prop(prop.id)
         return {prop.id: self._report(prop) for prop in self.props}
+
+    def _settle(self) -> tuple[str, str, str] | None:
+        """Give the card and the work folder back between batches.
+
+        The work between two prop-parts - asking the store for the next inputs, sending them, dropping a group's
+        networks, emptying the folder - belongs to no prop, and on a PC that has run out of room it is where a
+        failure surfaces. It comes back as a failure of the props that had not finished, so the ones that did
+        keep their results and the caller still gets its report.
+        """
+        ctx = self.ctx
+        try:
+            ctx.inputs.clear()
+            ctx.part = ""
+            ctx.loader.drop_all()
+            ctx.loader.prefetch(None)
+            if ctx.loader.capped():
+                ctx.loader.clear_cap()
+            ctx.store.flush()
+        except (BatchBroken, KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException as exc:
+            return classify(exc), describe(exc), traceback.format_exc()
+        return None
 
     def _begin(self, requests: list[PropRequest], wave_size: int | None, resume: bool) -> None:
         ctx, store = self.ctx, self.ctx.store
@@ -255,8 +259,8 @@ class StagedRunner:
 
     def _restore(self, prop: PropState, checkpoint: dict) -> bool:
         """Put a checkpoint's latents where part "finish" reads them. False when it does not hold them all."""
-        tensors = checkpoint.get("tensors", checkpoint)
         try:
+            tensors = checkpoint["tensors"]
             coords, res = tensors["coords"], tensors["res"]
             shape_slat, tex_slat = tensors["shape_slat"], tensors["tex_slat"]
         except KeyError:
@@ -355,8 +359,14 @@ class StagedRunner:
             self.ctx.store.want(prop.id, key)
 
     def _enter(self, part: str, kind: str) -> tuple[str, str, str] | None:
-        """Load the group's networks; after a failure everything is dropped and it is tried once more."""
+        """Load the group's networks; after a failure everything is dropped and it is tried once more.
+
+        The cap is set for this part first: the one in force is whatever the prop before left - lifted, because
+        it had to spill, or the small one "finish" sets for writing a file - and under that a flow network of a
+        few gigabytes could not be read at all.
+        """
         loader = self.ctx.loader
+        loader.set_cap(self.plan.NATIVE_RESERVE[part])
         failure = None
         for _ in range(2):
             failure = self._try_enter(part, kind)
@@ -401,11 +411,11 @@ class StagedRunner:
                     prop.slow = [*(name for name in prop.slow if name != part), part]
                     ctx.emit(Event("prop_spilled", part, prop.id))
                 elif part != "finish":                  # "finish" sets its own cap, once per phase
-                    loader.set_cap(NATIVE_RESERVE[part])
-                ooms = num_ooms()
-                rng = torch.get_rng_state() if self.check_rng and part not in DRAWING_PARTS else None
+                    loader.set_cap(self.plan.NATIVE_RESERVE[part])
+                ooms = num_ooms(ctx.device)
+                rng = torch.get_rng_state() if self.check_rng and part not in self.plan.DRAWING_PARTS else None
                 failure = self._attempt(part, prop, mode)
-                if failure is None and part in CONV_PARTS and num_ooms() > ooms:
+                if failure is None and part in self.plan.CONV_PARTS and num_ooms(ctx.device) > ooms:
                     failure = ("oom", "an allocation failed inside a convolution", "")
                     self._discard(prop, self.plan.produces(part))       # nobody has read them yet
                 if failure is None and rng is not None and not torch.equal(torch.get_rng_state(), rng):
@@ -413,9 +423,11 @@ class StagedRunner:
                 if failure is None:
                     break
                 loader.trim()
-                if failure[0] == "error" and any(words in failure[1].lower() for words in BROKEN_CONTEXT) \
-                        and not probe(ctx.device):
-                    raise BatchBroken(failure[1])
+                store.pump(upload=False)       # the next prop's inputs went ahead; the retry needs the room
+                if failure[0] == "error" and any(words in failure[1].lower() for words in BROKEN_CONTEXT):
+                    loader.clear_cap()         # the probe asks whether the card works, not whether the cap fits
+                    if not probe(ctx.device):
+                        raise BatchBroken(failure[1])
                 if failure[0] != "oom" or mode == "uncapped":
                     break
         finally:
@@ -425,7 +437,7 @@ class StagedRunner:
             self._fail(prop, part, failure)
             return
         self._discard(prop, self.plan.discards(part, prop))
-        if part in TRIMMED_PARTS:
+        if part in self.plan.TRIMMED_PARTS:
             loader.trim()
         if part != "finish":
             prop.state = "resting"

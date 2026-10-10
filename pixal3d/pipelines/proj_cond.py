@@ -47,9 +47,10 @@ class Spec:
     image_size: int                     # side of the picture DINOv3 and NAF's guide get
     use_naf: bool = False               # use_naf_upsample
     naf_target: Optional[int] = None    # naf_target_size: side of NAF's upsampled map
-    model_name: str = "camenduru/dinov3-vitl16-pretrain-lvd1689m"
+    model_name: str = "camenduru/dinov3-vitl16-pretrain-lvd1689m"   # not read here: for comparing with app.py
     patch_size: int = 16
     registers: int = 4
+    fusion: str = "average"             # multiview_fusion: how a multi-view extractor joins its views
 
     @staticmethod
     def of(extractor: nn.Module) -> "Spec":
@@ -65,6 +66,7 @@ class Spec:
             image_size=extractor.image_size,
             use_naf=extractor.use_naf_upsample,
             naf_target=target[0] if target else None,
+            fusion=getattr(extractor, "multiview_fusion", "average"),
             model_name=extractor.model_name,
             patch_size=extractor.patch_size,
             registers=getattr(extractor.model.config, "num_register_tokens", 4),
@@ -116,6 +118,12 @@ class Camera:
 
 
 _grids: Dict[tuple, ProjGrid] = {}
+
+
+def clear_grids() -> None:
+    """Forget the projection grids. They are a few megabytes each, but they are on the card, and the token cap
+    of a 1536 prop walks several grid sides, so a caller that counts what it leaves behind clears them."""
+    _grids.clear()
 
 
 def proj_grid_for(cls: type, grid_resolution: int, image_resolution: int, device) -> ProjGrid:
@@ -179,6 +187,7 @@ def _features(spec: Spec, z: torch.Tensor, camera: Camera, grid: int, image: Opt
             torch.as_tensor(camera.mesh_scale, dtype=torch.float32, device=device).reshape(-1),
             camera.transform_matrix,
             image_for_naf=image, naf_model=naf, naf_target_size=target, point_index=point_index,
+            multiview_fusion=spec.fusion,
         )
     return {"global": z_global, "proj": z_proj}
 
@@ -204,6 +213,9 @@ def cond_tokens(spec: Spec, z: torch.Tensor, image: torch.Tensor, naf: nn.Module
     """
     if not spec.use_naf:
         raise ValueError(f"{spec.name} has no NAF branch: use cond_dense")
+    if spec.fusion != "average":
+        # Only the averaged form gives the [B, K, C] the row below takes apart; "attention" keeps the views.
+        raise ValueError(f"{spec.name} joins its views by {spec.fusion!r}, which this path does not build")
     xyz = coords[:, 1:4].long()
     if xyz.numel() and (int(xyz.min()) < 0 or int(xyz.max()) >= grid or int(coords[:, 0].max()) != 0
                         or int(coords[:, 0].min()) != 0):
