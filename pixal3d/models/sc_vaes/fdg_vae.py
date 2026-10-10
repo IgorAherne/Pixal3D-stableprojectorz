@@ -97,14 +97,20 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
         else:
             out_list = list(decoded) if isinstance(decoded, tuple) else [decoded]
             h = out_list[0]
-            vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
-            intersected = h.replace(h.feats[..., 3:6] > 0)
-            quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
+            vertices = (1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin
+            intersected = h.feats[..., 3:6] > 0
+            quad_lerp = F.softplus(h.feats[..., 6:7])
+            if h.shape[0] == 1:
+                # One item is the whole table: taking it out of three SparseTensors would copy each of them.
+                items = [(h.coords[:, 1:], vertices, intersected, quad_lerp)]
+            else:
+                items = ((v.coords[:, 1:], v.feats, i.feats, q.feats) for v, i, q in zip(
+                    h.replace(vertices), h.replace(intersected), h.replace(quad_lerp)))
             mesh = [Mesh(*flexible_dual_grid_to_mesh(
-                v.coords[:, 1:], v.feats, i.feats, q.feats,
+                coords, v, i, q,
                 aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
                 grid_size=self.resolution,
                 train=False
-            )) for v, i, q in zip(vertices, intersected, quad_lerp)]
+            )) for coords, v, i, q in items]
             out_list[0] = mesh
             return out_list[0] if len(out_list) == 1 else tuple(out_list)

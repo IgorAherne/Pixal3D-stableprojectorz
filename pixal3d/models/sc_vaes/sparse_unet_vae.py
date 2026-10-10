@@ -8,6 +8,73 @@ from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
 
 
+NORM_ROWS = 2 ** 18     # a table above this many rows is normalised a slab of rows at a time
+
+
+def norm_rows(norm: LayerNorm32, feats: torch.Tensor) -> torch.Tensor:
+    """
+    `norm(feats)` for a table of any size.
+
+    LayerNorm32 makes a float32 copy and a float32 result of the whole table it is given. Every row is
+    normalised on its own, so a big table goes through a slab of rows at a time, straight into a result of
+    the table's dtype. The table is normalised whole when gradients are wanted or autocast is on.
+    """
+    if feats.shape[0] <= NORM_ROWS or torch.is_grad_enabled() or torch.is_autocast_enabled():
+        return norm(feats)
+    out = torch.empty_like(feats)
+    for start in range(0, feats.shape[0], NORM_ROWS):
+        out[start:start + NORM_ROWS] = norm(feats[start:start + NORM_ROWS])
+    return out
+
+
+def cast_norm_rows(feats: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """
+    `F.layer_norm(feats.type(dtype))` over the channels, for a table of any size.
+
+    A big table is cast and normalised a slab of rows at a time (every row is normalised on its own), so the
+    cast copy of the whole table never exists beside the result. Whole when gradients are wanted.
+    """
+    if feats.shape[0] <= NORM_ROWS or torch.is_grad_enabled():
+        feats = feats.type(dtype)
+        return F.layer_norm(feats, feats.shape[-1:])
+    out = torch.empty(feats.shape, dtype=dtype, device=feats.device)
+    for start in range(0, feats.shape[0], NORM_ROWS):
+        rows = feats[start:start + NORM_ROWS].type(dtype)
+        out[start:start + NORM_ROWS] = F.layer_norm(rows, rows.shape[-1:])
+    return out
+
+
+class SiLUOverInput(nn.SiLU):
+    """
+    SiLU that overwrites its input when gradients are off: the same values without a second table of that
+    size. For right after a layer whose output nobody else holds, such as the first Linear of an MLP.
+    """
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        return F.silu(input, inplace=not torch.is_grad_enabled())
+
+
+def add_into(h: sp.SparseTensor, other: sp.SparseTensor) -> sp.SparseTensor:
+    """
+    `h + other`, feature rows added one to one. Without gradients the sum is written into h's own table
+    instead of a third one, so h must be a result nobody else holds (a convolution's output).
+    """
+    if torch.is_grad_enabled() or h.feats.dtype != other.feats.dtype or h.feats.shape != other.feats.shape:
+        return h + other
+    h.feats.add_(other.feats)
+    return h
+
+
+def forget_neighbors(x: sp.SparseTensor) -> None:
+    """
+    Drop the convolutions' neighbour tables of x's level (the flex_gemm backend keeps them in the level's
+    spatial cache, shared by every tensor of the level). For after the level's last convolution, when
+    gradients are off; a convolution that came later would build them again.
+    """
+    level = x.get_spatial_cache()
+    for key in [key for key in level if key.startswith('SubMConv3d_neighbor_cache')]:
+        del level[key]
+
+
 class SparseResBlock3d(nn.Module):
     def __init__(
         self,
@@ -236,20 +303,37 @@ class SparseResBlockC2S3d(nn.Module):
         if pred_subdiv:
             self.to_subdiv = sp.SparseLinear(channels, 8)
         self.updown = sp.SparseChannel2Spatial(2)
+        self.lean = False       # set through the decoder's `lean`
+
+    def trim(self) -> None:
+        """
+        With `lean` set, give PyTorch's unused blocks back to the driver. This block goes from the coarse
+        level's tables to ones four times their size: a fine table carved out of a block a coarse one left
+        behind strands the rest of that block, and under a memory cap the decode then fails with memory to
+        spare. No value depends on it.
+        """
+        if self.lean:
+            torch.cuda.empty_cache()
 
     def _forward(self, x: sp.SparseTensor, subdiv: sp.SparseTensor = None) -> sp.SparseTensor:
         if self.pred_subdiv:
             subdiv = self.to_subdiv(x)
-        h = x.replace(self.norm1(x.feats))
+        h = x.replace(norm_rows(self.norm1, x.feats))
         h = h.replace(F.silu(h.feats))
         h = self.conv1(h)
+        if not torch.is_grad_enabled():
+            forget_neighbors(x)     # conv1 is the last convolution on the coarse voxels
+        self.trim()
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
         h = self.updown(h, subdiv_binarized)
+        self.trim()
         x = self.updown(x, subdiv_binarized)
-        h = h.replace(self.norm2(h.feats))
+        self.trim()
+        h = h.replace(norm_rows(self.norm2, h.feats))
         h = h.replace(F.silu(h.feats))
+        self.trim()
         h = self.conv2(h)
-        h = h + self.skip_connection(x)
+        h = add_into(h, self.skip_connection(x))
         if self.pred_subdiv:
             return h, subdiv
         else:
@@ -277,13 +361,13 @@ class SparseConvNeXtBlock3d(nn.Module):
         self.conv = sp.SparseConv3d(channels, channels, 3)
         self.mlp = nn.Sequential(
             nn.Linear(channels, int(channels * mlp_ratio)),
-            nn.SiLU(),
+            SiLUOverInput(),
             zero_module(nn.Linear(int(channels * mlp_ratio), channels)),
         )
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = self.conv(x)
-        h = h.replace(self.norm(h.feats))
+        h = h.replace(norm_rows(self.norm, h.feats))
         h = h.replace(self.mlp(h.feats))
         return h + x
     
@@ -419,6 +503,7 @@ class SparseUnetVaeDecoder(nn.Module):
         self.pred_subdiv = pred_subdiv
         self.dtype = torch.float16 if use_fp16 else torch.float32
         self.low_vram = False
+        self.lean = False       # True: PyTorch's cache is emptied between the levels (see trim)
         
         self.output_layer = sp.SparseLinear(model_channels[-1], out_channels)
         self.from_latent = sp.SparseLinear(latent_channels, model_channels[0])
@@ -475,7 +560,31 @@ class SparseUnetVaeDecoder(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-    def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None, return_subs: bool = False) -> sp.SparseTensor:
+    @property
+    def lean(self) -> bool:
+        """
+        Whether PyTorch's cache is emptied between the levels and between the steps of the up-blocks (see
+        trim). Off by default; the staged engine sets it.
+        """
+        return self._lean
+
+    @lean.setter
+    def lean(self, value: bool) -> None:
+        self._lean = bool(value)
+        for module in self.modules():
+            if module is not self and hasattr(module, 'lean'):
+                module.lean = self._lean
+
+    def trim(self) -> None:
+        """
+        With `lean` set, give PyTorch's unused blocks back to the driver. Called between the levels: each
+        level's tables are several times larger than the last one's, and under a memory cap they would have
+        to be carved out of the smaller blocks the level before left behind. No value depends on it.
+        """
+        if self.lean:
+            torch.cuda.empty_cache()
+
+    def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[Union[sp.SparseTensor, torch.Tensor]]] = None, return_subs: bool = False) -> sp.SparseTensor:
         assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
         assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
         
@@ -492,11 +601,18 @@ class SparseUnetVaeDecoder(nn.Module):
                         h, sub = block(h)
                         subs.append(sub)
                     else:
-                        h = block(h, subdiv=guide_subs[i] if guide_subs is not None else None)
+                        guide = guide_subs[i] if guide_subs is not None else None
+                        if isinstance(guide, torch.Tensor):
+                            # A bare table [n, 8] (logits or booleans), rows in the order of this level's voxels.
+                            guide = h.replace(guide)
+                        h = block(h, subdiv=guide)
+                    self.trim()
                 else:
                     h = block(h)
-        h = h.type(x.dtype)
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+        if not torch.is_grad_enabled():
+            forget_neighbors(h)     # nothing after the blocks convolves
+            self.trim()
+        h = h.replace(cast_norm_rows(h.feats, x.dtype))
         h = self.output_layer(h)
         if self.training and self.pred_subdiv:
             return h, subs_gt, subs
@@ -506,6 +622,17 @@ class SparseUnetVaeDecoder(nn.Module):
             else:
                 return h
     
+    @staticmethod
+    def child_coords(block: nn.Module, x: sp.SparseTensor) -> torch.Tensor:
+        """
+        The coords the up-block `block` would give its output for the input x, rows in the same order.
+        They follow from the block's subdivision of x alone, so only that is computed: the subdivision
+        table is sent through the block's own upsampling in place of the features.
+        """
+        subdiv = block.to_subdiv(x)
+        subdiv = subdiv.replace(subdiv.feats > 0)
+        return block.updown(subdiv, subdiv).coords
+
     def upsample(self, x: sp.SparseTensor, upsample_times: int) -> torch.Tensor:
         assert self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with upsampling"
         
@@ -516,7 +643,10 @@ class SparseUnetVaeDecoder(nn.Module):
                 return h.coords
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
+                    if i == upsample_times - 1:
+                        return self.child_coords(block, h)
                     h, sub = block(h)
+                    self.trim()
                 else:
                     h = block(h)
        
