@@ -4,7 +4,7 @@ import torch.nn as nn
 import numpy as np
 from PIL import Image
 from .base import Pipeline
-from . import samplers, rembg
+from . import samplers, rembg, decode, proj_cond
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
@@ -189,6 +189,17 @@ class Pixal3DImageTo3DPipeline(Pipeline):
     # Proj mode condition building
     # =========================================================================
 
+    def _cond_inputs(self, image_cond_model: nn.Module, image, camera_angle_x, distance, mesh_scale):
+        """What a conditioning is built from: this stage's settings, DINOv3's tokens of its pictures, those
+        pictures again (NAF's guide) and the camera. The multi-view pipeline overrides this and nothing else."""
+        device = self.device
+        spec = proj_cond.Spec.of(image_cond_model)
+        pictures = proj_cond.image_tensor(image, spec.image_size, device)
+        z = proj_cond.encode(image_cond_model.model, pictures)
+        camera = proj_cond.Camera.single(
+            {'camera_angle_x': camera_angle_x, 'distance': distance, 'mesh_scale': mesh_scale}, device)
+        return spec, z, pictures, camera
+
     @torch.no_grad()
     def get_proj_cond_ss(
         self,
@@ -209,22 +220,14 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         Returns:
             dict with 'cond' and 'neg_cond', each containing {'global': ..., 'proj': ...}
         """
-        device = self.device
         image_cond_model = self.image_cond_model_ss
         if self.low_vram:
-            image_cond_model.to(device)
-        cam_angle = torch.tensor([camera_angle_x], device=device)
-        dist_tensor = torch.tensor([distance], device=device)
-        scale_tensor = torch.tensor([mesh_scale], device=device)
-        z_global, z_proj = image_cond_model(
-            image, camera_angle_x=cam_angle, distance=dist_tensor, mesh_scale=scale_tensor,
-        )
+            image_cond_model.to(self.device)
+        spec, z, _, camera = self._cond_inputs(image_cond_model, image, camera_angle_x, distance, mesh_scale)
+        cond = proj_cond.cond_dense(spec, z, camera)
         if self.low_vram:
             image_cond_model.cpu()
-        return {
-            'cond': {'global': z_global, 'proj': z_proj},
-            'neg_cond': {'global': torch.zeros_like(z_global), 'proj': torch.zeros_like(z_proj)},
-        }
+        return {'cond': cond, 'neg_cond': proj_cond.negative(cond)}
 
     @torch.no_grad()
     def get_proj_cond_shape(
@@ -252,46 +255,23 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         Returns:
             dict with 'cond' and 'neg_cond', each containing {'global': ..., 'proj': SparseTensor}
         """
-        device = self.device
         if self.low_vram:
-            image_cond_model.to(device)
-
-        orig_grid_res = image_cond_model.grid_resolution
-        if grid_resolution_override is not None and grid_resolution_override != orig_grid_res:
-            image_cond_model.grid_resolution = grid_resolution_override
-            image_cond_model.proj_grid = image_cond_model.proj_grid.__class__(
-                grid_resolution=grid_resolution_override,
-                image_resolution=image_cond_model.proj_grid.image_resolution,
-            ).to(device)
-
-        B = 1
-        cam_angle = torch.tensor([camera_angle_x], device=device)
-        dist_tensor = torch.tensor([distance], device=device)
-        scale_tensor = torch.tensor([mesh_scale], device=device)
-        z_global, z_proj = image_cond_model(
-            image, camera_angle_x=cam_angle, distance=dist_tensor, mesh_scale=scale_tensor,
-        )
-        grid_res = image_cond_model.grid_resolution
-        z_proj_grid = z_proj.reshape(B, grid_res, grid_res, grid_res, -1)
-        batch_indices = coords[:, 0].long()
-        x_coords = coords[:, 1].long()
-        y_coords = coords[:, 2].long()
-        z_coords = coords[:, 3].long()
-        z_proj_sparse = z_proj_grid[batch_indices, x_coords, y_coords, z_coords]
-        z_proj_st = SparseTensor(feats=z_proj_sparse, coords=coords)
-
-        if grid_resolution_override is not None and grid_resolution_override != orig_grid_res:
-            image_cond_model.grid_resolution = orig_grid_res
-            image_cond_model.proj_grid = image_cond_model.proj_grid.__class__(
-                grid_resolution=orig_grid_res,
-                image_resolution=image_cond_model.proj_grid.image_resolution,
-            ).to(device)
-
+            image_cond_model.to(self.device)
+        spec, z, pictures, camera = self._cond_inputs(
+            image_cond_model, image, camera_angle_x, distance, mesh_scale)
+        image_cond_model._load_naf()
+        # The HR cascade's grid floats with the token budget, so it can differ from what this stage was
+        # trained at; proj_cond keeps one projection grid per side and leaves the extractor's own alone.
+        grid = image_cond_model.grid_resolution if grid_resolution_override is None else grid_resolution_override
+        cond = proj_cond.cond_tokens(
+            spec, z, pictures, image_cond_model.naf_model, camera, coords, grid)
+        feats = cond['proj']
         if self.low_vram:
             image_cond_model.cpu()
         return {
-            'cond': {'global': z_global, 'proj': z_proj_st},
-            'neg_cond': {'global': torch.zeros_like(z_global), 'proj': SparseTensor(feats=torch.zeros_like(z_proj_sparse), coords=coords)},
+            'cond': {'global': cond['global'], 'proj': SparseTensor(feats=feats, coords=coords)},
+            'neg_cond': {'global': torch.zeros_like(cond['global']),
+                         'proj': SparseTensor(feats=torch.zeros_like(feats), coords=coords)},
         }
 
     # =========================================================================
@@ -486,7 +466,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         self,
         slat: SparseTensor,
         resolution: int,
-    ) -> Tuple[List[Mesh], List[SparseTensor]]:
+    ) -> Tuple[Mesh, List[torch.Tensor]]:
         """
         Decode the structured latent.
 
@@ -494,19 +474,17 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             slat (SparseTensor): The structured latent.
 
         Returns:
-            List[Mesh]: The decoded meshes.
-            List[SparseTensor]: The decoded substructures.
+            Mesh: The decoded mesh, before its holes are closed.
+            List[torch.Tensor]: The four subdivision tables the texture decoder follows.
         """
-        self.models['shape_slat_decoder'].set_resolution(resolution)
+        decoder = self.models['shape_slat_decoder']
         if self.low_vram:
-            self.models['shape_slat_decoder'].to(self.device)
-            self.models['shape_slat_decoder'].low_vram = True
-        ret = self.models['shape_slat_decoder'](slat, return_subs=True)
+            decoder.to(self.device)
+        ret = decode.decode_shape(decoder, slat.feats, slat.coords, resolution)
         if self.low_vram:
-            self.models['shape_slat_decoder'].cpu()
-            self.models['shape_slat_decoder'].low_vram = False
+            decoder.cpu()
         return ret
-    
+
     def sample_tex_slat(
         self,
         cond: dict,
@@ -553,24 +531,26 @@ class Pixal3DImageTo3DPipeline(Pipeline):
     def decode_tex_slat(
         self,
         slat: SparseTensor,
-        subs: List[SparseTensor],
-    ) -> SparseTensor:
+        subs: List[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Decode the structured latent.
 
         Args:
             slat (SparseTensor): The structured latent.
+            subs (List[torch.Tensor]): The shape decode's subdivision tables.
 
         Returns:
-            SparseTensor: The decoded texture voxels
+            Tuple[torch.Tensor, torch.Tensor]: The texture voxels' coords [N, 3] and their attributes [N, 6].
         """
+        decoder = self.models['tex_slat_decoder']
         if self.low_vram:
-            self.models['tex_slat_decoder'].to(self.device)
-        ret = self.models['tex_slat_decoder'](slat, guide_subs=subs) * 0.5 + 0.5
+            decoder.to(self.device)
+        ret = decode.decode_texture(decoder, slat.feats, slat.coords, subs)
         if self.low_vram:
-            self.models['tex_slat_decoder'].cpu()
+            decoder.cpu()
         return ret
-    
+
     @torch.no_grad()
     def decode_latent(
         self,
@@ -586,24 +566,20 @@ class Pixal3DImageTo3DPipeline(Pipeline):
             tex_slat (SparseTensor): The structured latent for texture.
             resolution (int): The resolution of the output.
         """
-        meshes, subs = self.decode_shape_slat(shape_slat, resolution)
-        tex_voxels = self.decode_tex_slat(tex_slat, subs)
-        out_mesh = []
-        torch.cuda.synchronize()
-        for m, v in zip(meshes, tex_voxels):
-            m.fill_holes()
-            out_mesh.append(
-                MeshWithVoxel(
-                    m.vertices, m.faces,
-                    origin = [-0.5, -0.5, -0.5],
-                    voxel_size = 1 / resolution,
-                    coords = v.coords[:, 1:],
-                    attrs = v.feats,
-                    voxel_shape = torch.Size([*v.shape, *v.spatial_shape]),
-                    layout=self.pbr_attr_layout
-                )
+        mesh, subs = self.decode_shape_slat(shape_slat, resolution)
+        coords, attrs = self.decode_tex_slat(tex_slat, subs)
+        decode.fill_holes(mesh)
+        return [
+            MeshWithVoxel(
+                mesh.vertices, mesh.faces,
+                origin = [-0.5, -0.5, -0.5],
+                voxel_size = 1 / resolution,
+                coords = coords,
+                attrs = attrs,
+                voxel_shape = torch.Size([1, attrs.shape[1], *(coords.max(0)[0] + 1).tolist()]),
+                layout=self.pbr_attr_layout
             )
-        return out_mesh
+        ]
     
     @torch.no_grad()
     def run(

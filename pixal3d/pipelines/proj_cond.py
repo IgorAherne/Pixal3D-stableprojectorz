@@ -51,6 +51,25 @@ class Spec:
     patch_size: int = 16
     registers: int = 4
 
+    @staticmethod
+    def of(extractor: nn.Module) -> "Spec":
+        """The settings of a built extractor (DinoV3ProjFeatureExtractor or its multi-view subclass). A caller
+        that holds one then conditions exactly as that extractor would, whatever pipeline.json gave it."""
+        target = tuple(extractor.naf_target_size) if extractor.use_naf_upsample else None
+        if target is not None and target[0] != target[1]:
+            raise ValueError(f"NAF's target map must be square, got {target}")
+        return Spec(
+            name=f"{extractor.image_size} px, grid {extractor.grid_resolution}"
+                 + (f", naf {target[0]}" if target else ""),
+            grid=extractor.grid_resolution,
+            image_size=extractor.image_size,
+            use_naf=extractor.use_naf_upsample,
+            naf_target=target[0] if target else None,
+            model_name=extractor.model_name,
+            patch_size=extractor.patch_size,
+            registers=getattr(extractor.model.config, "num_register_tokens", 4),
+        )
+
 
 SPECS: Dict[str, Spec] = {
     "ss": Spec("ss", grid=16, image_size=512),
@@ -84,7 +103,8 @@ class Camera:
 
     @staticmethod
     def from_bundle(views: dict, device) -> "Camera":
-        """From a views bundle (see Pixal3DMVImageTo3DPipeline.run_mv), as its _run_extractor builds them."""
+        """From a views bundle (see Pixal3DMVImageTo3DPipeline.run_mv), which holds the same three values that
+        pipeline passes its condition builders."""
         transform_matrix = views["transform_matrix"].to(device)
         return Camera(
             camera_angle_x=torch.as_tensor(views["camera_angle_x"], dtype=torch.float32, device=device),
