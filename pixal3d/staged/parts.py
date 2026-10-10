@@ -42,7 +42,7 @@ from .types import PARTS, DecodedMesh, Event, PropFailed
 
 # MiB outside PyTorch's allocator while a part runs (cuBLAS / cuDNN handles, flash_attn, natten, flex_gemm work
 # areas; for "finish" its decode phase, which adds cumesh's fill_holes). The loader's cap leaves this much free.
-NATIVE_RESERVE = {**{part: 200 for part in PARTS if part != "finish"}, "finish": 300}
+NATIVE_RESERVE = {**{part: 200 for part in PARTS if part != "finish"}, "finish": 300}   # starting figures
 # Both phases of "finish" leave more of the card alone than the other parts do: the page's viewer may load a
 # finished model while the next prop is decoded.
 FINISH_SAFETY_MIB = 500
@@ -80,15 +80,18 @@ SPENT = {"ss": ("cond_ss",), "cond_lr": ("dino512",), "lr": ("cond_lr", "rng_ss"
          "tex": ("cond_tex", "rng_hr")}
 
 # Whether both decoders may be on the card at once in "finish": weights of one, voxels a token decodes to at most,
-# and PyTorch's allocated need per thousand decoded voxels.
+# and what a decode needs per thousand of them. Measured on an RTX 3060 over the captured reference cases (the
+# widest was 338 voxels per token). They decide speed, not correctness: too low and the two decoders are loaded
+# together, do not fit, and "finish" is run again with one at a time.
 DECODER_MIB = 905
-VOXELS_PER_TOKEN = 311
-DECODE_MIB_PER_KVOXEL = 0.80
+VOXELS_PER_TOKEN = 340
+DECODE_MIB_PER_KVOXEL = 0.52
 
 
 def glb_reserve(faces: int) -> int:
     """MiB of native memory the caller's finish hook needs for a decoded mesh of `faces` faces (to_glb: the
-    nvdiffrast context, one BVH at a time, cumesh)."""
+    nvdiffrast context, one BVH at a time, cumesh). A starting figure: too small and the hook spills into
+    shared memory, too large and a big mesh is decoded with the cap lifted that would have fitted."""
     return 2300 + 60 * faces // 1_000_000
 
 
@@ -366,7 +369,7 @@ def cond_hr(ctx: PartContext, prop: PropState, mode: str) -> None:
     z1024 = ctx.take(prop, "dino1024")["z"]
     image = proj_cond.image_tensor(source, 1024, ctx.device)
     shape = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["shape_1024"], z1024, image, naf, view, coords, grid))
-    ctx.loader.trim()
+    ctx.loader.trim()       # the texture conditioning is the widest moment of a prop: it starts from a clean cache
     tex = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["tex_1024"], z1024, image, naf, view, coords, grid))
     ctx.store.put_device(prop.id, "cond_hr", shape)
     ctx.store.put_device(prop.id, "cond_tex", tex)

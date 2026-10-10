@@ -25,7 +25,6 @@ from flex_gemm.ops import spconv, utils
 from flex_gemm.ops.spconv import Algorithm
 from flex_gemm.ops.spconv.submanifold_conv3d import SubMConv3dNeighborCache
 
-ENABLED = True              # False: every cache is flex_gemm's own
 MASKED = (Algorithm.MASKED_IMPLICIT_GEMM, Algorithm.MASKED_IMPLICIT_GEMM_SPLITK)
 MAX_KERNEL_VOLUME = 31      # the codes are kept as int32, as flex_gemm stores them: bit 31 would be the sign
 
@@ -37,11 +36,12 @@ def build(coords: torch.Tensor, shape: torch.Size, kernel_size: Tuple[int, int, 
     `shape` (N, C, W, H, D), for flex_gemm's algorithm in use; `kernel_size` and `dilation` in the order of
     the weight's kernel dimensions.
 
-    None when this cache does not apply (gradients on, switched off, another algorithm, coords not on the
-    card, a kernel of more than 31 offsets): flex_gemm then builds its own.
+    None when this cache does not apply (gradients on, another algorithm, coords not on the card, a kernel
+    of more than 31 offsets): flex_gemm then builds its own. The caller decides whether to ask at all
+    (conv/config.py LEAN_NEIGHBOR_CACHE).
     """
     volume = kernel_size[0] * kernel_size[1] * kernel_size[2]
-    if (not ENABLED or torch.is_grad_enabled() or spconv.ALGORITHM not in MASKED or not coords.is_cuda
+    if (torch.is_grad_enabled() or spconv.ALGORITHM not in MASKED or not coords.is_cuda
             or volume > MAX_KERNEL_VOLUME):
         return None
     assert coords.is_contiguous(), "Coords should be contiguous"

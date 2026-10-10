@@ -52,7 +52,7 @@ def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
     cached = neighbor_cache is not None
     if not cached:
         # The forward-only cache where it applies; None leaves the building to flex_gemm.
-        neighbor_cache = lean_cache.build(x.coords, shape, tuple(self.weight.shape[1:4]), self.dilation)
+        neighbor_cache = None if not config.LEAN_NEIGHBOR_CACHE else lean_cache.build(x.coords, shape, tuple(self.weight.shape[1:4]), self.dilation)
     
     out, neighbor_cache_ = sparse_submanifold_conv3d(
         x.feats,

@@ -4,8 +4,9 @@
 (`Pixal3DImageTo3DPipeline.run`, `Pixal3DMVImageTo3DPipeline.run_mv`) keep every network in RAM and move one after
 the other to the card for each prop. The staged engine makes a whole batch of props **part by part**: every prop
 goes through one part before any prop starts the next, and a part's networks are read from disk straight onto the
-card when the part starts and dropped when it ends. Nothing rests in RAM, and PyTorch's reserve on the card is
-capped so that it recycles its cache instead of spilling into shared memory.
+card when the part starts and dropped when it ends. No network rests in RAM (what a prop carries from part to
+part does, within a budget, and spills to the work folder beyond it), and PyTorch's reserve on the card is capped
+so that it recycles its cache instead of spilling into shared memory.
 
 The results are those of the reference pipelines for the same picture, seed and settings: same random numbers in
 the same order, same arithmetic. `run()` and `run_mv()` stay in the fork as that reference.
@@ -30,14 +31,18 @@ engine.release()        # before anything else needs the card (the reference pip
 engine.close()          # at exit: also stops the helper threads
 ```
 
-- `run` blocks and must be called on the one thread that does all CUDA work of the process. It raises only
-  `BatchBroken` (the CUDA context is unusable; restart the process). A prop that fails does not stop the others:
+- `run` blocks and must be called on the one thread that does all CUDA work of the process. Of the failures a
+  batch can meet it raises only `BatchBroken` (the CUDA context is unusable; restart the process): anything else
+  is laid on the props that had not finished, so the ones that had keep their results. Being called wrongly still
+  raises (`ValueError` for two props with one id, `RuntimeError` for a second batch at the same time). A prop that
+  fails does not stop the others:
   its entry is `{"state": "failed", "error": {"kind", "detail"}}` with kind `input`, `mv_missing`, `oom`, `ram`,
   `disk`, `missing_file` or `error`.
 - `cancelled()` is asked before every prop of every part, between the tensors of a network being loaded, at every
   sampler step and between the steps of the last part. Unfinished props come back as `{"state": "cancelled"}`. A
   prop whose file is being written is finished first.
-- `work_dir` belongs to the batch. The engine empties it at the start and leaves it empty at the end.
+- `work_dir` belongs to the batch. The engine empties it at the start, except for the checkpoints `resume` is
+  about to read, and removes each prop's folder as that prop ends.
 - `wave_size=K` makes K props at a time go through all parts (the first results appear sooner, a crash loses
   less). `None` / `0`: all props of the batch together.
 - `resume=True` on a second call with the same `work_dir` (after the process died): props whose sampling was
@@ -169,4 +174,6 @@ tensors. The runner reduces a failure to strings, leaves the `except` block and 
   fakes (`check_engine.py --fake` in Spellcast3D's `code/spellcast/profiling/p3d_checks/`).
 - On the card, the same script runs the engine on golden cases: tensors captured from the untouched reference
   path stage by stage (conditionings, coords, generator states, latents, the decoded mesh). Integers must be equal;
-  floats must be bit-equal wherever the reference reproduces itself bit for bit.
+  floats must be bit-equal wherever the reference reproduces itself bit for bit. The comparison is always against
+  those captured tensors, never against a live run of the reference path: the fork's own convolutions and decoders
+  changed under both, so the reference is no longer an independent control.

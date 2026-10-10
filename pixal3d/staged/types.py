@@ -81,7 +81,9 @@ class PropFailed(Exception):
     def __init__(self, detail: str, kind: str = "error"):
         super().__init__(detail)
         self.detail = detail
-        self.kind = kind            # one of FAILURE_KINDS
+        if kind not in FAILURE_KINDS:
+            raise ValueError(f"{kind!r} is not one of {FAILURE_KINDS}")
+        self.kind = kind
 
 
 class Cancelled(Exception):

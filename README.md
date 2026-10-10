@@ -243,7 +243,7 @@ Views need not be RGBA — any view without an alpha channel is matted with the 
 
 #### Batches in little memory: the staged engine
 
-`pixal3d/staged/` makes a whole batch of props part by part (cut-out, features, each sampler, the decoders), with only the networks of the running part on the card and none resting in RAM, and gives the results of `run()` / `run_mv()` for the same picture, seed and settings. It is a library for a host application that supplies the file handling through hooks; its API, parts, memory rules and checks are described in [docs/staged_engine.md](docs/staged_engine.md).
+`pixal3d/staged/` makes a whole batch of props part by part (cut-out, features, each sampler, the decoders), with only the networks of the running part on the card and no network resting in RAM. It is meant to give the results of `run()` / `run_mv()` for the same picture, seed and settings, and is checked against tensors captured from the reference path, wherever that path reproduces itself bit for bit. It needs the same graphics card as the rest of Pixal3D (Ampere or newer): it asks for less memory, not for less of the card. It is a library for a host application that supplies the file handling through hooks; its API, parts, memory rules and checks are described in [docs/staged_engine.md](docs/staged_engine.md).
 
 ### Web Demo
 
