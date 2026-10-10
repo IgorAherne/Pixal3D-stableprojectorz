@@ -182,6 +182,10 @@ class StagedEngine:
         proj_cond = sys.modules.get("pixal3d.pipelines.proj_cond")      # only the parts import it, and lazily
         if proj_cond is not None:
             proj_cond.clear_grids()
+        if torch.cuda.is_initialized():
+            # cuBLAS keeps an 8 MiB work area from a process's first matrix product on; the next tool on the card
+            # can use it, and the next batch makes it again at once.
+            torch._C._cuda_clearCublasWorkspaces()
 
     def close(self) -> None:
         """release(), then stop the loader's thread. The store's belongs to a batch and is stopped with it."""
