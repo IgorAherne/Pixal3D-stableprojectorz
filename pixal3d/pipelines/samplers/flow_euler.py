@@ -20,6 +20,7 @@ class FlowEulerSampler(Sampler):
         sigma_min: float,
     ):
         self.sigma_min = sigma_min
+        self._model_time = None
 
     def _eps_to_xstart(self, x_t, t, eps):
         assert x_t.shape == eps.shape
@@ -41,8 +42,20 @@ class FlowEulerSampler(Sampler):
     def _xstart_to_pred(self, x_t, t, x_0):
         return ((1 - self.sigma_min) * x_t - x_0) / (self.sigma_min + (1 - self.sigma_min) * t)
 
+    def _timestep(self, t, batch_size, device):
+        """
+        The timestep the model takes: 1000 * t for every item of the batch, made on the device.
+
+        The two passes of a guided step ask for the same one, so the last one made is kept
+        (until sample() ends).
+        """
+        key = (t, batch_size, device)
+        if self._model_time is None or self._model_time[0] != key:
+            self._model_time = (key, torch.full((batch_size,), 1000 * t, dtype=torch.float32, device=device))
+        return self._model_time[1]
+
     def _inference_model(self, model, x_t, t, cond=None, **kwargs):
-        t = torch.tensor([1000 * t] * x_t.shape[0], device=x_t.device, dtype=torch.float32)
+        t = self._timestep(t, x_t.shape[0], x_t.device)
         return model(x_t, t, cond, **kwargs)
 
     def _get_model_prediction(self, model, x_t, t, cond=None, **kwargs):
@@ -80,6 +93,13 @@ class FlowEulerSampler(Sampler):
         pred_x_prev = x_t - (t - t_prev) * pred_v
         return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
 
+    def _euler_step(self, model, x_t, t: float, t_prev: float, cond: Optional[Any] = None, **kwargs):
+        """
+        x_{t-1} alone: the step of sample_once without its prediction of x_0.
+        """
+        pred_v = self._inference_model(model, x_t, t, cond, **kwargs)
+        return x_t - (t - t_prev) * pred_v
+
     @torch.no_grad()
     def sample(
         self,
@@ -90,6 +110,8 @@ class FlowEulerSampler(Sampler):
         rescale_t: float = 1.0,
         verbose: bool = True,
         tqdm_desc: str = "Sampling",
+        keep_trajectory: bool = True,
+        step_callback: Optional[Callable[[int, int], None]] = None,
         **kwargs
     ):
         """
@@ -103,6 +125,10 @@ class FlowEulerSampler(Sampler):
             rescale_t: The rescale factor for t.
             verbose: If True, show a progress bar.
             tqdm_desc: A customized tqdm desc.
+            keep_trajectory: If False, only the samples are returned: the two lists stay empty
+                and the prediction of x_0 is not computed.
+            step_callback: Called as step_callback(step, steps) after every step (step counts from 1).
+                What it raises ends the sampling.
             **kwargs: Additional arguments for model_inference.
 
         Returns:
@@ -117,11 +143,19 @@ class FlowEulerSampler(Sampler):
         t_seq = t_seq.tolist()
         t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
         ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
-        for t, t_prev in tqdm(t_pairs, desc=tqdm_desc, disable=not verbose):
-            out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
-            sample = out.pred_x_prev
-            ret.pred_x_t.append(out.pred_x_prev)
-            ret.pred_x_0.append(out.pred_x_0)
+        try:
+            for step, (t, t_prev) in enumerate(tqdm(t_pairs, desc=tqdm_desc, disable=not verbose), start=1):
+                if keep_trajectory:
+                    out = self.sample_once(model, sample, t, t_prev, cond, **kwargs)
+                    sample = out.pred_x_prev
+                    ret.pred_x_t.append(out.pred_x_prev)
+                    ret.pred_x_0.append(out.pred_x_0)
+                else:
+                    sample = self._euler_step(model, sample, t, t_prev, cond, **kwargs)
+                if step_callback is not None:
+                    step_callback(step, steps)
+        finally:
+            self._model_time = None
         ret.samples = sample
         return ret
 
@@ -136,7 +170,7 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
         model,
         noise,
         cond,
-        neg_cond,
+        neg_cond: Optional[Any] = None,
         steps: int = 50,
         rescale_t: float = 1.0,
         guidance_strength: float = 3.0,
@@ -150,7 +184,7 @@ class FlowEulerCfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowEulerSampler):
             model: The model to sample from.
             noise: The initial noise tensor.
             cond: conditional information.
-            neg_cond: negative conditional information.
+            neg_cond: negative conditional information. Not read (may be None) when guidance_strength is 1.
             steps: The number of steps to sample.
             rescale_t: The rescale factor for t.
             guidance_strength: The strength of classifier-free guidance.
@@ -176,7 +210,7 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
         model,
         noise,
         cond,
-        neg_cond,
+        neg_cond: Optional[Any] = None,
         steps: int = 50,
         rescale_t: float = 1.0,
         guidance_strength: float = 3.0,
@@ -191,7 +225,7 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
             model: The model to sample from.
             noise: The initial noise tensor.
             cond: conditional information.
-            neg_cond: negative conditional information.
+            neg_cond: negative conditional information. Not read (may be None) when guidance_strength is 1.
             steps: The number of steps to sample.
             rescale_t: The rescale factor for t.
             guidance_strength: The strength of classifier-free guidance.

@@ -9,7 +9,9 @@ class ClassifierFreeGuidanceSamplerMixin:
     def _inference_model(self, model, x_t, t, cond, neg_cond, guidance_strength, guidance_rescale=0.0, **kwargs):
         if guidance_strength == 1:
             return super()._inference_model(model, x_t, t, cond, **kwargs)
-        elif guidance_strength == 0:
+        if neg_cond is None:
+            raise ValueError(f"neg_cond is needed when guidance_strength is not 1 (it is {guidance_strength})")
+        if guidance_strength == 0:
             return super()._inference_model(model, x_t, t, neg_cond, **kwargs)
         else:
             pred_pos = super()._inference_model(model, x_t, t, cond, **kwargs)
