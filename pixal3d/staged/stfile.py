@@ -11,14 +11,20 @@ non-blocking copy to the card stays non-blocking. Nothing here touches CUDA or a
         ...
     tensors = read_into(path, None, buffer)             # a whole small file into the buffer at once (store slots)
     write(path, {"feats": feats, "coords": coords})     # CPU tensors, through <path>.tmp
+    write_streamed(path, layout, pieces, metadata=...)  # tensor by tensor, piece by piece (weights.py's copies)
+    metadata = read_metadata(path)                      # the header's "__metadata__"
+    digest = header_sha256(path)                        # a fingerprint of the header (one small read)
 
 The format: 8 bytes (little-endian count N), N bytes of JSON {name: {"dtype", "shape", "data_offsets": [a, b]}},
-then the tensors' bytes, each at a + 8 + N. Complex64 is stored as pairs of float32 (real, imaginary).
+then the tensors' bytes, each at a + 8 + N. Complex64 is stored as pairs of float32 (real, imaginary). The JSON
+may also hold "__metadata__": {text: text}, which is no tensor.
 """
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
+import hashlib
 import json
 import os
 import struct
@@ -64,6 +70,34 @@ def read_header(path: str | os.PathLike) -> dict[str, TensorInfo]:
     """name -> TensorInfo of every tensor in the file, sorted by `start`. Reads the header only."""
     with open(path, "rb", buffering=0) as handle:
         return _header(handle, path)
+
+
+def read_metadata(path: str | os.PathLike) -> dict[str, str]:
+    """The header's "__metadata__" ({} when it has none). Reads the header only and checks it as read_header
+    does, so a file whose tensors do not fit it raises ValueError here too."""
+    with open(path, "rb", buffering=0) as handle:
+        entries, base = _entries(handle, path)
+        _infos(entries, base, os.fstat(handle.fileno()).st_size, path)
+    metadata = entries.get("__metadata__", {})
+    if not isinstance(metadata, dict) or not all(isinstance(key, str) and isinstance(value, str)
+                                                 for key, value in metadata.items()):
+        raise ValueError(f"{path}: the header's __metadata__ is not a map of texts")
+    return dict(metadata)
+
+
+def header_sha256(path: str | os.PathLike) -> str:
+    """SHA-256 of the file's first 8 + N bytes, its header's length and the header: a fingerprint of the names,
+    dtypes, shapes and places of its tensors that costs one small read."""
+    with open(path, "rb", buffering=0) as handle:
+        size = os.fstat(handle.fileno()).st_size
+        count = bytearray(8)
+        _fill(handle, memoryview(count), path)
+        length = struct.unpack("<Q", count)[0]
+        if length > min(_HEADER_LIMIT, size - 8):
+            raise ValueError(f"{path} is not a safetensors file (header of {length} bytes in a file of {size})")
+        text = bytearray(length)
+        _fill(handle, memoryview(text), path)
+    return hashlib.sha256(count + text).hexdigest()
 
 
 def as_tensor(data: torch.Tensor, info: TensorInfo) -> torch.Tensor:
@@ -141,16 +175,92 @@ def write(path: str | os.PathLike, tensors: dict[str, torch.Tensor], *, fsync: b
     for name, code, tensor, size in entries:
         header[name] = {"dtype": code, "shape": list(tensor.shape), "data_offsets": [total, total + size]}
         total += size
+    text = _header_text(header)
+    with _replacing(path, fsync) as handle:
+        _drain(handle, memoryview(text))
+        for name, code, tensor, size in entries:
+            _write_memory(handle, tensor, size)
+    return len(text) + total
+
+
+def write_streamed(path: str | os.PathLike, layout: Iterable[tuple[str, torch.dtype, tuple[int, ...]]],
+                   pieces: Iterable[tuple[str, torch.Tensor]], *, metadata: dict[str, str] | None = None,
+                   fsync: bool = False) -> int:
+    """Write a safetensors file whose tensors arrive piece by piece, so that only one piece need be in memory at a
+    time; return its size in bytes.
+
+    `layout` gives every tensor (name, dtype, shape) in the order they take in the file, one after the other
+    without gaps: a tensor then starts on a multiple of its element size only when the ones before it leave it
+    there (none of the readers here needs that). `pieces` yields (name, CPU tensor) in the layout's order, each
+    tensor being the next elements of the tensor of that name, in its dtype, as many as the piece holds (a tensor
+    of no elements needs no piece). `metadata` becomes the header's "__metadata__". Written through <path>.tmp as
+    `write` is; ValueError when the pieces do not fill the layout exactly, and then nothing is left behind."""
+    order: list[tuple[str, torch.dtype, int]] = []
+    header: dict[str, dict] = {}
+    if metadata:
+        if not all(isinstance(key, str) and isinstance(value, str) for key, value in metadata.items()):
+            raise ValueError("metadata is a map of texts")
+        header["__metadata__"] = dict(metadata)
+    total = 0
+    for name, dtype, shape in layout:
+        code = _CODE.get(dtype)
+        if not isinstance(name, str) or name == "__metadata__" or name in header:
+            raise ValueError(f"{name!r} cannot be a tensor's name here")
+        if code is None:
+            raise ValueError(f"{name}: {dtype} cannot be written (supported: {sorted(DTYPES)})")
+        elements = 1
+        for side in shape:
+            elements *= int(side)
+        size = elements * _ITEM[code]
+        header[name] = {"dtype": code, "shape": [int(side) for side in shape], "data_offsets": [total, total + size]}
+        order.append((name, dtype, size))
+        total += size
+    text = _header_text(header)
+
+    with _replacing(path, fsync) as handle:
+        _drain(handle, memoryview(text))
+        index, left = -1, 0
+        for name, piece in pieces:
+            while index < 0 or name != order[index][0]:
+                if left:
+                    raise ValueError(f"{order[index][0]}: {left} bytes were still to come when {name} began")
+                index += 1
+                if index == len(order):
+                    raise ValueError(f"{name} is not in the layout, or comes out of its order")
+                left = order[index][2]
+            if (not isinstance(piece, torch.Tensor) or piece.dtype != order[index][1]
+                    or piece.device.type != "cpu" or piece.layout != torch.strided):
+                raise ValueError(f"{name}: a piece must be a dense CPU tensor of {order[index][1]}")
+            if piece.is_conj() or piece.is_neg():
+                piece = piece.resolve_conj().resolve_neg()
+            piece = piece.contiguous()
+            size = piece.numel() * piece.element_size()
+            if size > left:
+                raise ValueError(f"{name}: more elements came than its shape holds")
+            _write_memory(handle, piece, size)
+            left -= size
+        if index >= 0 and left:
+            raise ValueError(f"the pieces ended {left} bytes before the end of {order[index][0]}")
+        rest = [entry[0] for entry in order[index + 1:] if entry[2]]
+        if rest:
+            raise ValueError(f"the pieces ended before {rest[0]}")
+    return len(text) + total
+
+
+def _header_text(header: dict) -> bytes:
+    """The 8-byte length and the JSON of a header, padded with spaces to a multiple of 8 bytes."""
     text = json.dumps(header, separators=(",", ":")).encode("utf-8")
     text += b" " * (-len(text) % 8)
+    return struct.pack("<Q", len(text)) + text
 
+
+@contextlib.contextmanager
+def _replacing(path: str | os.PathLike, fsync: bool) -> Iterator:
+    """An open <path>.tmp to write; renamed over `path` when the block ends well, removed when it does not."""
     partial = f"{os.fspath(path)}.tmp"
     try:
         with open(partial, "wb", buffering=0) as handle:
-            _drain(handle, memoryview(struct.pack("<Q", len(text)) + text))
-            for name, code, tensor, size in entries:
-                if size:
-                    _drain(handle, memoryview((ctypes.c_ubyte * size).from_address(tensor.data_ptr())))
+            yield handle
             if fsync:
                 os.fsync(handle.fileno())
         os.replace(partial, path)
@@ -160,11 +270,22 @@ def write(path: str | os.PathLike, tensors: dict[str, torch.Tensor], *, fsync: b
         except OSError:
             pass
         raise
-    return 8 + len(text) + total
+
+
+def _write_memory(handle, tensor: torch.Tensor, size: int) -> None:
+    """The `size` bytes of a contiguous CPU tensor's memory, straight out of it."""
+    if size:
+        _drain(handle, memoryview((ctypes.c_ubyte * size).from_address(tensor.data_ptr())))
 
 
 def _header(handle, path) -> dict[str, TensorInfo]:
     """The header of an open file, checked against the file's size."""
+    entries, base = _entries(handle, path)
+    return _infos(entries, base, os.fstat(handle.fileno()).st_size, path)
+
+
+def _entries(handle, path) -> tuple[dict, int]:
+    """The header's JSON object of an open file, and where the tensors' bytes begin."""
     size = os.fstat(handle.fileno()).st_size
     count = bytearray(8)
     _fill(handle, memoryview(count), path)
@@ -179,7 +300,11 @@ def _header(handle, path) -> dict[str, TensorInfo]:
         raise ValueError(f"{path} is not a safetensors file (its header is not JSON: {error})") from None
     if not isinstance(entries, dict):
         raise ValueError(f"{path} is not a safetensors file (its header is not a JSON object)")
-    base = 8 + length
+    return entries, 8 + length
+
+
+def _infos(entries: dict, base: int, size: int, path) -> dict[str, TensorInfo]:
+    """name -> TensorInfo of a header's entries, sorted by `start`, each checked against the file's size."""
     found: list[tuple[str, TensorInfo]] = []
     for name, entry in entries.items():
         if name == "__metadata__":

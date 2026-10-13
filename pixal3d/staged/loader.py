@@ -2,10 +2,14 @@
 
 No copy of a network rests in RAM. A flow model or a decoder is built without its weights (nothing is initialised
 that the file overwrites anyway), its file is read tensor by tensor through one 64 MiB buffer, each tensor is
-uploaded, cast on the card to the dtype the model keeps it in, and assigned. The four small models (background
-removal, MoGe, DINOv3, NAF) come from their own builders (builders.py). The loader also owns the cap on what
-PyTorch may reserve on the card, and a background thread that reads the next network's file so that the operating
-system has it in its file cache when its turn comes.
+uploaded, cast on the card to the dtype the model keeps it in, and assigned. Where the installer has made a copy of
+the file with every tensor already in the model's dtype (weights.py: the flows' fp32 tensors as bf16, half the
+bytes), that copy is read instead and nothing is cast - as long as it was made from the file as it is now, by this
+torch, and holds what the model takes; anything else about it (missing, stale, unreadable, breaking half-way) only
+means that the original is read. The four small models (background removal, MoGe, DINOv3, NAF) come from their own
+builders (builders.py). The loader also owns the cap on what PyTorch may reserve on the card, and a background
+thread that reads the next network's file (its copy, when that is current) so that the operating system has it in
+its file cache when its turn comes.
 
     loader = NetworkLoader("cuda", on_event=print)
     loader.register_checkpoint("hr_flow.sv", ckpts / "slat_flow_img2shape_dit_1_3B_1024_bf16")
@@ -24,7 +28,8 @@ Events (`on_event`, called on the loading thread, must not block), all plain dic
     {"kind": "net_load", "name", "bytes_read", "bytes"}    when a load starts, then at most once a second
     {"kind": "net_ready", "name", "seconds", "bytes"}      the network is on the card
     {"kind": "net_drop", "name", "seconds", "bytes"}       it is gone again
-`bytes` is what the load reads from disk (a builder without a file: the size of the built module).
+`bytes` is what the load reads from disk: the tensors it takes from the checkpoint's copy or from the original,
+whichever it reads (a builder without a file: the size of the built module).
 """
 
 from __future__ import annotations
@@ -46,7 +51,7 @@ from typing import Any, Callable, Iterator
 import torch
 import torch.nn as nn
 
-from . import stfile
+from . import stfile, weights
 from .types import Cancelled
 
 MIB = 1 << 20
@@ -78,6 +83,18 @@ class _Builder:
     file: Path | None
 
 
+@dataclass
+class _Plan:
+    """A checkpoint's load as settled before any of its tensors is read (weights.py makes its copies from it too)."""
+    cls: type
+    args: dict
+    computed: frozenset[str]        # what the class's constructor computes and no file carries (COMPUTED)
+    model: nn.Module                # built without weights, or for real when the class is in COMPUTED
+    header: dict[str, stfile.TensorInfo]                    # the checkpoint's own file
+    want: dict[str, tuple[torch.dtype, tuple[int, ...]]]    # the model's state: each tensor's dtype and shape
+    keys: list[str]                 # the file's tensors the model has a place for, in file order
+
+
 class NetworkLoader:
     """The networks of one process: which exist (registered), which are on the device now (loaded), and how much
     PyTorch may reserve there (the cap)."""
@@ -105,7 +122,8 @@ class NetworkLoader:
     # ------------------------------------------------------------------------------------------------ registration
 
     def register_checkpoint(self, name: str, ckpt: Path) -> None:
-        """A flow model or decoder: `ckpt` is the path without extension (<ckpt>.json and <ckpt>.safetensors).
+        """A flow model or decoder: `ckpt` is the path without extension (<ckpt>.json and <ckpt>.safetensors; a
+        copy of the latter in the model's dtypes, weights.copy_of, is read in its place while it is valid).
         Nothing is read here: files that are missing or broken are reported by `load`."""
         self._free_name(name)
         self._sources[name] = _Checkpoint(Path(f"{ckpt}.json"), Path(f"{ckpt}.safetensors"))
@@ -231,14 +249,19 @@ class NetworkLoader:
     def prefetch(self, name: str | None) -> None:
         """Start reading that network's file in the background, in place of whatever was being read; None stops.
         The bytes are thrown away: the point is that the operating system keeps the file in its cache while RAM
-        is free. Nothing is read for a network that is loaded or has no file."""
+        is free. For a checkpoint whose copy was made from its file as it is now, the copy is what a load will
+        read, so it is the copy that is read ahead (deciding that takes a look at two headers, here). Nothing is
+        read for a network that is loaded or has no file."""
         if self._prefetcher is None:
             return
         file = None
         if name is not None:
-            file = self._source(name).file
+            source = self._source(name)
+            file = source.file
             if name in self._modules:
                 file = None
+            elif isinstance(source, _Checkpoint):
+                file = weights.current_copy(source.file) or file
         self._prefetcher.read(name, file)
 
     def close(self) -> None:
@@ -278,35 +301,42 @@ class NetworkLoader:
     def _read(self, name: str, source: _Checkpoint, state: dict[str, torch.Tensor],
               cancelled: Callable[[], bool] | None) -> tuple[nn.Module | None, int]:
         """A checkpoint onto the device: (the module, bytes read), or (None, 0) when cancelled. The tensors are
-        collected in `state`, which the caller owns and empties."""
-        config = _config(source.config_file)
-        header = stfile.read_header(source.file)
-        cls, args = _model_class(config["name"]), config["args"]
-        computed = COMPUTED.get(cls.__name__, frozenset())
-        model = _build_for_real(cls, args) if computed else _build_empty(cls, args)
-        want = {key: (value.dtype, tuple(value.shape)) for key, value in model.state_dict().items()}
+        collected in `state`, which the caller owns and empties. They come from the checkpoint's copy when it is
+        valid (weights.usable_copy), else from its own file; a copy that fails while it is read is given up for
+        the original, read from its first tensor."""
+        plan = _plan(source.config_file, source.file)
+        copy = weights.usable_copy(source.file, plan.keys, plan.want)
+        if copy is not None:
+            broken = False
+            try:
+                return self._read_file(name, plan, *copy, state, cancelled)
+            except (OSError, EOFError) as error:
+                # The original is read once this block is left: the traceback holds the tensors read so far.
+                traceback.clear_frames(error.__traceback__)
+                broken = True
+            if broken:
+                state.clear()
+                self.trim()
+        return self._read_file(name, plan, source.file, plan.header, state, cancelled)
 
-        missing = sorted(want.keys() - header.keys() - computed)
-        if missing:
-            raise KeyError(f"{source.file} lacks {len(missing)} of the tensors {cls.__name__} needs "
-                           f"(first: {missing[0]})")
-        keys = [key for key in header if key in want]       # what the model has no place for is not read
-        for key in keys:
-            if header[key].shape != want[key][1]:
-                raise ValueError(f"{source.file}: {key} is {list(header[key].shape)}, {cls.__name__} expects "
-                                 f"{list(want[key][1])}")
+    def _read_file(self, name: str, plan: _Plan, file: Path, header: dict[str, stfile.TensorInfo],
+                   state: dict[str, torch.Tensor], cancelled: Callable[[], bool] | None
+                   ) -> tuple[nn.Module | None, int]:
+        """_read from one file: the checkpoint's own (`header` is then plan.header) or its copy."""
+        cls, args, computed, model, want, keys = plan.cls, plan.args, plan.computed, plan.model, plan.want, plan.keys
         size = sum(header[key].nbytes for key in keys)
         self._emit("net_load", name=name, bytes_read=0, bytes=size)
 
         buffer = _staging_buffer(self.device.type == "cuda")
         # Tensors the model keeps in another dtype than the file's (the flows: fp32 to bf16) are cast on the
         # device. They all pass through ONE block there, taken before any weight: uploaded into blocks of their
-        # own they would leave a hole behind every kept tensor (165 MiB of holes in a flow model).
+        # own they would leave a hole behind every kept tensor (165 MiB of holes in a flow model). A copy holds
+        # them in the model's dtypes already: no block is taken then.
         passing = max((header[key].nbytes for key in keys if header[key].torch_dtype != want[key][0]
                        and header[key].nbytes <= buffer.numel()), default=0)
         scratch = torch.empty(passing, dtype=torch.uint8, device=self.device) if passing else None
         done, told = 0, time.monotonic()
-        reader = stfile.iter_tensors(source.file, buffer, keys)
+        reader = stfile.iter_tensors(file, buffer, keys)
         try:
             for key, info, data in reader:
                 cast = info.torch_dtype != want[key][0]
@@ -342,9 +372,31 @@ class NetworkLoader:
             model.load_state_dict(state, strict=False, assign=True)
         stranded = _on_meta(model)
         if stranded:
-            raise RuntimeError(f"{cls.__name__}: {stranded[0]} has no values after loading {source.file}")
+            raise RuntimeError(f"{cls.__name__}: {stranded[0]} has no values after loading {file}")
         model.to(self.device)                                       # what the constructor computed, if anything
         return model, size
+
+
+def _plan(config_file: Path, file: Path) -> _Plan:
+    """A checkpoint's load settled: its config read, its model built without weights (for real when COMPUTED
+    lists the class), its file's header checked against the model's state. KeyError when the file lacks a tensor
+    the model needs, ValueError when one has another shape; nothing of the tensors is read."""
+    config = _config(config_file)
+    header = stfile.read_header(file)
+    cls, args = _model_class(config["name"]), config["args"]
+    computed = COMPUTED.get(cls.__name__, frozenset())
+    model = _build_for_real(cls, args) if computed else _build_empty(cls, args)
+    want = {key: (value.dtype, tuple(value.shape)) for key, value in model.state_dict().items()}
+
+    missing = sorted(want.keys() - header.keys() - computed)
+    if missing:
+        raise KeyError(f"{file} lacks {len(missing)} of the tensors {cls.__name__} needs (first: {missing[0]})")
+    keys = [key for key in header if key in want]       # what the model has no place for is not read
+    for key in keys:
+        if header[key].shape != want[key][1]:
+            raise ValueError(f"{file}: {key} is {list(header[key].shape)}, {cls.__name__} expects "
+                             f"{list(want[key][1])}")
+    return _Plan(cls, args, computed, model, header, want, keys)
 
 
 def _config(file: Path) -> dict:
