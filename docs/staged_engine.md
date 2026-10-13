@@ -60,12 +60,28 @@ on the GPU thread; each may raise `PropFailed(detail, kind)` to fail its prop:
 | `camera(req, image, moge)` | part `camera`, single-view props | `{"camera_angle_x", "distance", "mesh_scale"}` as Python floats |
 | `bundle(req, images, meta)` | parts `features`, `cond_lr`, `cond_hr`, multi-view props | the views dict of `run_mv` (`images` at 512 and 1024, `camera_angle_x`, `camera_distance`, `transform_matrix`, `mesh_scale`) |
 | `prop_scope(req, "ss")` | around the sparse-structure stage | a context manager yielding a dict the hook has filled when the block is left; it becomes part of the prop's notes |
-| `finish(req, mesh, notes)` | part `finish` | writes the prop's file from the `DecodedMesh` (four CPU tensors) and returns what the result should carry |
+| `finish(req, mesh, notes)` | part `finish` | writes the prop's file from the `DecodedMesh` (four CPU tensors) and returns what the result should carry - or a `FinishSteps` (below) |
 
 `engine.sample_sparse_structure(cond, resolution, num_samples, sampler_params)` is the one attribute a caller may
 wrap, exactly as the pipeline's method of that name: part `ss` calls it through the engine, positionally. A wrapper
 that calls it again draws new noise from the prop's generator, and the state stored for the next stage is the one
 after all draws.
+
+#### Finishing in steps
+
+Most of what a finish hook does after the decoders (the UV unwrap, the texture clean-up, writing the file) is CPU
+work that leaves the card idle. Instead of a result, `finish` may return `types.FinishSteps(steps, state, result)`:
+`steps` is a list of `("gpu" | "cpu", fn)`, each `fn(state)` reading and writing the dict `state`; `result(state)`
+gives the prop's result once every step ran. The runner runs the `"gpu"` steps on the GPU thread, between the
+other props' turns, under the memory cap (`native_mib`, by default the engine's own figure for a mesh of this
+size, and `safety_mib`); the `"cpu"` steps run on one worker thread meanwhile, so the next prop is decoded while
+this one is unwrapped. Rules: a GPU step may run twice after an out-of-memory (it must compute from its inputs and
+may overwrite its outputs) and leaves nothing on the card when it returns; a CPU step touches neither the card
+nor the engine (no events, no store). An exception in a step fails the prop as the hook's own would; a cancel does
+not stop a prop that has reached its steps. At most `runner.IN_FLIGHT` (2) props are in their steps at once, which
+bounds the RAM their meshes and textures hold. The hook's steps are reported as `step` events `4..3+n` of `3+n`;
+`prop_done` comes when the last step is over, so a prop's turn on the card and its `prop_done` are no longer back
+to back.
 
 ### Events
 
@@ -75,9 +91,9 @@ after all draws.
 |---|---|
 | `part_start` / `part_end` | a part begins / is over for the wave; `detail["props"]` lists the props in run order, `detail["wave"]` / `["waves"]` the wave |
 | `prop_start` | a prop goes onto the card for this part; `detail["position"]` of `detail["of"]` |
-| `step` | `step` of `total`: a sampler step, or one of the three steps of `finish` (shape decoded, texture decoded, holes filled) |
+| `step` | `step` of `total`: a sampler step, or one of the three steps of `finish` (shape decoded, texture decoded, holes filled), then the hook's own steps when it finishes in steps |
 | `prop_rest` | the prop is done with this part and waits for the next |
-| `prop_done` | the prop's file is written; `detail["result"]`, `detail["seconds"]` |
+| `prop_done` | the prop's file is written; `detail["result"]`, `detail["seconds"]` (the GPU thread's seconds on the prop; the worker's are not counted) |
 | `prop_failed` | `detail["kind"]`, `detail["detail"]` |
 | `prop_spilled` | the memory cap was lifted for this prop in this part (see the ladder) |
 | `prop_resumed` | the prop's latents came from a checkpoint |
@@ -112,12 +128,12 @@ Everything a prop needs later lies in the batch's `PropStore`, under the prop's 
 
 | key | content |
 |---|---|
-| `request`, `notes` | the request's numbers; what the hooks noted (`ss_retries`, `ss_blocked`, ...). The finish hook and the checkpoint get the notes with `slow`: the parts that ran with the cap lifted |
+| `request`, `notes` | the request's numbers; what the hooks noted (`ss_retries`, `ss_blocked`, ...) and what the engine noted: `memory_cap` when the memory, not the token cap, chose the resolution (`{"by": "card" \| "ram", "resolution", "without", "tokens"}`). The finish hook and the checkpoint get the notes with `slow`: the parts that ran with the cap lifted |
 | `image_<i>`, `prep` | the prepared pictures (PIL); `{"meta": ..., "camera": {...}}` |
 | `dino512`, `dino1024` | `z` [V,1029,1024] / [V,4101,1024] float32: DINOv3's tokens, computed once per input size |
 | `cond_ss` | `global` [1,5,1024], `proj` [1,4096,1024] bfloat16 |
 | `cond_lr`, `cond_hr`, `cond_tex` | `global` [1,5,1024], `proj` [tokens,2048] bfloat16 |
-| `coords_ss`, `coords_hr` | `coords` [tokens,4] int32 (batch, x, y, z), never re-ordered; `coords_hr` also `res` int32 [1] |
+| `coords_ss`, `coords_hr` | `coords` [tokens,4] int32 (batch, x, y, z), never re-ordered; `coords_hr` also `res` int32 [1] (the resolution used) and `voxels` int64 [1] (what the decode is foreseen to produce; see the memory rules) |
 | `lr_slat`, `shape_slat`, `tex_slat` | `feats` [tokens,32] float32, denormalised |
 | `rng_ss`, `rng_lr`, `rng_hr` | `state`: `torch.get_rng_state()` after the part's draws |
 | checkpoint | `coords`, `res`, `shape_slat`, `tex_slat` and the notes, on disk: what a restarted batch resumes from |
@@ -143,16 +159,77 @@ does not fit raises instead of spilling. The runner then goes down a ladder, for
 1. `normal`;
 2. `tight`: after the cache was emptied; samplers stop bringing the next prop's inputs to the card ahead of time,
    `finish` holds one decoder at a time;
-3. `uncapped`: the cap is lifted, PyTorch may spill into shared memory as the reference does: slow, but done. The
-   part is listed in the result's `slow` and a `prop_spilled` event is sent;
-4. only then the prop fails with kind `oom`.
+3. only with `EngineOptions.spill=True`, `uncapped`: the cap is lifted, PyTorch may spill into shared memory as the
+   reference does: slow, but done. The part is listed in the result's `slow` and a `prop_spilled` event is sent;
+4. then the prop fails with kind `oom`.
 
-Only out-of-memory failures are tried again (`runner.classify`). Parts that run cuDNN convolutions are also
-treated as failed when PyTorch counted a failed allocation without raising: cuDNN would have taken another
-algorithm, which rounds differently.
+By default (`spill=False`) nothing a batch does goes beyond the card's own memory: a prop that does not fit after
+the tight attempt fails with `oom` instead of running slowly in shared memory. Only out-of-memory failures are
+tried again (`runner.classify`). Parts that run cuDNN convolutions are also treated as failed when PyTorch counted
+a failed allocation without raising: cuDNN would have taken another algorithm, which rounds differently.
+
+Two rules keep that failure rare (`parts.resolution_fits`, `parts.decode_mib`, with the figures at the top of
+`parts.py`, measured on an RTX 3060):
+
+- **The resolution of a 1536 prop follows the memory as well as the token cap.** `upsample` walks the resolutions
+  down as the reference does (1536, 1408, ..., 1024) and stops at the first whose token count is under the cap
+  AND whose decode (one decoder, the voxels the shape will produce at that resolution) fits the cap `finish` will
+  get, whose samplers fit the cap in force, and whose finish hook leaves the RAM a floor; at 1024 it stops
+  whatever the figures say. When the memory, not the token cap, chose, the notes carry `memory_cap`.
+- **A decode that cannot fit under the cap is not attempted.** `finish` fails at once with `oom` (an attempt would
+  run out of memory after a minute and leave nothing); with `spill=True` the ladder then runs it with the cap
+  lifted, as before.
+
+A bulky prop (41.6k tokens at 1408) is thus made at 1152 on a card that leaves Pixal3D 7 GiB, within it, instead of
+spilling 2.6 GB into shared memory for its decode.
 
 Nothing is retried, closed or freed while an exception is being handled: its traceback holds the failed attempt's
 tensors. The runner reduces a failure to strings, leaves the `except` block and only then acts.
+
+## Reading the networks: the copies in the models' dtypes
+
+A part's network is read from disk onto the card when the part starts (`loader.py`): built without weights, its
+file read tensor by tensor through one 64 MiB buffer, each tensor uploaded and cast on the card to the dtype the
+model keeps it in. The four flow checkpoints are stored in float32 (5.4-5.6 GB each), but the models keep 480 of
+their 700 tensors, 98.7 % of the bytes, in bfloat16: half of what is read is cast away.
+
+`weights.py` writes, once, a copy of such a checkpoint beside it, `<ckpt>.model-dtypes.safetensors`, with every
+tensor the model takes from the file already in the model's dtype (2.72 GB for the sparse-structure flow, 2.81 GB
+for each other flow: 11.14 GB a set of four instead of 22.0 GB):
+
+```
+python -m pixal3d.staged.weights <folder of pipeline.json>      # every checkpoint of pipeline.json, and of
+                                                                 # pipeline_mv.json when its models are there
+```
+
+```python
+from pixal3d.staged import weights
+ok = weights.make_copies(snapshot, say=print)    # the same in-process; False when a checkpoint got no copy
+weights.make_copy(ckpt)                          # one checkpoint, its path without extension
+```
+
+- **What a copy holds.** The tensors the loader takes from the original (the model's state, nothing else), in the
+  original's order - the loader puts them on the card in file order, so where each block lands does not change -
+  each in the model's dtype, cast on the CPU with `tensor.to(dtype)`: round to nearest even, the cast the loader
+  makes on the card. The original is read through a 64 MiB buffer and each tensor (or piece of one) is cast and
+  written before the next is read; the copy is written as `<copy>.tmp`, flushed to the disk and renamed. The card
+  is not used (Spellcast3D runs the maker with it hidden).
+- **When it is read.** The header's `__metadata__` records the original's name, size, modification time (ns) and
+  the SHA-256 of its header, the torch version that cast it and the copy's format (`weights.FORMAT`). The loader
+  reads a copy in place of its original only while that record matches the original as it is now and the running
+  torch, and the copy holds exactly the tensors the model takes, in its dtypes and shapes
+  (`weights.usable_copy`). A copy that is missing, stale, foreign or unreadable, or that fails while it is read,
+  only means that the original is read (from its first tensor); no load fails because of a copy. A load from a
+  copy casts nothing and takes no block for casts; `net_load` / `net_ready` `bytes` are what it read: the copy's
+  tensors, or the original's. The read-ahead (`prefetch`) reads the copy when its record is current.
+- **Which checkpoints get one.** Those where the model keeps some tensor in another dtype than the file and the
+  copy is smaller: the flows. Not the decoders: the sparse-structure decoder's model keeps its file's dtypes, and
+  the two others would widen fp16 tensors to fp32 (a file whose tensors all take two bytes or fewer is not even
+  looked at with its model, whose class needs a card to be built). A copy that is no longer needed is removed.
+- **The maker.** It skips copies that are up to date (it can run at every install), makes the missing and stale
+  ones, refuses to leave less than 1 GB free on the drive, and prints one line per checkpoint with sizes and
+  seconds. It exits 1 when a checkpoint got no copy, 0 otherwise. Spellcast3D runs it after its installer has
+  downloaded the models and after the multi-view download (its `install/components.py` and `multiview.py`).
 
 ## Extending it
 
@@ -172,6 +249,9 @@ tensors. The runner reduces a failure to strings, leaves the `except` block and 
 - The logic of `engine.py`, `runner.py` and `parts.py` - order, waves, ladder, classifier, cancel, failure
   isolation, resume, the generator's hand-over, events - is tested on the CPU with everything below replaced by
   fakes (`check_engine.py --fake` in Spellcast3D's `code/spellcast/profiling/p3d_checks/`).
+- The copies (`weights.py`) and the loader reading them or the original - what a copy holds and how it is
+  rounded, stale, foreign and broken copies, a copy breaking half-way, the read-ahead, a pipeline folder - are
+  tested on the CPU with small stand-in models (`code/tests/test_pixal3d_weights.py` in Spellcast3D).
 - On the card, the same script runs the engine on golden cases: tensors captured from the untouched reference
   path stage by stage (conditionings, coords, generator states, latents, the decoded mesh). Integers must be equal;
   floats must be bit-equal wherever the reference reproduces itself bit for bit. The comparison is always against

@@ -5,22 +5,26 @@ The runner knows nothing of what a part computes. It is given a context (loader,
 and cancel callbacks) and a plan - the part functions and what each needs (parts.py is the plan of the engine) -
 and it owns everything around them:
 
-- the ladder of a prop-part: normal -> tight -> memory cap lifted. Only an out-of-memory failure goes down it; a
-  prop that needed the last step is done and marked slow, one that fails there too is failed;
+- the ladder of a prop-part: normal -> tight -> (when the options allow a spill) memory cap lifted. Only an
+  out-of-memory failure goes down it; a prop that needed the last step is done and marked slow, one that fails
+  there too is failed;
 - failure isolation: a failing prop is closed and the part goes on with the next one;
 - cancel: checked before every prop (the parts check inside); everything unfinished is closed;
 - resume: a prop whose finished latents a killed run left in the work folder runs only its last part;
+- the finish steps a hook hands back (types.FinishSteps): their GPU steps run here between the other props'
+  turns, their CPU steps on one worker thread meanwhile;
 - the events the caller's progress is made of.
 
 One rule shapes the code: nothing is retried, closed or trimmed while an exception is being handled. A caught
 exception's traceback holds the part function's frames and every tensor in them, so memory freed there is not free.
 `_attempt` and `_try_enter` reduce a failure to strings and return; only then the runner acts on it.
 
-Everything here runs on the GPU thread.
+Everything here runs on the GPU thread, except the CPU steps of a FinishSteps.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -28,10 +32,13 @@ from typing import Any, Callable
 
 import torch
 
-from .types import PARTS, BatchBroken, Cancelled, Event, PropFailed, PropRequest
+from .types import PARTS, BatchBroken, Cancelled, Event, FinishSteps, PropFailed, PropRequest
 
 MODES = ("normal", "tight", "uncapped")
 KINDS = ("mv", "sv")                # the order inside every part: multi-view props first
+IN_FLIGHT = 2                       # props that may be in their finish steps while another prop is decoded: each
+#                                     holds its decoded mesh and its textures in RAM meanwhile
+STEP_WAIT = 0.05                    # seconds the GPU thread waits for a CPU step before it looks again
 
 # Texts of a failure after which the CUDA context may be gone for good; a probe allocation decides.
 BROKEN_CONTEXT = ("cuda error", "device-side assert", "unspecified launch failure")
@@ -126,6 +133,15 @@ class PropState:
 
 
 @dataclass
+class _Tail:
+    """A prop in the steps its finish hook handed back."""
+    prop: PropState
+    steps: FinishSteps
+    index: int = 0                  # the next step to run
+    future: Any = None              # the CPU step under way on the worker thread
+
+
+@dataclass
 class PartContext:
     """What a part function is given beside its prop."""
     engine: Any                     # the StagedEngine: part "ss" calls engine.sample_sparse_structure through it
@@ -172,6 +188,13 @@ class StagedRunner:
         self.props: list[PropState] = []
         self.waves: list[list[PropState]] = []
         self._ahead = ""            # the network last handed to loader.prefetch
+        self._returned: Any = None  # what the last part function returned
+        self._tails: list[_Tail] = []
+        self._worker: concurrent.futures.ThreadPoolExecutor | None = None
+
+    def _modes(self) -> tuple[str, ...]:
+        """The ladder: the cap is lifted only where the options allow a spill into shared memory."""
+        return MODES if getattr(self.ctx.options, "spill", False) else MODES[:2]
 
     # ---- the batch ------------------------------------------------------------------------------------------------
 
@@ -191,6 +214,13 @@ class StagedRunner:
             raise
         except BaseException as exc:
             failure = (classify(exc), describe(exc), traceback.format_exc())
+        # The props that reached their finish steps are finished, cancel or not: their files are being written.
+        try:
+            self._pump_tails(until=lambda: not self._tails)
+        except (BatchBroken, KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException as exc:
+            failure = failure or (classify(exc), describe(exc), traceback.format_exc())
         failure = self._settle() or failure
         for prop in self.props:
             if prop.over:
@@ -212,6 +242,12 @@ class StagedRunner:
         """
         ctx = self.ctx
         try:
+            if self._worker is not None:
+                self._worker.shutdown(wait=True, cancel_futures=True)
+                self._worker = None
+            for tail in self._tails:                # only after a failure of the steps' machinery itself
+                self._fail(tail.prop, "finish", ("error", "the finish steps were not completed", ""))
+            self._tails = []
             ctx.inputs.clear()
             ctx.part = ""
             ctx.loader.drop_all()
@@ -304,6 +340,8 @@ class StagedRunner:
                 if group:
                     self._group(index, part, kind, group, done, len(alive))
                     done += len(group)
+            if self._tails:
+                self._pump_tails(until=lambda: not self._tails)
             ctx.store.flush()
             ctx.emit(Event("part_end", part))
 
@@ -339,6 +377,10 @@ class StagedRunner:
             if position + 1 < len(group):
                 self._want(part, group[position + 1])
             store.pump()
+            if self._tails:
+                # Steps of the props finished before: their GPU steps now, while this prop's inputs are still on
+                # their way, and no more than IN_FLIGHT of them in RAM beside this prop's decode.
+                self._pump_tails(until=lambda: len(self._tails) < IN_FLIGHT)
             self._prop_part(part, prop, done + position + 1, count)
         later = self._later(index, part, kind)
         ctx.keep = frozenset(later[0]) if later else frozenset()
@@ -389,14 +431,27 @@ class StagedRunner:
 
     def _attempt(self, part: str, prop: PropState, mode: str) -> tuple[str, str, str] | None:
         """One try of a prop-part. A failure comes back as (kind, words, traceback text): when this returns, the
-        exception, its traceback and the part function's frames are gone."""
+        exception, its traceback and the part function's frames are gone. What the part returned is in
+        `_returned` (a FinishSteps from "finish", else None)."""
+        self._returned = None
         try:
-            self.plan.TABLE[part](self.ctx, prop, mode)
+            self._returned = self.plan.TABLE[part](self.ctx, prop, mode)
         except (Cancelled, BatchBroken, KeyboardInterrupt, SystemExit, GeneratorExit):
             raise
         except BaseException as exc:
             return classify(exc), describe(exc), traceback.format_exc()
         return None
+
+    def _after_failure(self, failure: tuple[str, str, str]) -> None:
+        """Between two attempts of the ladder: the cache given back, what went ahead for the next prop too, and
+        the card probed when the failure's words say its context may be gone."""
+        loader = self.ctx.loader
+        loader.trim()
+        self.ctx.store.pump(upload=False)       # the next prop's inputs went ahead; the retry needs the room
+        if failure[0] == "error" and any(words in failure[1].lower() for words in BROKEN_CONTEXT):
+            loader.clear_cap()                  # the probe asks whether the card works, not whether the cap fits
+            if not probe(self.ctx.device):
+                raise BatchBroken(failure[1])
 
     def _prop_part(self, part: str, prop: PropState, position: int, count: int) -> None:
         ctx, loader, store = self.ctx, self.ctx.loader, self.ctx.store
@@ -404,8 +459,9 @@ class StagedRunner:
         ctx.emit(Event("prop_start", part, prop.id, detail={"position": position, "of": count}))
         started = time.perf_counter()
         failure = None
+        modes = self._modes()
         try:
-            for mode in MODES:
+            for mode in modes:
                 if mode == "uncapped":
                     loader.clear_cap()
                     prop.slow = [*(name for name in prop.slow if name != part), part]
@@ -422,13 +478,8 @@ class StagedRunner:
                     failure = ("error", f"part {part} drew from the CPU random generator, which it must not", "")
                 if failure is None:
                     break
-                loader.trim()
-                store.pump(upload=False)       # the next prop's inputs went ahead; the retry needs the room
-                if failure[0] == "error" and any(words in failure[1].lower() for words in BROKEN_CONTEXT):
-                    loader.clear_cap()         # the probe asks whether the card works, not whether the cap fits
-                    if not probe(ctx.device):
-                        raise BatchBroken(failure[1])
-                if failure[0] != "oom" or mode == "uncapped":
+                self._after_failure(failure)
+                if failure[0] != "oom" or mode == modes[-1]:
                     break
         finally:
             ctx.inputs.clear()
@@ -443,11 +494,122 @@ class StagedRunner:
             prop.state = "resting"
             ctx.emit(Event("prop_rest", part, prop.id))
             return
+        if isinstance(self._returned, FinishSteps):
+            self._tails.append(_Tail(prop, self._returned))
+            self._returned = None
+            self._pump_tails(until=lambda: True)        # its first GPU steps, while its mesh is fresh
+            return
+        self._done(prop)
+
+    def _done(self, prop: PropState) -> None:
         prop.result = {**(prop.result or {}), "slow": list(prop.slow), "seconds": prop.seconds,
                        "resolution": prop.resolution, "resumed": prop.resumed}
-        store.close_prop(prop.id)
+        self.ctx.store.close_prop(prop.id)
         prop.state = "done"
-        ctx.emit(Event("prop_done", part, prop.id, detail={"result": prop.result, "seconds": prop.seconds}))
+        self.ctx.emit(Event("prop_done", "finish", prop.id, detail={"result": prop.result, "seconds": prop.seconds}))
+
+    # ---- the finish steps -----------------------------------------------------------------------------------------
+
+    def _pump_tails(self, until: Callable[[], bool]) -> None:
+        """Move every prop that is in its finish steps along: a CPU step that is over is collected, GPU steps run
+        here, CPU steps go to the worker thread. Then, while `until()` is false, wait for the CPU steps and go on;
+        `until` is true at once for a look that does not wait."""
+        while True:
+            for tail in list(self._tails):
+                self._advance(tail)
+            if until() or not self._tails:
+                return
+            running = [tail.future for tail in self._tails if tail.future is not None]
+            if not running:
+                return                              # nothing is under way: `until` cannot come true by waiting
+            concurrent.futures.wait(running, timeout=STEP_WAIT, return_when=concurrent.futures.FIRST_COMPLETED)
+
+    def _advance(self, tail: _Tail) -> None:
+        """Run the tail's GPU steps until it reaches a CPU step (handed to the worker), its end, or a failure."""
+        steps = tail.steps
+        if tail.future is not None:
+            if not tail.future.done():
+                return
+            error = tail.future.exception()
+            tail.future = None
+            if error is not None:
+                failure = (classify(error), describe(error), "".join(traceback.format_exception(error)))
+                del error
+                self._end_tail(tail, failure)
+                return
+            tail.index += 1
+            self._step_event(tail)
+        while tail.index < len(steps.steps):
+            kind, fn = steps.steps[tail.index]
+            if kind == "cpu":
+                if self._worker is None:
+                    self._worker = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                                                                         thread_name_prefix="p3d-finish-cpu")
+                tail.future = self._worker.submit(fn, steps.state)
+                return
+            failure = self._gpu_step(tail, fn)
+            if failure is not None:
+                self._end_tail(tail, failure)
+                return
+            tail.index += 1
+            self._step_event(tail)
+        failure = self._result(tail)
+        self._end_tail(tail, failure)
+
+    def _gpu_step(self, tail: _Tail, fn: Callable[[dict], None]) -> tuple[str, str, str] | None:
+        """One GPU step of a tail, down the ladder like a prop-part: under the hook's cap, after a trim, with
+        the cap lifted when a spill is allowed."""
+        ctx, loader, prop = self.ctx, self.ctx.loader, tail.prop
+        modes = self._modes()
+        failure = None
+        for mode in modes:
+            if mode == "uncapped":
+                loader.clear_cap()
+                prop.slow = [*(name for name in prop.slow if name != "finish"), "finish"]
+                ctx.emit(Event("prop_spilled", "finish", prop.id))
+            else:
+                loader.set_cap(tail.steps.native_mib, safety_mib=tail.steps.safety_mib)
+            started = time.perf_counter()
+            failure = self._call(fn, tail.steps.state)
+            prop.seconds += time.perf_counter() - started
+            if failure is None:
+                return None
+            self._after_failure(failure)
+            if failure[0] != "oom" or mode == modes[-1]:
+                break
+        return failure
+
+    def _result(self, tail: _Tail) -> tuple[str, str, str] | None:
+        """The prop's result from its finished steps."""
+        found: list[dict] = []
+        failure = self._call(lambda state: found.append(dict(tail.steps.result(state) or {})), tail.steps.state)
+        if failure is None:
+            tail.prop.result = found[0]
+        return failure
+
+    @staticmethod
+    def _call(fn: Callable[[dict], Any], state: dict) -> tuple[str, str, str] | None:
+        """fn(state) on this thread; a failure as (kind, words, traceback text), the exception gone."""
+        try:
+            fn(state)
+        except (BatchBroken, KeyboardInterrupt, SystemExit, GeneratorExit):
+            raise
+        except BaseException as exc:
+            return classify(exc), describe(exc), traceback.format_exc()
+        return None
+
+    def _step_event(self, tail: _Tail) -> None:
+        """The hook's steps count on after the three of the decode phase."""
+        total = 3 + len(tail.steps.steps)
+        self.ctx.emit(Event("step", "finish", tail.prop.id, 3 + tail.index, total))
+
+    def _end_tail(self, tail: _Tail, failure: tuple[str, str, str] | None) -> None:
+        self._tails.remove(tail)
+        tail.steps.state.clear()                # the mesh and the textures: RAM back at once
+        if failure is not None:
+            self._fail(tail.prop, "finish", failure)
+        else:
+            self._done(tail.prop)
 
     def _discard(self, prop: PropState, keys: tuple[str, ...]) -> None:
         if keys:

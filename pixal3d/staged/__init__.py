@@ -17,6 +17,7 @@ __attributes = {
     'Prepared': 'types',
     'DecodedMesh': 'types',
     'Event': 'types',
+    'FinishSteps': 'types',
     'PropFailed': 'types',
     'Cancelled': 'types',
     'BatchBroken': 'types',

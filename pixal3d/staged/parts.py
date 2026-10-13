@@ -38,7 +38,7 @@ import torch
 
 from ..modules.sparse import SparseTensor
 from .runner import PartContext, PropState
-from .types import PARTS, DecodedMesh, Event, PropFailed
+from .types import PARTS, DecodedMesh, Event, FinishSteps, PropFailed
 
 # MiB outside PyTorch's allocator while a part runs (cuBLAS / cuDNN handles, flash_attn, natten, flex_gemm work
 # areas; for "finish" its decode phase, which adds cumesh's fill_holes). The loader's cap leaves this much free.
@@ -79,13 +79,26 @@ SPENT = {"ss": ("cond_ss",), "cond_lr": ("dino512",), "lr": ("cond_lr", "rng_ss"
          "upsample": ("coords_ss", "lr_slat"), "cond_hr": ("dino1024", "prep"), "hr": ("cond_hr", "rng_lr"),
          "tex": ("cond_tex", "rng_hr")}
 
-# Whether both decoders may be on the card at once in "finish": weights of one, voxels a token decodes to at most,
-# and what a decode needs per thousand of them. Measured on an RTX 3060 over the captured reference cases (the
-# widest was 338 voxels per token). They decide speed, not correctness: too low and the two decoders are loaded
-# together, do not fit, and "finish" is run again with one at a time.
+# What the end of a prop needs, as measured on an RTX 3060 over the captured reference cases and the bulky prop
+# (code/logs/profiling/pixal3d-lowmem/staged in Spellcast3D). The decoders: the weights of one; what a decode
+# allocates per thousand voxels of the result; and how many voxels a shape of M occupied voxels on the 512 grid
+# decodes to at resolution R: about M * (R / 512)^2 (0.97-1.12 of it over the measured props). The flow samplers at
+# the 1024 grid: what they allocate at 0 tokens and per thousand tokens, with a quarter on top for the allocator's
+# fragmentation under a cap. The finish hook on the CPU: what it holds beside the process's working set, and per
+# million voxels of the mesh (its faces, two BVHs, the simplification). These figures decide, in `upsample`, the
+# highest resolution a 1536 prop can be made at within the card and the RAM, and in `finish` whether both decoders
+# may share the card and whether a decode is hopeless under the cap.
 DECODER_MIB = 905
-VOXELS_PER_TOKEN = 340
 DECODE_MIB_PER_KVOXEL = 0.52
+VOXELS_PER_OCCUPIED = 1.15          # decoded voxels per occupied 512-grid voxel scaled to the resolution, with margin
+VOXELS_PER_TOKEN = 400              # voxels a token decodes to at most (396 measured on the bulky prop): used only
+#                                     where the occupied voxels are not known (a resumed prop)
+SAMPLER_BASE_MIB = 2_700
+SAMPLER_MIB_PER_KTOKEN = 50
+SAMPLER_SLACK = 1.25
+HOOK_RAM_BASE_MIB = 3_000
+HOOK_RAM_MIB_PER_MVOXEL = 310
+RAM_FLOOR_MIB = 1_500               # what must stay available to Windows and the hub beside the hook's own need
 
 
 def glb_reserve(faces: int) -> int:
@@ -93,6 +106,63 @@ def glb_reserve(faces: int) -> int:
     nvdiffrast context, one BVH at a time, cumesh). A starting figure: too small and the hook spills into
     shared memory, too large and a big mesh is decoded with the cap lifted that would have fitted."""
     return 2300 + 60 * faces // 1_000_000
+
+
+def voxels_at(occupied: int, resolution: int) -> int:
+    """The voxels a shape with `occupied` voxels on the 512 grid decodes to at `resolution`, with margin."""
+    return int(VOXELS_PER_OCCUPIED * occupied * (resolution / 512) ** 2)
+
+
+def decode_mib(voxels: int, decoders: int = 1) -> float:
+    """MiB PyTorch allocates to decode a shape of `voxels` voxels with `decoders` decoders on the card."""
+    return decoders * DECODER_MIB + DECODE_MIB_PER_KVOXEL * voxels / 1000
+
+
+def sampler_mib(tokens: int) -> float:
+    """MiB a 1024-grid flow sampler needs on the card for a prop of `tokens` tokens, fragmentation included."""
+    return SAMPLER_SLACK * (SAMPLER_BASE_MIB + SAMPLER_MIB_PER_KTOKEN * tokens / 1000)
+
+
+def hook_ram_mib(voxels: int) -> float:
+    """MiB of RAM the finish hook takes for a mesh of `voxels` voxels beside what the process already holds."""
+    return HOOK_RAM_BASE_MIB + HOOK_RAM_MIB_PER_MVOXEL * voxels / 1_000_000
+
+
+def card_limits(ctx: PartContext) -> tuple[int, int] | None:
+    """(the cap PyTorch will get for the decode phase of `finish`, the cap in force now) in MiB. The first is
+    foreseen from the second: the parts before `finish` leave the same networks' room, only the reserves differ.
+    None when nothing is capped: the card is not the limit (a CPU run, or the cap was lifted)."""
+    now = ctx.loader.stats().get("cap_mib")
+    if not now:
+        return None
+    safety = getattr(ctx.loader, "safety_mib", 300)
+    return int(now - ((NATIVE_RESERVE["finish"] + FINISH_SAFETY_MIB) - (NATIVE_RESERVE[ctx.part] + safety))), int(now)
+
+
+def ram_available_mib() -> int | None:
+    """RAM Windows can still hand out, or None where it cannot be asked."""
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available) >> 20
+    except Exception:
+        return None
+
+
+def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: int) -> str | None:
+    """Why a prop of `tokens` tokens at `resolution` would not fit the memory this PC leaves Pixal3D - "card" or
+    "ram" - or None when it fits. The card: the decode of `finish` with one decoder under the cap it will get, and
+    the 1024-grid samplers under the cap in force; the RAM: what the finish hook needs beside the process."""
+    voxels = voxels_at(occupied, resolution)
+    limits = card_limits(ctx)
+    if limits is not None:
+        finish_limit, cap_now = limits
+        if decode_mib(voxels) > finish_limit / 1.1 or sampler_mib(tokens) > cap_now:
+            return "card"
+    available = ram_available_mib()
+    if available is not None and hook_ram_mib(voxels) > available - RAM_FLOOR_MIB:
+        return "ram"
+    return None
 
 
 def networks(part: str, kind: str) -> tuple[str, ...]:
@@ -342,21 +412,39 @@ def upsample(ctx: PartContext, prop: PropState, mode: str) -> None:
     feats = store.get_small(prop.id, "lr_slat")["feats"].to(device)
     coords = store.get_small(prop.id, "coords_ss")["coords"].to(device)
     hr_coords = _decode().upsample(_decoder(ctx, "shape_dec"), feats, coords)
-    # The token cap of p2d:711-725: a 1536 prop with too many tokens is made at a lower resolution.
-    lr_resolution = 512
-    resolution = request.resolution
-    while True:
+    occupied = hr_coords.shape[0]
+
+    def tokens_at(resolution: int) -> torch.Tensor:
         grid_res = resolution // 16
         quant_coords = torch.cat([
             hr_coords[:, :1],
-            ((hr_coords[:, 1:] + 0.5) / lr_resolution * (grid_res - 1)).round().int(),
+            ((hr_coords[:, 1:] + 0.5) / 512 * (grid_res - 1)).round().int(),
         ], dim=1)
-        unique = quant_coords.unique(dim=0)
-        if unique.shape[0] < request.max_num_tokens or resolution == 1024:
+        return quant_coords.unique(dim=0)
+
+    # The token cap of p2d:711-725: a 1536 prop with too many tokens is made at a lower resolution. The memory
+    # this PC leaves Pixal3D caps it as well (resolution_fits): a prop that would not fit the card or the RAM at
+    # a resolution is made at the next lower one, down to 1024, instead of spilling or failing at the end.
+    resolution, unique = request.resolution, None
+    unbounded, why = None, None            # the resolution the token cap alone gives, and what memory said against it
+    while True:
+        unique = tokens_at(resolution)
+        under_cap = unique.shape[0] < request.max_num_tokens
+        if unbounded is None and (under_cap or resolution == 1024):
+            unbounded = resolution
+        reason = resolution_fits(ctx, occupied, unique.shape[0], resolution) if under_cap else None
+        why = why or reason
+        if (under_cap and reason is None) or resolution == 1024:
             break
         resolution -= 128
-    store.put_small(prop.id, "coords_hr", {"coords": unique.cpu(),
-                                           "res": torch.tensor([resolution], dtype=torch.int32)})
+    bound_by = why if resolution != unbounded else None
+    stored = {"coords": unique.cpu(), "res": torch.tensor([resolution], dtype=torch.int32),
+              "voxels": torch.tensor([voxels_at(occupied, resolution)], dtype=torch.int64)}
+    store.put_small(prop.id, "coords_hr", stored)
+    if bound_by is not None:
+        notes = store.get_small(prop.id, "notes")
+        store.put_small(prop.id, "notes", {**notes, "memory_cap": {
+            "by": bound_by, "resolution": resolution, "without": unbounded, "tokens": unique.shape[0]}})
 
 
 def cond_hr(ctx: PartContext, prop: PropState, mode: str) -> None:
@@ -408,23 +496,36 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
                           "tex_slat": tex_feats}, prop.noted(store.get_small(prop.id, "notes")))
 
 
-def decoders_fit(tokens: int, limit_mib: int) -> bool:
-    """May both decoders stay on the card while a prop of `tokens` tokens is decoded under a cap of `limit_mib`."""
-    need = DECODE_MIB_PER_KVOXEL * VOXELS_PER_TOKEN * tokens / 1000
-    return 2 * DECODER_MIB + need <= limit_mib / 1.1
+def decoders_fit(voxels: int, limit_mib: int) -> bool:
+    """May both decoders stay on the card while a shape of `voxels` voxels is decoded under a cap of `limit_mib`."""
+    return decode_mib(voxels, decoders=2) <= limit_mib / 1.1
 
 
-def finish(ctx: PartContext, prop: PropState, mode: str) -> None:
+def decode_voxels(stored: dict) -> int:
+    """The voxels the stored coords_hr decode to: as `upsample` foresaw them, or from the token count for a prop
+    that was resumed from a checkpoint."""
+    voxels = stored.get("voxels")
+    return int(voxels[0]) if voxels is not None else VOXELS_PER_TOKEN * int(stored["coords"].shape[0])
+
+
+def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None":
     decode = _decode()
     store, loader, device = ctx.store, ctx.loader, ctx.device
     stored = store.get_small(prop.id, "coords_hr")
     resolution = int(stored["res"][0])
     notes = prop.noted(store.get_small(prop.id, "notes"))
     capped = mode != "uncapped"
+    voxels = decode_voxels(stored)
 
     # Phase 1, the decoders. A decoder's weights go onto the card before the latents it decodes.
     limit = loader.set_cap(NATIVE_RESERVE["finish"], safety_mib=FINISH_SAFETY_MIB) if capped else 0
-    together = mode == "normal" and decoders_fit(stored["coords"].shape[0], limit)
+    if capped and decode_mib(voxels / VOXELS_PER_OCCUPIED) > limit:
+        # Hopeless under the cap, even with every margin taken off: an attempt would run out of memory after a
+        # minute and leave nothing. Said at once; the ladder lifts the cap when the caller allows a spill.
+        raise PropFailed(f"Decoding this shape ({voxels / 1e6:.1f} M voxels) needs about "
+                         f"{decode_mib(voxels / VOXELS_PER_OCCUPIED):,.0f} MiB of video memory; the card has "
+                         f"{limit:,} MiB free for it.", "oom")
+    together = mode == "normal" and decoders_fit(voxels, limit)
     ctx.check()
     if not together and loader.get("tex_dec") is not None:      # left by an attempt that failed with both loaded
         loader.drop("tex_dec")
@@ -455,12 +556,21 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> None:
     del mesh, tex_coords, attrs
     loader.trim()
 
-    # Phase 2, the caller's hook. Once it has started the prop is finished and saved, cancel or not.
+    # Phase 2, the caller's hook. Once it has started the prop is finished and saved, cancel or not. The hook may
+    # hand the rest back as steps (types.FinishSteps): the runner then runs them around the next props' decodes,
+    # the CPU ones on its worker thread.
     ctx.check()
+    reserve = glb_reserve(decoded.faces.shape[0])
     if capped:
-        loader.set_cap(glb_reserve(decoded.faces.shape[0]), safety_mib=FINISH_SAFETY_MIB)
-    prop.result = dict(ctx.hooks.finish(prop.req, decoded, notes) or {})
+        loader.set_cap(reserve, safety_mib=FINISH_SAFETY_MIB)
     prop.resolution = resolution
+    outcome = ctx.hooks.finish(prop.req, decoded, notes)
+    if isinstance(outcome, FinishSteps):
+        outcome.native_mib = outcome.native_mib or reserve
+        outcome.safety_mib = FINISH_SAFETY_MIB if outcome.safety_mib is None else outcome.safety_mib
+        return outcome
+    prop.result = dict(outcome or {})
+    return None
 
 
 TABLE = {"cutout": cutout, "camera": camera, "features": features, "ss": ss, "cond_lr": cond_lr, "lr": lr,

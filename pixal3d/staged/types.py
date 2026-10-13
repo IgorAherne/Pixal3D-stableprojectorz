@@ -119,9 +119,31 @@ class Hooks(Protocol):
         """Around the work of one prop in `part` (today only "ss"): yields a dict the hook has filled when the
         block is left; the engine keeps it with the prop's notes."""
 
-    def finish(self, req: PropRequest, mesh: DecodedMesh, notes: dict) -> dict:
+    def finish(self, req: PropRequest, mesh: DecodedMesh, notes: dict) -> "dict | FinishSteps":
         """Write the prop's file from the decoded mesh. Returns what the result carries beside the engine's own
-        keys."""
+        keys - or a FinishSteps, the rest of the work as steps, so that its CPU-only steps run on the engine's
+        worker thread while the next prop is decoded."""
+
+
+@dataclass
+class FinishSteps:
+    """What hooks.finish may return instead of a result: the prop's remaining work as steps that alternate between
+    the GPU thread and the engine's worker thread. A prop's UV unwrap, texture clean-up and file writing are CPU
+    work that would otherwise leave the card idle; this way they run while the next prop is decoded.
+
+    `steps` is a list of ("gpu" | "cpu", fn); `fn(state)` reads and writes the dict `state` and returns nothing.
+    A "gpu" step runs on the GPU thread under the memory cap, with `native_mib` left free outside PyTorch's
+    allocator and `safety_mib` for everybody else; it may run twice after an out-of-memory (it must compute from
+    its inputs and may overwrite its outputs), and it leaves nothing on the card when it returns, so that the next
+    prop's decode gets the whole card. A "cpu" step runs on the worker thread: it must not touch the card nor the
+    engine (no events, no store). `result(state)` runs on the GPU thread once every step is done and returns what
+    the prop's result carries. Exceptions fail the prop as the hook's own would; a cancel does not stop the steps
+    of a prop that has reached this point. At most runner.IN_FLIGHT props are in their steps at once."""
+    steps: list                     # [("gpu" | "cpu", Callable[[dict], None])]
+    state: dict
+    result: Callable[[dict], dict]
+    native_mib: int = 0             # 0: the engine's own figure for a mesh of this size (parts.glb_reserve)
+    safety_mib: int | None = None   # None: the engine's figure for the last part (parts.FINISH_SAFETY_MIB)
 
 
 @dataclass
@@ -136,3 +158,6 @@ class EngineOptions:
     wave_size: int | None = None                    # None / 0: every prop passes each part before the next part
     #                                                 starts; K: K props at a time. run() may override it per batch
     check_rng: bool = False                         # tests: a part that must not draw random numbers and does, fails
+    spill: bool = False                             # True: a prop-part that does not fit under the cap after the
+    #                                                 tight retry runs once more with the cap lifted and may spill
+    #                                                 into shared memory (slow). False: it fails with kind "oom"
