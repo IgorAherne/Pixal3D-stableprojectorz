@@ -180,8 +180,8 @@ Two rules keep that failure rare (`parts.resolution_fits`, `parts.decode_mib`, w
   run out of memory after a minute and leave nothing); with `spill=True` the ladder then runs it with the cap
   lifted, as before.
 
-A bulky prop (41.6k tokens at 1408) is thus made at 1152 on a card that leaves Pixal3D 7 GiB, within it, instead of
-spilling 2.6 GB into shared memory for its decode.
+A bulky prop (41.6k tokens at 1408 by the token cap alone) is thus made at 1024 on a card that leaves Pixal3D
+7.2 GiB, inside it, in 299 s - instead of at 1408 in 801 s with 2.6 GB of its decode spilled into shared memory.
 
 Nothing is retried, closed or freed while an exception is being handled: its traceback holds the failed attempt's
 tensors. The runner reduces a failure to strings, leaves the `except` block and only then acts.
