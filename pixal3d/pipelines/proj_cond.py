@@ -217,9 +217,12 @@ def cond_tokens(spec: Spec, z: torch.Tensor, image: torch.Tensor, naf: nn.Module
         # Only the averaged form gives the [B, K, C] the row below takes apart; "attention" keeps the views.
         raise ValueError(f"{spec.name} joins its views by {spec.fusion!r}, which this path does not build")
     xyz = coords[:, 1:4].long()
-    if xyz.numel() and (int(xyz.min()) < 0 or int(xyz.max()) >= grid or int(coords[:, 0].max()) != 0
-                        or int(coords[:, 0].min()) != 0):
-        raise ValueError(f"{spec.name}: coords must be (0, x, y, z) with 0 <= x, y, z < {grid}")
+    if xyz.numel():
+        # The four bounds in one read from the card rather than a wait for each.
+        low, high, batch_low, batch_high = torch.stack(
+            [xyz.min(), xyz.max(), coords[:, 0].min().long(), coords[:, 0].max().long()]).tolist()
+        if low < 0 or high >= grid or batch_low != 0 or batch_high != 0:
+            raise ValueError(f"{spec.name}: coords must be (0, x, y, z) with 0 <= x, y, z < {grid}")
     # ProjGrid lists its points in meshgrid(indexing='ij') order: voxel (x, y, z) is row (x * R + y) * R + z,
     # the row `z_proj.reshape(B, R, R, R, -1)[b, x, y, z]` reads.
     point_index = (xyz[:, 0] * grid + xyz[:, 1]) * grid + xyz[:, 2]

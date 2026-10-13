@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .. import VarLenTensor, SparseTensor
+from .. import config
 from .full_attn import sparse_scaled_dot_product_attention
 from .windowed_attn import sparse_windowed_scaled_dot_product_self_attention
 from .rope import SparseRotaryPositionEmbedder
@@ -100,6 +101,7 @@ class SparseMultiHeadAttention(nn.Module):
         if self._type == "self":
             qkv = self._linear(self.to_qkv, x)
             qkv = self._fused_pre(qkv, num_fused=3)
+            apart = None
             if self.qk_rms_norm or self.use_rope:
                 q, k, v = qkv.unbind(dim=-3)
                 if self.qk_rms_norm:
@@ -107,9 +109,14 @@ class SparseMultiHeadAttention(nn.Module):
                     k = self.k_rms_norm(k)
                 if self.use_rope:
                     q, k = self.rope(q, k)
-                qkv = qkv.replace(torch.stack([q.feats, k.feats, v.feats], dim=1))
+                if self.attn_mode == "full" and config.ATTN == 'flash_attn':
+                    # flash_attn's packed call only slices q, k and v back out of the stack and runs the kernel
+                    # of the unpacked call with the same arguments, so the stack would be a copy for nothing.
+                    apart = (q, k, v)
+                else:
+                    qkv = qkv.replace(torch.stack([q.feats, k.feats, v.feats], dim=1))
             if self.attn_mode == "full":
-                h = sparse_scaled_dot_product_attention(qkv)
+                h = sparse_scaled_dot_product_attention(*apart) if apart else sparse_scaled_dot_product_attention(qkv)
             elif self.attn_mode == "windowed":
                 h = sparse_windowed_scaled_dot_product_self_attention(
                     qkv, self.window_size, shift_window=self.shift_window

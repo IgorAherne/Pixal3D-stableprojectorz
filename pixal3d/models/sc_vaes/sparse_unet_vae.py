@@ -331,9 +331,11 @@ class SparseResBlockC2S3d(nn.Module):
             forget_neighbors(x)     # conv1 is the last convolution on the coarse voxels
         self.trim()
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
-        h = self.updown(h, subdiv_binarized)
+        fine = self.updown.fine_level(h, subdiv_binarized)     # x is on h's voxels: one fine level serves both
+        h = self.updown(h, fine=fine)
         self.trim()
-        x = self.updown(x, subdiv_binarized)
+        x = self.updown(x, fine=fine)
+        del fine
         self.trim()
         h = h.replace(norm_rows(self.norm2, h.feats))
         h = h.replace(F.silu(h.feats))
@@ -508,7 +510,6 @@ class SparseUnetVaeDecoder(nn.Module):
         self.use_fp16 = use_fp16
         self.pred_subdiv = pred_subdiv
         self.dtype = torch.float16 if use_fp16 else torch.float32
-        self.low_vram = False
         self.lean = False       # True: PyTorch's cache is emptied between the levels (see trim)
         
         self.output_layer = sp.SparseLinear(model_channels[-1], out_channels)

@@ -227,6 +227,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         cond = proj_cond.cond_dense(spec, z, camera)
         if self.low_vram:
             image_cond_model.cpu()
+            proj_cond.clear_grids()     # the projection grids are on the card too: they go with the extractor
         return {'cond': cond, 'neg_cond': proj_cond.negative(cond)}
 
     @torch.no_grad()
@@ -268,6 +269,7 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         feats = cond['proj']
         if self.low_vram:
             image_cond_model.cpu()
+            proj_cond.clear_grids()
         return {
             'cond': {'global': cond['global'], 'proj': SparseTensor(feats=feats, coords=coords)},
             'neg_cond': {'global': torch.zeros_like(cond['global']),
@@ -416,13 +418,12 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         slat = slat * std + mean
         
         # Upsample
+        decoder = self.models['shape_slat_decoder']
         if self.low_vram:
-            self.models['shape_slat_decoder'].to(self.device)
-            self.models['shape_slat_decoder'].low_vram = True
-        hr_coords = self.models['shape_slat_decoder'].upsample(slat, upsample_times=4)
+            decoder.to(self.device)
+        hr_coords = decode.upsample(decoder, slat.feats, slat.coords)
         if self.low_vram:
-            self.models['shape_slat_decoder'].cpu()
-            self.models['shape_slat_decoder'].low_vram = False
+            decoder.cpu()
         hr_resolution = resolution
         while True:
             quant_coords = torch.cat([
@@ -676,13 +677,12 @@ class Pixal3DImageTo3DPipeline(Pipeline):
         torch.cuda.empty_cache()
 
         # ---- Stage 3a: Upsample LR → HR ----
+        decoder = self.models['shape_slat_decoder']
         if self.low_vram:
-            self.models['shape_slat_decoder'].to(self.device)
-            self.models['shape_slat_decoder'].low_vram = True
-        hr_coords = self.models['shape_slat_decoder'].upsample(lr_slat, upsample_times=4)
+            decoder.to(self.device)
+        hr_coords = decode.upsample(decoder, lr_slat.feats, lr_slat.coords)
         if self.low_vram:
-            self.models['shape_slat_decoder'].cpu()
-            self.models['shape_slat_decoder'].low_vram = False
+            decoder.cpu()
 
         lr_resolution = 512
         actual_hr_resolution = hr_resolution

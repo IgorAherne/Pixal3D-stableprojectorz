@@ -7,14 +7,16 @@ the position rotation (RoPE) of the guide's map holds 4.9 GiB.
 
 NAF's heads do not see each other: the rotation is element-wise with the same angles for every head, the keys are
 an average pool per channel, the values are copied by a nearest resize, and the attention kernel works a head at a
-time. So `naf_sampled` runs RoPE, the key pool, the resize and the attention for one head, hands that head's map
-[B, C / heads, T, T] to `sample` and keeps only what `sample` returns. The values are those of the whole call, bit
-for bit; the largest moment is one head's attention - at T = 1024 the guide's map (1 GiB), that head's queries and
-keys (0.25 GiB each), its values and its output (1 GiB each).
+time. So `naf_sampled` turns the guide's map by RoPE over itself a head at a time, then runs the key pool, the
+resize and the attention for one head, hands that head's map [B, C / heads, T, T] to `sample` and keeps only what
+`sample` returns. The values are those of the whole call, bit for bit; the largest moment is one head's attention -
+at T = 1024 the guide's map (1 GiB), that head's queries and keys (0.25 GiB each), its values and its output (1 GiB
+each).
 """
 
 from __future__ import annotations
 
+import math
 import sys
 from typing import Callable, Optional, Tuple
 
@@ -27,6 +29,31 @@ def _attention_of(naf) -> Optional[Callable]:
     older natten releases (src/layers/attentions.py:6-11)."""
     module = sys.modules.get(type(naf.upsampler).__module__)
     return getattr(module, "na2d", None) if getattr(module, "NATTEN_RECENT", False) else None
+
+
+def _rope_by_head(rope, x: torch.Tensor) -> torch.Tensor:
+    """rope(x) for the guide's map x [B, C, H, W] when RoPE's heads are the attention's, one head at a time, written
+    over x (returned) when the rotation keeps x's dtype; rope._cached_coords must be those of x's H x W.
+
+    NAF's rotate makes the angles, cosines and sines of the whole map at every call, the same for every head
+    (layers/rope.py:137-153). They are made here once, by the same operations, and each head is turned by NAF's own
+    rope_apply. They are dropped before the first attention, the largest moment of the call."""
+    rope_apply = sys.modules[type(rope).__module__].rope_apply
+    batch, channels, height, width = x.shape
+    d = channels // rope.num_heads
+    angles = 2 * math.pi * rope._cached_coords[:, :, None] / rope.periods[None, None, :]
+    angles = angles.flatten(1, 2)
+    angles = angles.tile(2)
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+    del angles
+    dtype = torch.result_type(x, cos)
+    turned = x if dtype == x.dtype else x.new_empty(x.shape, dtype=dtype)
+    for i in range(rope.num_heads):
+        head = rope_apply(x[:, d * i:d * (i + 1)].permute(0, 2, 3, 1).reshape(batch, 1, height * width, d), sin, cos)
+        turned[:, d * i:d * (i + 1)] = head.reshape(batch, height, width, d).permute(0, 3, 1, 2)
+        del head
+    return turned
 
 
 def _heads_last(x: torch.Tensor) -> torch.Tensor:
@@ -83,7 +110,7 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
         if (height, width) != rope._cached_hw:
             rope._cached_coords = rope.create_coordinate(H=height, W=width)
             rope._cached_hw = (height, width)
-        coords = rope._cached_coords
+        x = _rope_by_head(rope, x)
     else:                                                                   # RoPE's heads are not the attention's
         x = rope(x)
 
@@ -94,10 +121,9 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
     for i in range(heads):
         xh = x[:, d * i:d * (i + 1)]
         if by_head:
-            xh = rope.rotate(xh.permute(0, 2, 3, 1).reshape(batch, 1, height * width, d), coords)
-            # This head's channels of rope(x), laid out in memory as NAF's own map is (channels first), so that
-            # the key pool runs the kernel it runs there whatever layout the rotation left.
-            xh = xh.reshape(batch, height, width, d).permute(0, 3, 1, 2).contiguous()
+            # This head's channels of rope(x) as one block of memory, as NAF's own map holds a head's channels
+            # (channels first), so that the key pool runs the kernel it runs there whatever the batch.
+            xh = xh.contiguous()
         q = _heads_last(xh)
         k = F.adaptive_avg_pool2d(xh, low)
         del xh

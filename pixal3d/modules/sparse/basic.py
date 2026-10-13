@@ -718,7 +718,13 @@ class SparseTensor(VarLenTensor):
         if isinstance(other, torch.Tensor):
             try:
                 other = torch.broadcast_to(other, self.shape)
-                other = other[self.batch_boardcast_map]
+                # One item: every row would get row 0, which op broadcasts over the rows by itself, so the copy
+                # of `other` as large as the features (the modulated blocks ask for six a block) is skipped. Only
+                # where the result is then laid out as before: with the copy, a row-major operand of the same
+                # shape could decide the layout (`other - x` of column-major features, a dimension of size 1).
+                if (other.shape[0] != 1 or not other.is_contiguous() or not self.feats.is_contiguous()
+                        or min(self.feats.shape) < 2):
+                    other = other[self.batch_boardcast_map]
             except:
                 pass
         if isinstance(other, VarLenTensor):
