@@ -12,7 +12,7 @@ and it owns everything around them:
 - cancel: checked before every prop (the parts check inside); everything unfinished is closed;
 - resume: a prop whose finished latents a killed run left in the work folder runs only its last part;
 - the finish steps a hook hands back (types.FinishSteps): their GPU steps run here between the other props'
-  turns, their CPU steps on one worker thread meanwhile; before each step the hook is told how much it may keep
+  turns, their CPU steps on WORKERS worker threads meanwhile; before each step the hook is told how much it may keep
   on the card for its later steps (plan.tail_room: what the props still to be decoded leave), and what it holds
   is let go when a decode runs out of memory;
 - the events the caller's progress is made of.
@@ -42,6 +42,11 @@ KINDS = ("mv", "sv")                # the order inside every part: multi-view pr
 IN_FLIGHT = 3                       # props that may be in their finish steps while another prop is decoded: each
 #                                     holds its decoded mesh and its textures in RAM meanwhile (and the tree of its
 #                                     BVH, when the engine gave it room: cuBVH keeps a copy in RAM)
+WORKERS = 2                         # threads for the CPU steps: one prop's export no longer waits behind another's
+#                                     BVH build or unwrap (measured on a tight card: exports of 3 s queued for 23 s
+#                                     behind one thread). The steps' libraries (cuBVH's build, xatlas, OpenCV) let
+#                                     go of Python's lock, so two run at once; what they hold in RAM is bounded by
+#                                     IN_FLIGHT, which counts the props, not the threads
 STEP_WAIT = 0.05                    # seconds the GPU thread waits for a CPU step before it looks again
 
 # Texts of a failure after which the CUDA context may be gone for good; a probe allocation decides.
@@ -524,8 +529,8 @@ class StagedRunner:
 
     def _pump_tails(self, until: Callable[[], bool]) -> None:
         """Move every prop that is in its finish steps along: a CPU step that is over is collected, CPU steps go
-        to the worker thread, then GPU steps run here - every tail's CPU step is handed over before any GPU step
-        runs, so the worker never waits for a GPU step of another prop. Then, while `until()` is false, wait for
+        to the worker threads, then GPU steps run here - every tail's CPU step is handed over before any GPU step
+        runs, so no worker waits for a GPU step of another prop. Then, while `until()` is false, wait for
         the CPU steps and go on; `until` is true at once for a look that does not wait."""
         while True:
             for tail in list(self._tails):
@@ -563,7 +568,7 @@ class StagedRunner:
             tail.offered = steps.state["room_mib"] = self._room(tail)
             if kind == "cpu":
                 if self._worker is None:
-                    self._worker = concurrent.futures.ThreadPoolExecutor(max_workers=1,
+                    self._worker = concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS,
                                                                          thread_name_prefix="p3d-finish-cpu")
                 tail.open = True
                 tail.future = self._worker.submit(fn, steps.state)

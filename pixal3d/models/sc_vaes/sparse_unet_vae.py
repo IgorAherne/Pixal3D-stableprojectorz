@@ -6,6 +6,7 @@ import torch.utils.checkpoint
 from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
+from . import chunked
 
 
 NORM_ROWS = 2 ** 18     # a table above this many rows is normalised a slab of rows at a time
@@ -511,6 +512,9 @@ class SparseUnetVaeDecoder(nn.Module):
         self.pred_subdiv = pred_subdiv
         self.dtype = torch.float16 if use_fp16 else torch.float32
         self.lean = False       # True: PyTorch's cache is emptied between the levels (see trim)
+        # > 0: without gradients, the levels after R/4 are decoded in boxes of about this many fine voxels,
+        # the same values in a memory that does not grow with the prop (chunked.py). 0: the loop below.
+        self.chunk_voxels = 0
         
         self.output_layer = sp.SparseLinear(model_channels[-1], out_channels)
         self.from_latent = sp.SparseLinear(latent_channels, model_channels[0])
@@ -594,6 +598,10 @@ class SparseUnetVaeDecoder(nn.Module):
     def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[Union[sp.SparseTensor, torch.Tensor]]] = None, return_subs: bool = False) -> sp.SparseTensor:
         assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
         assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
+        if chunked.applies(self, x):
+            fields, coords, subs = chunked.forward_chunked(self, x, guide_subs, chunked.raw_fields)
+            h = sp.SparseTensor(fields.pop("feats"), coords)
+            return (h, subs) if return_subs else h
         
         h = self.from_latent(x)
         h = h.type(self.dtype)

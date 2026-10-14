@@ -74,8 +74,8 @@ work that leaves the card idle. Instead of a result, `finish` may return `types.
 `steps` is a list of `("gpu" | "cpu", fn)`, each `fn(state)` reading and writing the dict `state`; `result(state)`
 gives the prop's result once every step ran. The runner runs the `"gpu"` steps on the GPU thread, between the
 other props' turns, under the memory cap (`native_mib`, by default the engine's own figure for a mesh of this
-size, and `safety_mib`); the `"cpu"` steps run on one worker thread meanwhile, so the next prop is decoded while
-this one is unwrapped. Rules: a GPU step may run twice after an out-of-memory (it must compute from its inputs and
+size, and `safety_mib`); the `"cpu"` steps run on `runner.WORKERS` (2) worker threads meanwhile, so the next prop is
+decoded while this one is unwrapped, and one prop's export does not wait behind another's BVH build. Rules: a GPU step may run twice after an out-of-memory (it must compute from its inputs and
 may overwrite its outputs) and leaves nothing on the card when it returns; a CPU step touches neither the card
 nor the engine (no events, no store). An exception in a step fails the prop as the hook's own would; a cancel does
 not stop a prop that has reached its steps. At most `runner.IN_FLIGHT` (2) props are in their steps at once, which
@@ -149,7 +149,6 @@ of a pass is unchanged. Before the first fused pass of a process the kernels are
 small tables; a card or a Triton that cannot run them turns the switch off with a `[FUSED]` warning and the flows
 run eagerly.
 
-
 A part function is `fn(ctx, prop, mode)` in `parts.py`. It reads from the batch's store, computes, and writes its
 results **as its last actions**, so an attempt that failed has changed nothing.
 
@@ -199,20 +198,31 @@ the tight attempt fails with `oom` instead of running slowly in shared memory. O
 tried again (`runner.classify`). Parts that run cuDNN convolutions are also treated as failed when PyTorch counted
 a failed allocation without raising: cuDNN would have taken another algorithm, which rounds differently.
 
-Two rules keep that failure rare (`parts.resolution_fits`, `parts.decode_mib`, with the figures at the top of
-`parts.py`, measured on an RTX 3060):
+Three rules keep that failure rare (`parts.resolution_fits`, `parts.finish_mib`, `parts.chunk_for`, with the
+figures at the top of `parts.py`, measured on an RTX 3060):
 
+- **A big shape is decoded in boxes.** A shape whose whole-table decode would take more than
+  `parts.CHUNK_ABOVE_MIB` (3,000 MiB: every 1536 prop of the test set, no 1024 one) is decoded a box of
+  `parts.CHUNK_VOXELS` (2 M) fine voxels at a time (`models/sc_vaes/chunked.py`, `decoder.chunk_voxels`): the
+  same vertices and faces, bit for bit, in a peak that no longer grows with the prop - about 0.13 MiB per thousand
+  voxels plus 600 MiB for the boxes, 3.4 GB where the whole-table decode of a 16.45 M-voxel shape took 9.2 GB -
+  for 4-9 % of the decode's time. What then bounds a big prop on the card is the closing of its holes (cumesh's
+  native tables, about 144 bytes a face: `parts.fill_mib`), the widest moment of `finish` (`parts.finish_mib`).
 - **The resolution of a 1536 prop follows the memory as well as the token cap.** `upsample` walks the resolutions
   down as the reference does (1536, 1408, ..., 1024) and stops at the first whose token count is under the cap
-  AND whose decode (one decoder, the voxels the shape will produce at that resolution) fits the cap `finish` will
-  get, whose samplers fit the cap in force, and whose finish hook leaves the RAM a floor; at 1024 it stops
-  whatever the figures say. When the memory, not the token cap, chose, the notes carry `memory_cap`.
-- **A decode that cannot fit under the cap is not attempted.** `finish` fails at once with `oom` (an attempt would
+  AND whose finish (`finish_mib`: the decode, in boxes for a big shape, or the closing of the holes) fits the cap
+  `finish` will get, whose samplers fit the cap in force, and whose finish hook leaves the RAM a floor; at 1024 it
+  stops whatever the figures say. When the memory, not the token cap, chose, the notes carry `memory_cap`. With
+  the decode in boxes, every prop of the test set is made at 1536 on a card that leaves Pixal3D 7.2 GiB; what can
+  still lower one there is the closing of the holes of a far bulkier shape, or the RAM.
+- **A finish that cannot fit under the cap is not attempted.** `finish` fails at once with `oom` (an attempt would
   run out of memory after a minute and leave nothing); with `spill=True` the ladder then runs it with the cap
   lifted, as before.
 
-A bulky prop (41.6k tokens at 1408 by the token cap alone) is thus made at 1024 on a card that leaves Pixal3D
-7.2 GiB, inside it, in 299 s - instead of at 1408 in 801 s with 2.6 GB of its decode spilled into shared memory.
+Before the decode in boxes, a bulky prop (41.6k tokens at 1408 by the token cap alone, 16.45 M voxels) was thus
+made at 1024 on a card that leaves Pixal3D 7.2 GiB, inside it, in 299 s - instead of at 1408 in 801 s with 2.6 GB
+of its decode spilled into shared memory. By the rules now its decode fits at 1408 and the closing of its holes
+(5.9 GB there) does not: it is made at 1280 (foreseen by the figures, not measured).
 
 Nothing is retried, closed or freed while an exception is being handled: its traceback holds the failed attempt's
 tensors. The runner reduces a failure to strings, leaves the `except` block and only then acts.

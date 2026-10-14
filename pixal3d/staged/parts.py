@@ -84,20 +84,42 @@ SPENT = {"ss": ("cond_ss",), "cond_lr": ("dino512",), "lr": ("cond_lr", "rng_ss"
 # allocates per thousand voxels of the result; and how many voxels a shape of M occupied voxels on the 512 grid
 # decodes to at resolution R: about M * (R / 512)^2 (0.97-1.12 of it over the measured props). The flow samplers at
 # the 1024 grid: what they allocate at 0 tokens and per thousand tokens, with a quarter on top for the allocator's
-# fragmentation under a cap. The finish hook on the CPU: what it holds beside the process's working set, and per
-# million voxels of the mesh (its faces, two BVHs, the simplification). These figures decide, in `upsample`, the
+# fragmentation under a cap. The finish hook on the CPU: what the finish of a prop adds to the process's working
+# set beside what it holds at `upsample` (the decoded mesh and its textures in RAM, the BVH's copy of its tree,
+# the simplification, the maps) and per million voxels of the shape - measured on the five test props at 1536
+# (8.8-12.3 M voxels, up to four in their finish at once): the launcher's private working set rose from 3.0 GB
+# before the finish part to 6.7 GB, 3.7 GB for all of them (round-e/e1536-full). These figures decide, in `upsample`, the
 # highest resolution a 1536 prop can be made at within the card and the RAM, and in `finish` whether both decoders
-# may share the card and whether a decode is hopeless under the cap.
+# may share the card and whether a decode is hopeless under the cap. A big shape is decoded in boxes (below), so
+# its decode no longer grows with the prop; what then bounds a 1536 prop on a small card is the closing of its
+# holes, and the RAM.
 DECODER_MIB = 905
 DECODE_MIB_PER_KVOXEL = 0.52
 VOXELS_PER_OCCUPIED = 1.15          # decoded voxels per occupied 512-grid voxel scaled to the resolution, with margin
 VOXELS_PER_TOKEN = 400              # voxels a token decodes to at most (396 measured on the bulky prop): used only
 #                                     where the occupied voxels are not known (a resumed prop)
+# The decode in boxes (models/sc_vaes/chunked.py: the same values, bit for bit). A shape whose whole-table decode
+# would take more than CHUNK_ABOVE_MIB is decoded a box of CHUNK_VOXELS fine voxels at a time, and its peak stops
+# growing with the prop: DECODER_MIB, CHUNKED_MIB_PER_KVOXEL per thousand voxels of the prop (the coarse levels on
+# whole tables, the assembly, the mesh extraction; the texture decode's mesh on the card) and CHUNK_MIB_PER_KVOXEL
+# per thousand voxels of a box (measured: a 16.45 M-voxel shape 3,103-3,423 MiB with 1-2 M boxes, a 7.3 M one
+# 1,946 shape / 2,725 texture with 2 M boxes, the texture decode holding the mesh; the formula gives 4,002-4,302 and
+# 2,743). Every 1536 prop of the test set goes this way; a 1024 prop stays whole. Boxes cost 4-9 % of
+# the decode's time, and the first chunked decode of an install autotunes flex_gemm's kernels for the new row
+# counts (a few seconds, kept in its cache).
+CHUNK_ABOVE_MIB = 3_000
+CHUNK_VOXELS = 2_000_000
+CHUNKED_MIB_PER_KVOXEL = 0.17
+CHUNK_MIB_PER_KVOXEL = 0.30
+# Closing the mesh's holes (cumesh: native memory, outside PyTorch's cap but on the card): about 144 bytes a face
+# (its edge tables and the copies of the mesh it takes), 2.0-2.2 faces a voxel, beside the mesh itself; the texture
+# tables are off the card by then. The finish part's widest moment once the decode runs in boxes.
+FILL_MIB_PER_KVOXEL = 0.36
 SAMPLER_BASE_MIB = 2_700
 SAMPLER_MIB_PER_KTOKEN = 50
 SAMPLER_SLACK = 1.25
-HOOK_RAM_BASE_MIB = 3_000
-HOOK_RAM_MIB_PER_MVOXEL = 310
+HOOK_RAM_BASE_MIB = 1_500
+HOOK_RAM_MIB_PER_MVOXEL = 200
 RAM_FLOOR_MIB = 1_500               # what must stay available to Windows and the hub beside the hook's own need
 # `cond_hr` makes the shape and the texture conditionings together (proj_cond.cond_tokens_pair: NAF's image encoder
 # once per view instead of twice, about 0.36 s a view). A single-view prop pays nothing for it on the card; a
@@ -129,9 +151,31 @@ def voxels_at(occupied: int, resolution: int) -> int:
     return int(VOXELS_PER_OCCUPIED * occupied * (resolution / 512) ** 2)
 
 
-def decode_mib(voxels: int, decoders: int = 1) -> float:
-    """MiB PyTorch allocates to decode a shape of `voxels` voxels with `decoders` decoders on the card."""
+def decode_mib(voxels: int, decoders: int = 1, chunk: int = 0) -> float:
+    """MiB PyTorch allocates to decode a shape of `voxels` voxels with `decoders` decoders on the card: on whole
+    tables (chunk 0), or in boxes of `chunk` fine voxels."""
+    if chunk:
+        return decoders * DECODER_MIB + CHUNKED_MIB_PER_KVOXEL * voxels / 1000 + CHUNK_MIB_PER_KVOXEL * chunk / 1000
     return decoders * DECODER_MIB + DECODE_MIB_PER_KVOXEL * voxels / 1000
+
+
+def chunk_for(voxels: int) -> int:
+    """The box size a shape of `voxels` voxels is decoded in (decoder.chunk_voxels), 0 for a whole-table decode:
+    boxes where the whole-table decode would take more than CHUNK_ABOVE_MIB."""
+    return CHUNK_VOXELS if decode_mib(voxels) > CHUNK_ABOVE_MIB else 0
+
+
+def fill_mib(voxels: int) -> float:
+    """MiB of the card the closing of the holes of a shape of `voxels` voxels takes (cumesh's native tables beside
+    the mesh)."""
+    return FILL_MIB_PER_KVOXEL * voxels / 1000
+
+
+def finish_mib(voxels: int, decoders: int = 1) -> float:
+    """MiB of the card the finish part's widest moment takes for a shape of `voxels` voxels: its decode (with
+    `decoders` decoders on the card, in boxes where chunk_for says so) or the closing of its holes, whichever is
+    more."""
+    return max(decode_mib(voxels, decoders, chunk_for(voxels)), fill_mib(voxels))
 
 
 def sampler_mib(tokens: int) -> float:
@@ -167,13 +211,14 @@ def ram_available_mib() -> int | None:
 
 def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: int) -> str | None:
     """Why a prop of `tokens` tokens at `resolution` would not fit the memory this PC leaves Pixal3D - "card" or
-    "ram" - or None when it fits. The card: the decode of `finish` with one decoder under the cap it will get, and
-    the 1024-grid samplers under the cap in force; the RAM: what the finish hook needs beside the process."""
+    "ram" - or None when it fits. The card: the widest moment of `finish` (finish_mib: the decode, in boxes for a
+    big shape, or the closing of the holes) under the cap it will get, and the 1024-grid samplers under the cap in
+    force; the RAM: what the finish hook needs beside the process."""
     voxels = voxels_at(occupied, resolution)
     limits = card_limits(ctx)
     if limits is not None:
         finish_limit, cap_now = limits
-        if decode_mib(voxels) > finish_limit / 1.1 or sampler_mib(tokens) > cap_now:
+        if finish_mib(voxels) > finish_limit / 1.1 or sampler_mib(tokens) > cap_now:
             return "card"
     available = ram_available_mib()
     if available is not None and hook_ram_mib(voxels) > available - RAM_FLOOR_MIB:
@@ -195,7 +240,7 @@ def tail_room(ctx: PartContext, pending: list, held_mib: int) -> int:
             stored = ctx.store.get_small(prop.id, "coords_hr")
         except Exception:
             return 0
-        need = max(need, 1.1 * decode_mib(decode_voxels(stored), decoders=2))
+        need = max(need, 1.1 * finish_mib(decode_voxels(stored), decoders=2))
     room = (headroom - (NATIVE_RESERVE["finish"] + FINISH_SAFETY_MIB) - max(need, HOLD_BESIDE_MIB) - held_mib
             - HOLD_SLACK_MIB)
     available = ram_available_mib()
@@ -253,10 +298,12 @@ def _network(ctx: PartContext, name: str) -> Any:
     return module if module is not None else ctx.loader.load(name, ctx.cancelled)
 
 
-def _decoder(ctx: PartContext, name: str) -> Any:
-    """A sparse decoder in its memory-saving form (it gives each level's cache back as soon as the level is done)."""
+def _decoder(ctx: PartContext, name: str, chunk: int = 0) -> Any:
+    """A sparse decoder in its memory-saving form (it gives each level's cache back as soon as the level is done),
+    decoding in boxes of `chunk` fine voxels when `chunk` is given (chunk_for; models/sc_vaes/chunked.py)."""
     decoder = _network(ctx, name)
     decoder.lean = True
+    decoder.chunk_voxels = chunk
     return decoder
 
 
@@ -463,7 +510,9 @@ def upsample(ctx: PartContext, prop: PropState, mode: str) -> None:
 
     # The token cap of p2d:711-725: a 1536 prop with too many tokens is made at a lower resolution. The memory
     # this PC leaves Pixal3D caps it as well (resolution_fits): a prop that would not fit the card or the RAM at
-    # a resolution is made at the next lower one, down to 1024, instead of spilling or failing at the end.
+    # a resolution is made at the next lower one, down to 1024, instead of spilling or failing at the end. With
+    # the decode in boxes, what can still lower a 1536 prop on an 8 GB card is the closing of the holes of a shape
+    # far bulkier than the test set's (fill_mib), or the RAM.
     resolution, unique = request.resolution, None
     unbounded, why = None, None            # the resolution the token cap alone gives, and what memory said against it
     while True:
@@ -550,7 +599,7 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
 
 def decoders_fit(voxels: int, limit_mib: int) -> bool:
     """May both decoders stay on the card while a shape of `voxels` voxels is decoded under a cap of `limit_mib`."""
-    return decode_mib(voxels, decoders=2) <= limit_mib / 1.1
+    return decode_mib(voxels, decoders=2, chunk=chunk_for(voxels)) <= limit_mib / 1.1
 
 
 def decode_voxels(stored: dict) -> int:
@@ -571,18 +620,19 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None"
 
     # Phase 1, the decoders. A decoder's weights go onto the card before the latents it decodes.
     limit = loader.set_cap(NATIVE_RESERVE["finish"], safety_mib=FINISH_SAFETY_MIB) if capped else 0
-    if capped and decode_mib(voxels / VOXELS_PER_OCCUPIED) > limit:
+    chunk = chunk_for(voxels)           # a big shape in boxes: the same mesh, a peak that does not grow with it
+    if capped and finish_mib(voxels / VOXELS_PER_OCCUPIED) > limit:
         # Hopeless under the cap, even with every margin taken off: an attempt would run out of memory after a
         # minute and leave nothing. Said at once; the ladder lifts the cap when the caller allows a spill.
-        raise PropFailed(f"Decoding this shape ({voxels / 1e6:.1f} M voxels) needs about "
-                         f"{decode_mib(voxels / VOXELS_PER_OCCUPIED):,.0f} MiB of video memory; the card has "
+        raise PropFailed(f"Finishing this shape ({voxels / 1e6:.1f} M voxels) needs about "
+                         f"{finish_mib(voxels / VOXELS_PER_OCCUPIED):,.0f} MiB of video memory; the card has "
                          f"{limit:,} MiB free for it.", "oom")
     together = mode == "normal" and decoders_fit(voxels, limit)
     ctx.check()
     if not together and loader.get("tex_dec") is not None:      # left by an attempt that failed with both loaded
         loader.drop("tex_dec")
     for name in LAZY["finish"] if together else LAZY["finish"][:1]:
-        _decoder(ctx, name)
+        _decoder(ctx, name, chunk)
     coords = stored["coords"].to(device)
     shape_feats = store.get_small(prop.id, "shape_slat")["feats"].to(device)
     mesh, subs = decode.decode_shape(loader.get("shape_dec"), shape_feats, coords, resolution)
@@ -593,18 +643,19 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None"
         loader.drop("shape_dec")
     ctx.emit(Event("step", "finish", prop.id, 1, 3))
     ctx.check()
-    _decoder(ctx, "tex_dec")
+    _decoder(ctx, "tex_dec", chunk)
     tex_feats = store.get_small(prop.id, "tex_slat")["feats"].to(device)
     tex_coords, attrs = decode.decode_texture(loader.get("tex_dec"), tex_feats, coords, subs)
     del tex_feats, subs, coords
-    loader.drop(*(name for name in LAZY["finish"] if loader.get(name) is not None))
+    tex_coords, attrs = tex_coords.cpu(), attrs.cpu()     # off the card before the holes are closed: cumesh's
+    loader.drop(*(name for name in LAZY["finish"] if loader.get(name) is not None))     # tables need the room
     ctx.emit(Event("step", "finish", prop.id, 2, 3))
     decode.fill_holes(mesh)
     ctx.emit(Event("step", "finish", prop.id, 3, 3))
 
     # Nothing of the prop stays on the card: the hook's own work needs the room, and uploads what it needs.
-    decoded = DecodedMesh(vertices=mesh.vertices.cpu(), faces=mesh.faces.cpu(), coords=tex_coords.cpu(),
-                          attrs=attrs.cpu(), resolution=resolution, attr_layout=ctx.args(prop).pbr_attr_layout)
+    decoded = DecodedMesh(vertices=mesh.vertices.cpu(), faces=mesh.faces.cpu(), coords=tex_coords,
+                          attrs=attrs, resolution=resolution, attr_layout=ctx.args(prop).pbr_attr_layout)
     del mesh, tex_coords, attrs
     loader.trim()
 

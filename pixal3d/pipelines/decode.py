@@ -68,7 +68,11 @@ def decode_texture(decoder, feats: torch.Tensor, coords: torch.Tensor,
     """The texture latent decoded along the shape's subdivision tables: the voxels' coords [N4, 3] int32
     (x, y, z) and their attributes [N4, 6] float32 in 0..1, rows in the order of the shape decoder's voxels."""
     voxels = decoder(SparseTensor(feats, coords), guide_subs=subs)
-    held = [voxels.coords[:, 1:].contiguous(), voxels.feats * 0.5 + 0.5]
+    if getattr(decoder, 'chunk_voxels', 0):
+        # In place: the same two roundings as `* 0.5 + 0.5`, without a second table of the prop's size.
+        held = [voxels.coords[:, 1:].contiguous(), voxels.feats.mul_(0.5).add_(0.5)]
+    else:
+        held = [voxels.coords[:, 1:].contiguous(), voxels.feats * 0.5 + 0.5]
     del voxels
     if getattr(decoder, 'lean', False):
         held = settle(held)
