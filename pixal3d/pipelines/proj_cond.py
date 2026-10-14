@@ -8,11 +8,13 @@ tokens. Here the same work is split where it can be shared and cut down:
     z = encode(dino, image)                                # DINOv3 once per input size, for every stage of that size
     cond_ss = cond_dense(SPECS["ss"], z, camera)           # the dense grid of the sparse-structure stage
     cond = cond_tokens(SPECS["shape_512"], z, image, naf, camera, coords, 32)      # only the rows of `coords`
+    shape, tex = cond_tokens_pair(SPECS["shape_1024"], SPECS["tex_1024"], z, image, naf, camera, coords, 64)
 
 `cond_tokens` projects the whole grid as the extractors do, then samples DINOv3's patch map and NAF's upsampled map
 at the tokens' points only (NAF one attention head at a time: modules/naf_sliced.py), so neither the dense grid
 [R^3, 2048] nor NAF's map [1024, T, T] is ever made. The values are those the extractors give: both are built from
-the same functions of trainers/flow_matching/mixins/image_conditioned_proj.py.
+the same functions of trainers/flow_matching/mixins/image_conditioned_proj.py. `cond_tokens_pair` is two
+`cond_tokens` of stages that read the same picture and differ in NAF's target, with what they share made once.
 
 Everything is float32 on the device of `z`; a caller that stores a conditioning casts it itself.
 """
@@ -26,13 +28,16 @@ import torch
 import torch.nn as nn
 from torchvision.transforms.functional import normalize
 
+from ..modules import naf_sliced
 from ..trainers.flow_matching.mixins.image_conditioned_proj import (
     IMAGENET_MEAN,
     IMAGENET_STD,
     ProjGrid,
     ProjGridMV,
+    compute_relative_calc_mat,
     dino_tokens,
     pictures_to_tensor,
+    split_tokens,
     tokens_to_features,
     view_tokens_to_features,
 )
@@ -216,6 +221,14 @@ def cond_tokens(spec: Spec, z: torch.Tensor, image: torch.Tensor, naf: nn.Module
     if spec.fusion != "average":
         # Only the averaged form gives the [B, K, C] the row below takes apart; "attention" keeps the views.
         raise ValueError(f"{spec.name} joins its views by {spec.fusion!r}, which this path does not build")
+    point_index = _point_index(spec, coords, grid)
+    cond = _features(spec, z, camera, grid, image, naf, point_index)
+    cond["proj"] = cond["proj"][0]
+    return cond
+
+
+def _point_index(spec: Spec, coords: torch.Tensor, grid: int) -> torch.Tensor:
+    """The rows of the R^3 grid the tokens `coords` are, after the bounds check of cond_tokens."""
     xyz = coords[:, 1:4].long()
     if xyz.numel():
         # The four bounds in one read from the card rather than a wait for each.
@@ -225,10 +238,110 @@ def cond_tokens(spec: Spec, z: torch.Tensor, image: torch.Tensor, naf: nn.Module
             raise ValueError(f"{spec.name}: coords must be (0, x, y, z) with 0 <= x, y, z < {grid}")
     # ProjGrid lists its points in meshgrid(indexing='ij') order: voxel (x, y, z) is row (x * R + y) * R + z,
     # the row `z_proj.reshape(B, R, R, R, -1)[b, x, y, z]` reads.
-    point_index = (xyz[:, 0] * grid + xyz[:, 1]) * grid + xyz[:, 2]
-    cond = _features(spec, z, camera, grid, image, naf, point_index)
-    cond["proj"] = cond["proj"][0]
-    return cond
+    return (xyz[:, 0] * grid + xyz[:, 1]) * grid + xyz[:, 2]
+
+
+@torch.no_grad()
+def cond_tokens_pair(spec_a: Spec, spec_b: Spec, z: torch.Tensor, image: torch.Tensor, naf: nn.Module,
+                     camera: Camera, coords: torch.Tensor, grid: int,
+                     first_dtype: Optional[torch.dtype] = None) -> tuple[dict, dict]:
+    """`cond_tokens` of two stages that read the same picture size and tokens and differ in NAF's target (shape_1024
+    at 512, tex_1024 at 1024): the same values as the two calls, with what the two share made once per view -
+    the bounds check, DINOv3's map sampled at the tokens, the global tokens, and NAF's image encoder (two
+    convolution stacks over the whole picture, about 0.36 s a view at 1024 px, whatever the target). The
+    encoder's map is pooled to spec_a's target for the first conditioning and used at spec_b's for the second,
+    which writes over it; spec_b's target is meant to be the picture's own size, where the pool is the identity.
+    Returns (cond_a, cond_b), each {"global", "proj"} as cond_tokens gives them; with `first_dtype` the first
+    one's "proj" is cast to it as soon as it is done (a single view: before the second is made, so that nothing
+    more is on the card meanwhile than the second call alone needs; a multi-view prop: after its views are
+    averaged, in float32 until then). Raises ValueError where the two cannot share (NAF's guard would resize the
+    picture for one target and not the other, another fusion, an older natten): the caller makes the two calls.
+    """
+    for spec in (spec_a, spec_b):
+        if not spec.use_naf:
+            raise ValueError(f"{spec.name} has no NAF branch: use cond_dense")
+        if spec.fusion != "average":
+            raise ValueError(f"{spec.name} joins its views by {spec.fusion!r}, which this path does not build")
+    if (spec_a.image_size, spec_a.patch_size, spec_a.registers) != (spec_b.image_size, spec_b.patch_size, spec_b.registers):
+        raise ValueError(f"{spec_a.name} and {spec_b.name} do not read the same tokens")
+    if naf_sliced._attention_of(naf) is None:
+        raise ValueError("this NAF runs the two-call form of an older natten: no shared guide")
+    patches = spec_a.image_size // spec_a.patch_size
+    if z.shape[0] != camera.views or z.shape[1] != 1 + spec_a.registers + patches * patches:
+        raise ValueError(f"{spec_a.name}: expected DINOv3 tokens [{camera.views}, "
+                         f"{1 + spec_a.registers + patches * patches}, D] of {spec_a.image_size} px pictures, "
+                         f"got {list(z.shape)}")
+    targets = ((spec_a.naf_target, spec_a.naf_target), (spec_b.naf_target, spec_b.naf_target))
+    point_index = _point_index(spec_a, coords, grid)
+    device = z.device
+    z_global_all, z_patch = split_tokens(z, spec_a.registers, patches)
+    # The views as tokens_to_features / view_tokens_to_features hand each one to project_view.
+    if camera.transform_matrix is None:
+        proj_grid = proj_grid_for(ProjGrid, grid, spec_a.image_size, device)
+        views = [(z_patch, camera.camera_angle_x, camera.distance, torch.tensor([camera.mesh_scale], device=device),
+                  None, image)]
+        count = 1
+        z_global = z_global_all
+    else:
+        proj_grid = proj_grid_for(ProjGridMV, grid, spec_a.image_size, device)
+        matrix = camera.transform_matrix
+        batch, count = matrix.shape[:2]
+        calc_mat = compute_relative_calc_mat(matrix, camera.distance, proj_grid.front_view_transform_matrix)
+        angle_flat = camera.camera_angle_x.reshape(batch * count)
+        distance_flat = camera.distance.reshape(batch * count)
+        mesh_scale = torch.as_tensor(camera.mesh_scale, dtype=torch.float32, device=device).reshape(-1)
+        scale_flat = mesh_scale[:, None].expand(batch, count).reshape(batch * count)
+        calc_flat = calc_mat.reshape(batch * count, 4, 4)
+        views = []
+        for v in range(count):
+            idx = torch.arange(v, batch * count, count, device=device)
+            views.append((z_patch[idx], angle_flat[idx], distance_flat[idx], scale_flat[idx], calc_flat[idx],
+                          image[idx]))
+        z_global = z_global_all.reshape(batch, count, z_global_all.shape[-2], z_global_all.shape[-1]).mean(dim=1)
+    acc_a = acc_b = None
+    for z_patch_v, angle_v, distance_v, scale_v, matrix_v, image_v in views:
+        for target in targets:
+            if naf_sliced.guide_input(image_v, target) is not image_v:
+                raise ValueError(f"NAF would bring the picture down for a target of {target}: no shared guide")
+        lr = proj_grid(z_patch_v, angle_v, distance_v, scale_v, matrix_v, point_index=point_index)   # [B, K, D]
+        width = lr.shape[-1]
+        z_a = lr.new_empty(*lr.shape[:-1], 2 * width)
+        z_a[..., :width] = lr
+        z_b = lr.new_empty(*lr.shape[:-1], 2 * width)
+        z_b[..., :width] = lr
+        del lr
+        lr_features = z_patch_v.permute(0, 3, 1, 2)                 # [B, D, h, w]
+
+        def sample(hr_features: torch.Tensor) -> torch.Tensor:
+            return proj_grid(hr_features, angle_v, distance_v, scale_v, matrix_v, BHWC=False, point_index=point_index)
+
+        raw = naf_sliced.guide_map(naf, image_v)
+        guide = torch.nn.functional.adaptive_avg_pool2d(raw, targets[0])
+        naf_sliced.naf_sampled(naf, image_v, lr_features, targets[0], sample, out=z_a[..., width:], guide=guide)
+        del guide
+        if first_dtype is not None and count == 1:
+            z_a = z_a.type(first_dtype)
+        if tuple(raw.shape[-2:]) == targets[1]:
+            guide = raw
+        else:
+            guide = torch.nn.functional.adaptive_avg_pool2d(raw, targets[1])
+        del raw
+        if device.type == "cuda":
+            torch.cuda.empty_cache()    # the first pass's blocks, before the widest moment
+        naf_sliced.naf_sampled(naf, image_v, lr_features, targets[1], sample, out=z_b[..., width:], guide=guide)
+        del guide
+        if acc_a is None:
+            acc_a, acc_b = z_a.contiguous(), z_b.contiguous()
+        else:
+            acc_a.add_(z_a)
+            acc_b.add_(z_b)
+        del z_a, z_b
+    if count > 1:
+        acc_a.div_(count)
+        acc_b.div_(count)
+        if first_dtype is not None:
+            acc_a = acc_a.type(first_dtype)
+    return {"global": z_global, "proj": acc_a[0]}, {"global": z_global, "proj": acc_b[0]}
 
 
 def negative(cond: dict) -> dict:

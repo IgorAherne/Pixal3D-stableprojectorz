@@ -136,13 +136,15 @@ class FinishSteps:
     allocator and `safety_mib` for everybody else; it may run twice after an out-of-memory (it must compute from
     its inputs and may overwrite its outputs), and it leaves nothing on the card when it returns, so that the next
     prop's decode gets the whole card - except what the engine lets it hold: before every step the runner writes
-    `state["room_mib"]`, the MiB a GPU step may keep on the card for a later step of the same prop (a BVH built
-    once for two uses), from what the props still to be decoded need; a step that keeps something writes the MiB
-    it holds into `state["card_mib"]`, and the step that frees it removes that key. `release(state)` lets go of
-    the hold at once; the runner calls it when a decode runs out of memory. A "cpu" step runs on the worker
-    thread: it must not touch the card nor the engine (no events, no store). `result(state)` runs on the GPU
-    thread once every step is done and returns what the prop's result carries. Exceptions fail the prop as the
-    hook's own would; a cancel does not stop the steps of a prop that has reached this point. At most
+    `state["room_mib"]`, the MiB a step may keep on the card for a later step of the same prop (a BVH built once
+    for two uses), from what the props still to be decoded need; a step that keeps something writes the MiB it
+    holds into `state["card_mib"]` - a CPU step as soon as it starts taking it, since the runner counts the hold
+    against the other props only from that key (and from `holds_mib`, the most a step would take, while the step is
+    under way) - and the step that frees it removes that key. `release(state)` lets go of the hold at once; the
+    runner calls it when a decode runs out of memory. A "cpu" step runs on the worker thread: it must not touch
+    the engine (no events, no store), and the card only for such a hold within the room it was given. `result(state)`
+    runs on the GPU thread once every step is done and returns what the prop's result carries. Exceptions fail the
+    prop as the hook's own would; a cancel does not stop the steps of a prop that has reached this point. At most
     runner.IN_FLIGHT props are in their steps at once."""
     steps: list                     # [("gpu" | "cpu", Callable[[dict], None])]
     state: dict
@@ -150,6 +152,7 @@ class FinishSteps:
     native_mib: int = 0             # 0: the engine's own figure for a mesh of this size (parts.glb_reserve)
     safety_mib: int | None = None   # None: the engine's figure for the last part (parts.FINISH_SAFETY_MIB)
     release: Callable[[dict], None] | None = None     # lets go of what the steps hold on the card (state["card_mib"])
+    holds_mib: int = 0              # the most one step keeps on the card, given the room (the hook's estimate)
 
 
 @dataclass

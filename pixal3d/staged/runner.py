@@ -39,8 +39,9 @@ from .types import PARTS, BatchBroken, Cancelled, Event, FinishSteps, PropFailed
 
 MODES = ("normal", "tight", "uncapped")
 KINDS = ("mv", "sv")                # the order inside every part: multi-view props first
-IN_FLIGHT = 2                       # props that may be in their finish steps while another prop is decoded: each
-#                                     holds its decoded mesh and its textures in RAM meanwhile
+IN_FLIGHT = 3                       # props that may be in their finish steps while another prop is decoded: each
+#                                     holds its decoded mesh and its textures in RAM meanwhile (and the tree of its
+#                                     BVH, when the engine gave it room: cuBVH keeps a copy in RAM)
 STEP_WAIT = 0.05                    # seconds the GPU thread waits for a CPU step before it looks again
 
 # Texts of a failure after which the CUDA context may be gone for good; a probe allocation decides.
@@ -142,6 +143,8 @@ class _Tail:
     steps: FinishSteps
     index: int = 0                  # the next step to run
     future: Any = None              # the CPU step under way on the worker thread
+    offered: int = 0                # the room written before the step under way
+    open: bool = False              # a CPU step is under way: its hold counts from the offer on (steps.holds_mib)
 
 
 @dataclass
@@ -518,12 +521,15 @@ class StagedRunner:
     # ---- the finish steps -----------------------------------------------------------------------------------------
 
     def _pump_tails(self, until: Callable[[], bool]) -> None:
-        """Move every prop that is in its finish steps along: a CPU step that is over is collected, GPU steps run
-        here, CPU steps go to the worker thread. Then, while `until()` is false, wait for the CPU steps and go on;
-        `until` is true at once for a look that does not wait."""
+        """Move every prop that is in its finish steps along: a CPU step that is over is collected, CPU steps go
+        to the worker thread, then GPU steps run here - every tail's CPU step is handed over before any GPU step
+        runs, so the worker never waits for a GPU step of another prop. Then, while `until()` is false, wait for
+        the CPU steps and go on; `until` is true at once for a look that does not wait."""
         while True:
             for tail in list(self._tails):
-                self._advance(tail)
+                self._advance(tail, gpu=False)
+            for tail in list(self._tails):
+                self._advance(tail, gpu=True)
             if until() or not self._tails:
                 return
             running = [tail.future for tail in self._tails if tail.future is not None]
@@ -531,14 +537,16 @@ class StagedRunner:
                 return                              # nothing is under way: `until` cannot come true by waiting
             concurrent.futures.wait(running, timeout=STEP_WAIT, return_when=concurrent.futures.FIRST_COMPLETED)
 
-    def _advance(self, tail: _Tail) -> None:
-        """Run the tail's GPU steps until it reaches a CPU step (handed to the worker), its end, or a failure."""
+    def _advance(self, tail: _Tail, gpu: bool = True) -> None:
+        """Collect the tail's CPU step when it is over, hand its next CPU step to the worker, and with `gpu` run
+        its GPU steps until it reaches a CPU step, its end, or a failure (without `gpu`, stop at a GPU step)."""
         steps = tail.steps
         if tail.future is not None:
             if not tail.future.done():
                 return
             error = tail.future.exception()
             tail.future = None
+            tail.open = False
             if error is not None:
                 failure = (classify(error), describe(error), "".join(traceback.format_exception(error)))
                 del error
@@ -548,11 +556,14 @@ class StagedRunner:
             self._step_event(tail)
         while tail.index < len(steps.steps):
             kind, fn = steps.steps[tail.index]
-            steps.state["room_mib"] = self._room(tail)
+            if kind == "gpu" and not gpu:
+                return
+            tail.offered = steps.state["room_mib"] = self._room(tail)
             if kind == "cpu":
                 if self._worker is None:
                     self._worker = concurrent.futures.ThreadPoolExecutor(max_workers=1,
                                                                          thread_name_prefix="p3d-finish-cpu")
+                tail.open = True
                 tail.future = self._worker.submit(fn, steps.state)
                 return
             failure = self._gpu_step(tail, fn)
@@ -594,11 +605,19 @@ class StagedRunner:
         if room is None:
             return 0
         pending = [prop for prop in self._alive("finish", self._wave_now) if prop.part != "finish"]
-        held = sum(int(other.steps.state.get("card_mib") or 0) for other in self._tails if other is not tail)
+        held = sum(self._holding(other) for other in self._tails if other is not tail)
         try:
             return int(room(self.ctx, pending, held))
         except Exception:
             return 0
+
+    @staticmethod
+    def _holding(tail: _Tail) -> int:
+        """MiB a tail holds on the card, or is about to: what its state says, or - while a CPU step it was
+        offered room runs - the most a step takes, since that step reports only when it is over."""
+        said = int(tail.steps.state.get("card_mib") or 0)
+        coming = min(tail.offered, int(tail.steps.holds_mib or 0)) if tail.open else 0
+        return max(said, coming)
 
     def _let_go(self) -> bool:
         """Every tail lets go of what it holds on the card (a decode ran out of memory). True when one did."""

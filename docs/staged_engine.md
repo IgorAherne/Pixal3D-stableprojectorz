@@ -83,18 +83,23 @@ bounds the RAM their meshes and textures hold. The hook's steps are reported as 
 `prop_done` comes when the last step is over, so a prop's turn on the card and its `prop_done` are no longer back
 to back.
 
-One thing a GPU step may leave on the card: what the engine has room for. Before every step the runner writes
+One thing a step may leave on the card: what the engine has room for. Before every step the runner writes
 `state["room_mib"]`, the MiB the step may keep for a later step of the same prop (`parts.tail_room`: what the card
 has beside PyTorch's reserve, less the finish part's reserves, less what the props still to be decoded need under
 the cap at most - both decoders with the margin of `decoders_fit` - or what another prop's hook steps need with
 nothing held (`parts.HOLD_BESIDE_MIB`), whichever is more, less what the other props in their steps hold already
 and a slack; and no more than the RAM allows twice over beside the floor, for things that keep a copy in RAM). A
-step that keeps something writes the MiB it holds into `state["card_mib"]`; the step that uses it up removes the
-key. `FinishSteps.release(state)` lets go of the hold at once: the runner calls it on every tail when a decode
-runs out of memory, before the retry. Spellcast3D's GLB steps hold the cuBVH of the decoded mesh this way (built
-once for the remesh, needed again for the bake; 60-70 bytes a face, 0.6-0.9 GB for the meshes of a 1024 prop;
-a build takes 5-7 s on the CPU with Python's lock held), so a batch builds it once per prop where the card has
-room, and twice where it has not, as before.
+step that keeps something writes the MiB it holds into `state["card_mib"]` - a CPU step as soon as it starts
+taking it, and the runner counts `FinishSteps.holds_mib`, the most a step takes, from the offer until the step is
+over, since a CPU step reports only then; the step that uses it up removes the key. A CPU step may touch the card
+for such a hold and for nothing else. `FinishSteps.release(state)` lets go of the hold at once: the runner calls
+it on every tail when a decode runs out of memory, before the retry. The runner hands every tail's CPU step to
+the worker before it runs any GPU step, so the worker never waits behind another prop's GPU step, and up to
+`runner.IN_FLIGHT` (3) props are in their steps at once. Spellcast3D's GLB steps hold the cuBVH of the decoded
+mesh this way: its CPU step builds it on the worker thread (cuBVH builds its tree on the CPU for 5-7 s; the
+Spellcast3D build of cumesh lets go of Python's lock meanwhile) while the next prop is decoded, the remesh and
+the bake both use it (60-70 bytes a face, 0.6-0.9 GB on the card and in RAM for the meshes of a 1024 prop), and
+where the card has no room the GPU thread builds it twice as before.
 
 ### Events
 
@@ -123,7 +128,7 @@ room, and twice where it has not, as before.
 | `cond_lr` | NAF | `dino512`, pictures, `prep`, `coords_ss` | `cond_lr` |
 | `lr` | shape flow 512 | `cond_lr`, `coords_ss`, `rng_ss` | `lr_slat`, `rng_lr` |
 | `upsample` | shape decoder | `lr_slat`, `coords_ss` | `coords_hr` (with the resolution used) |
-| `cond_hr` | NAF | `dino1024`, pictures, `prep`, `coords_hr` | `cond_hr`, `cond_tex` |
+| `cond_hr` | NAF | `dino1024`, pictures, `prep`, `coords_hr` | `cond_hr`, `cond_tex` (both at once, `proj_cond.cond_tokens_pair`: NAF's image encoder once per view; a multi-view prop only under a cap of `FUSED_COND_MV_CAP_MIB`, else the two calls) |
 | `hr` | shape flow 1024 | `cond_hr`, `coords_hr`, `rng_lr` | `shape_slat`, `rng_hr` |
 | `tex` | texture flow | `cond_tex`, `coords_hr`, `shape_slat`, `rng_hr` | `tex_slat`, the checkpoint |
 | `finish` | shape decoder, texture decoder | `coords_hr`, `shape_slat`, `tex_slat`, `notes` | the prop's file, through the hook |

@@ -1,0 +1,211 @@
+{
+  "wheel": "cumesh-0.0.1+cu128torch2.8-cp311-cp311-win_amd64.whl",
+  "sha256": "4b7150ffbd355473ba518843fe6518c4cb222809698c66c9d8b5e181cba2122b",
+  "size_bytes": 13421947,
+  "built": "2026-10-14T13:08:03+00:00",
+  "build_seconds": 510,
+  "sources": {
+    "cumesh": {
+      "repo": "https://github.com/JeffreyXiang/CuMesh.git",
+      "commit": "b84410e9c01f68f5236c328cba610e9051cd1063",
+      "license": "MIT (Microsoft TRELLIS.2's CuMesh)"
+    },
+    "cubvh": {
+      "repo": "https://github.com/JeffreyXiang/cubvh.git",
+      "commit": "ff89002e3c7fdcac63cf71ddb638e7934ca3fc6e",
+      "license": "MIT (ashawkey/cubvh lineage; NVIDIA instant-ngp's BVH code under its licence, LICENSE_NVIDIA in the tree)"
+    },
+    "eigen": {
+      "repo": "https://gitlab.com/libeigen/eigen",
+      "commit": "e63d9f6ccb7f6f29f31241b87c542f3f0ab3112b",
+      "license": "MPL-2.0 (headers only)"
+    },
+    "xatlas": {
+      "where": "third_party/xatlas in CuMesh's tree",
+      "license": "MIT"
+    }
+  },
+  "patches": {
+    "script": "code/release/wheels/cumesh/patch_cumesh_win.py",
+    "applied_to": "clean `git archive` exports of the pinned commits (the clones stay untouched)",
+    "why": "MSVC 2022 + CUDA 12.8 build (ssize_t, compiler flags, no torch pin), Pixal3D's memory edits of remeshing.py (the wheel the fork shipped: chunked BVH queries and frees, value-neutral) and cuBVH's build without Python's lock (create_cuBVH: py::call_guard<py::gil_scoped_release>)",
+    "hunks": [
+      {
+        "id": "pyproject-no-torch-pin",
+        "file": "pyproject.toml"
+      },
+      {
+        "id": "setup-msvc-flags",
+        "file": "setup.py"
+      },
+      {
+        "id": "setup-ext-C-flags",
+        "file": "setup.py"
+      },
+      {
+        "id": "setup-ext-cubvh-flags",
+        "file": "setup.py"
+      },
+      {
+        "id": "setup-ext-xatlas-flags",
+        "file": "setup.py"
+      },
+      {
+        "id": "ext-ssize_t",
+        "file": "src/ext.cpp"
+      },
+      {
+        "id": "cubvh-bindings-ssize_t",
+        "file": "third_party/cubvh/src/bindings.cpp"
+      },
+      {
+        "id": "atlas-cub-sum-for-cuda-12.8",
+        "file": "src/atlas.cu"
+      },
+      {
+        "id": "cubvh-build-without-the-gil",
+        "file": "third_party/cubvh/src/bindings.cpp"
+      },
+      {
+        "id": "msvc-compat-header",
+        "file": "src/cumesh_msvc_compat.h (new)"
+      },
+      {
+        "id": "remeshing-memory-edits",
+        "file": "cumesh/remeshing.py (replaced by remeshing_pixal3d.py)"
+      },
+      {
+        "id": "local-version",
+        "file": "pyproject.toml"
+      }
+    ]
+  },
+  "python": "CPython 3.11.9 (spellcast3d tools/python), throw-away build venv",
+  "torch_at_build": "2.8.0+cu128 (CUDA 12.8) from code\\venvs\\pixal3d via a .pth (not installed/modified)",
+  "msvc": "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35213 for x64 (toolset 14.44.35207), dynamic CRT /MD like torch",
+  "windows_sdk": "10.0.26100.0",
+  "cuda": "CUDA 12.8 (nvcc V12.8.93) at C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
+  "torch_cuda_arch_list": "6.1;7.0;7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX",
+  "cuobjdump": {
+    "_C.cp311-win_amd64.pyd": {
+      "sass_sm": [
+        61,
+        70,
+        75,
+        80,
+        86,
+        89,
+        90,
+        100,
+        120
+      ],
+      "ptx_compute": [
+        120
+      ],
+      "cubin_images": 99,
+      "ptx_images": 11
+    },
+    "_cubvh.cp311-win_amd64.pyd": {
+      "sass_sm": [
+        61,
+        70,
+        75,
+        80,
+        86,
+        89,
+        90,
+        100,
+        120
+      ],
+      "ptx_compute": [
+        120
+      ],
+      "cubin_images": 18,
+      "ptx_images": 2
+    }
+  },
+  "pyds": [
+    "cumesh/_C.cp311-win_amd64.pyd",
+    "cumesh/_cubvh.cp311-win_amd64.pyd",
+    "cumesh/_xatlas.cp311-win_amd64.pyd"
+  ],
+  "pyd_dll_imports": {
+    "_C.cp311-win_amd64.pyd": [
+      "c10.dll",
+      "torch_cpu.dll",
+      "torch_python.dll",
+      "cudart64_12.dll",
+      "MSVCP140.dll",
+      "python311.dll",
+      "KERNEL32.dll",
+      "VCRUNTIME140.dll",
+      "VCRUNTIME140_1.dll",
+      "api-ms-win-crt-runtime-l1-1-0.dll",
+      "api-ms-win-crt-heap-l1-1-0.dll",
+      "api-ms-win-crt-environment-l1-1-0.dll",
+      "api-ms-win-crt-string-l1-1-0.dll",
+      "api-ms-win-crt-math-l1-1-0.dll",
+      "api-ms-win-crt-stdio-l1-1-0.dll"
+    ],
+    "_cubvh.cp311-win_amd64.pyd": [
+      "c10.dll",
+      "torch_cpu.dll",
+      "torch_python.dll",
+      "cudart64_12.dll",
+      "c10_cuda.dll",
+      "MSVCP140.dll",
+      "python311.dll",
+      "KERNEL32.dll",
+      "VCRUNTIME140.dll",
+      "VCRUNTIME140_1.dll",
+      "api-ms-win-crt-runtime-l1-1-0.dll",
+      "api-ms-win-crt-heap-l1-1-0.dll",
+      "api-ms-win-crt-environment-l1-1-0.dll",
+      "api-ms-win-crt-string-l1-1-0.dll",
+      "api-ms-win-crt-math-l1-1-0.dll",
+      "api-ms-win-crt-stdio-l1-1-0.dll"
+    ],
+    "_xatlas.cp311-win_amd64.pyd": [
+      "c10.dll",
+      "torch_cpu.dll",
+      "torch_python.dll",
+      "MSVCP140.dll",
+      "python311.dll",
+      "KERNEL32.dll",
+      "VCRUNTIME140_1.dll",
+      "VCRUNTIME140.dll",
+      "api-ms-win-crt-heap-l1-1-0.dll",
+      "api-ms-win-crt-runtime-l1-1-0.dll",
+      "api-ms-win-crt-string-l1-1-0.dll",
+      "api-ms-win-crt-stdio-l1-1-0.dll",
+      "api-ms-win-crt-utility-l1-1-0.dll",
+      "api-ms-win-crt-math-l1-1-0.dll"
+    ]
+  },
+  "build_tools": {
+    "setuptools": "80.9.0",
+    "wheel": "0.45.1",
+    "ninja": "1.13.2.git.kitware.jobserver-pipe-1"
+  },
+  "env": {
+    "CUDA_HOME": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
+    "DISTUTILS_USE_SDK": "1",
+    "FORCE_CUDA": "1",
+    "TORCH_CUDA_ARCH_LIST": "6.1;7.0;7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX",
+    "MAX_JOBS": "8"
+  },
+  "build_command": "python -m pip wheel <patched export> --no-deps --no-build-isolation -v -w <out>  (inside vcvars64; driver: code/release/wheels/cumesh/build_cumesh_win.py)",
+  "runtime_requirements": {
+    "install": "pip install <this wheel>  (Pixal3D's install.py installs every wheel in its whl folder)",
+    "import_needs": [
+      "torch 2.8.x+cu128",
+      "numpy",
+      "tqdm"
+    ]
+  },
+  "wheel_files": 13,
+  "wheel_license_files": [
+    "cumesh-0.0.1+cu128torch2.8.dist-info/licenses/LICENSE"
+  ],
+  "build_log": "release\\cache\\wheels\\logs\\cumesh-build.log"
+}

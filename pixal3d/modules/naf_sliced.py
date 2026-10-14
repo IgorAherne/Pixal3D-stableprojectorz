@@ -62,9 +62,41 @@ def _heads_last(x: torch.Tensor) -> torch.Tensor:
     return x.permute(0, 2, 3, 1).unsqueeze(3).contiguous()
 
 
+def guide_input(image: torch.Tensor, target_size: Tuple[int, int]) -> torch.Tensor:
+    """The picture as NAF's forward hands it to its encoder: NAF's own guard, its target cross-indexed as it is
+    there - a map wider than four times the one asked for is brought down first (model/naf.py:38-48). Copied
+    rather than tidied, so a target that is not square behaves as it does in NAF. The picture itself when the
+    guard does nothing."""
+    if image.shape[-2] > 4 * target_size[0] or image.shape[-1] > 4 * target_size[1]:
+        return F.interpolate(
+            image,
+            size=(
+                min(image.shape[-2], 4 * target_size[0], 4 * target_size[1]),
+                min(image.shape[-1], 4 * target_size[1], 4 * target_size[0]),
+            ),
+            mode="bilinear",
+            align_corners=False,
+        )
+    return image
+
+
+@torch.no_grad()
+def guide_map(naf, image: torch.Tensor) -> torch.Tensor:
+    """The guide's map before the pool to a target: what ImageEncoder.forward_encoder makes of the picture up to
+    its last line (model/naf.py:31-35), the two convolution stacks over the whole picture - about 0.36 s a view at
+    1024 px, the same whatever the target. `image` as guide_input gives it. Pooled to a target with
+    `F.adaptive_avg_pool2d(map, target)`, it is forward_encoder's result for that target; at the map's own size
+    the pool averages one pixel each, so the map itself is that result."""
+    encoder = naf.image_encoder
+    if not encoder.use_encoder:
+        return image
+    return torch.cat([encoder.encoder(image), encoder.sem_encoder(image)], dim=1)
+
+
 @torch.no_grad()
 def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size: Tuple[int, int],
-                sample: Callable[[torch.Tensor], torch.Tensor], out: Optional[torch.Tensor] = None) -> torch.Tensor:
+                sample: Callable[[torch.Tensor], torch.Tensor], out: Optional[torch.Tensor] = None,
+                guide: Optional[torch.Tensor] = None) -> torch.Tensor:
     """NAF.forward(image, lr_features, target_size) fed head by head to `sample`.
 
     image [B, 3, H, W] in 0..1; lr_features [B, C, h, w]; sample(fmap [B, C / heads, T, T]) -> [B, K, C / heads];
@@ -74,9 +106,15 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
     `sample` is given one head's map; on the fall-back below, where the whole map is built at once, it is given
     all the channels in one call instead. Both callers sample each channel on its own, so that makes no
     difference to them.
+
+    `guide`: the guide's map at `target_size` made outside (guide_map, pooled), in place of the encoder's run
+    here; it is written over by the rotation and not usable afterwards. A caller that needs the encoder's map at
+    two targets makes it once this way.
     """
     na2d = _attention_of(naf)
     if na2d is None:
+        if guide is not None:
+            raise ValueError("a guide made outside needs natten's na2d; this NAF runs the two-call form")
         rows = sample(naf(image, lr_features, target_size))      # an older natten: no kernel to call per head
         if out is None:
             return rows
@@ -87,19 +125,12 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
     heads = attention.num_heads
     if lr_features.shape[1] % heads:
         raise ValueError(f"NAF's {lr_features.shape[1]} channels do not divide into {heads} heads")
-    # NAF's own guard, its target cross-indexed as it is there: a map wider than four times the one asked for is
-    # brought down first. Copied rather than tidied, so a target that is not square behaves as it does in NAF.
-    if image.shape[-2] > 4 * target_size[0] or image.shape[-1] > 4 * target_size[1]:
-        image = F.interpolate(
-            image,
-            size=(
-                min(image.shape[-2], 4 * target_size[0], 4 * target_size[1]),
-                min(image.shape[-1], 4 * target_size[1], 4 * target_size[0]),
-            ),
-            mode="bilinear",
-            align_corners=False,
-        )
-    x = encoder.forward_encoder(image, target_size)                         # the guide's map before RoPE
+    if guide is None:
+        x = encoder.forward_encoder(guide_input(image, target_size), target_size)   # the guide's map before RoPE
+    else:
+        if tuple(guide.shape[-2:]) != tuple(target_size):
+            raise ValueError(f"the guide's map is {tuple(guide.shape[-2:])}, the target {tuple(target_size)}")
+        x = guide
     batch, channels, height, width = x.shape
     if channels % heads:
         raise ValueError(f"the guide's {channels} channels do not divide into {heads} heads")

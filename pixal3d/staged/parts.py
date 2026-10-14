@@ -99,6 +99,11 @@ SAMPLER_SLACK = 1.25
 HOOK_RAM_BASE_MIB = 3_000
 HOOK_RAM_MIB_PER_MVOXEL = 310
 RAM_FLOOR_MIB = 1_500               # what must stay available to Windows and the hub beside the hook's own need
+# `cond_hr` makes the shape and the texture conditionings together (proj_cond.cond_tokens_pair: NAF's image encoder
+# once per view instead of twice, about 0.36 s a view). A single-view prop pays nothing for it on the card; a
+# multi-view prop keeps the shape conditioning's running sum in float32 through the texture pass, its widest
+# moment, so it goes this way only under a cap of at least this much (a 7.2 GiB card gives about 6,800).
+FUSED_COND_MV_CAP_MIB = 7_400
 
 
 # What a finish hook's GPU step may keep on the card between its steps (types.FinishSteps: state["room_mib"]): a
@@ -490,9 +495,22 @@ def cond_hr(ctx: PartContext, prop: PropState, mode: str) -> None:
     grid = int(stored["res"][0]) // 16
     z1024 = ctx.take(prop, "dino1024")["z"]
     image = proj_cond.image_tensor(source, 1024, ctx.device)
-    shape = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["shape_1024"], z1024, image, naf, view, coords, grid))
-    ctx.loader.trim()       # the texture conditioning is the widest moment of a prop: it starts from a clean cache
-    tex = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["tex_1024"], z1024, image, naf, view, coords, grid))
+    limits = card_limits(ctx)
+    together = mode == "normal" and (not prop.req.multi or limits is None or limits[1] >= FUSED_COND_MV_CAP_MIB)
+    pair_fn = getattr(proj_cond, "cond_tokens_pair", None)      # a conditioning module without it: the two calls
+    pair = None
+    if together and pair_fn is not None:
+        try:
+            pair = pair_fn(proj_cond.SPECS["shape_1024"], proj_cond.SPECS["tex_1024"], z1024, image, naf, view,
+                           coords, grid, first_dtype=torch.bfloat16)
+        except ValueError:          # nothing to share for this NAF or picture: the two calls, as before
+            pair = None
+    if pair is not None:
+        shape, tex = _bf16(pair[0]), _bf16(pair[1])
+    else:
+        shape = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["shape_1024"], z1024, image, naf, view, coords, grid))
+        ctx.loader.trim()       # the texture conditioning is the widest moment of a prop: it starts from a clean cache
+        tex = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["tex_1024"], z1024, image, naf, view, coords, grid))
     ctx.store.put_device(prop.id, "cond_hr", shape)
     ctx.store.put_device(prop.id, "cond_tex", tex)
 
