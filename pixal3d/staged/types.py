@@ -139,8 +139,9 @@ class FinishSteps:
     `state["room_mib"]`, the MiB a step may keep on the card for a later step of the same prop (a BVH built once
     for two uses), from what the props still to be decoded need; a step that keeps something writes the MiB it
     holds into `state["card_mib"]` - a CPU step as soon as it starts taking it, since the runner counts the hold
-    against the other props only from that key (and from `holds_mib`, the most a step would take, while the step is
-    under way) - and the step that frees it removes that key. `release(state)` lets go of the hold at once; the
+    against the other props from that key (and, until a step of the prop has held, from `holds_mib`, the most a
+    step would take, while a CPU step is under way) - and the step that frees it removes that key. The runner's
+    `step` events carry the room offered and the hold (`detail` room_mib, card_mib). `release(state)` lets go of the hold at once; the
     runner calls it when a decode runs out of memory. A "cpu" step runs on the worker thread: it must not touch
     the engine (no events, no store), and the card only for such a hold within the room it was given. `result(state)`
     runs on the GPU thread once every step is done and returns what the prop's result carries. Exceptions fail the

@@ -145,6 +145,8 @@ class _Tail:
     future: Any = None              # the CPU step under way on the worker thread
     offered: int = 0                # the room written before the step under way
     open: bool = False              # a CPU step is under way: its hold counts from the offer on (steps.holds_mib)
+    held: bool = False              # a step has held something (state["card_mib"] seen): later CPU steps that say
+    #                                 nothing hold nothing
 
 
 @dataclass
@@ -553,7 +555,7 @@ class StagedRunner:
                 self._end_tail(tail, failure)
                 return
             tail.index += 1
-            self._step_event(tail)
+            self._step_done(tail)
         while tail.index < len(steps.steps):
             kind, fn = steps.steps[tail.index]
             if kind == "gpu" and not gpu:
@@ -571,7 +573,7 @@ class StagedRunner:
                 self._end_tail(tail, failure)
                 return
             tail.index += 1
-            self._step_event(tail)
+            self._step_done(tail)
         failure = self._result(tail)
         self._end_tail(tail, failure)
 
@@ -614,9 +616,11 @@ class StagedRunner:
     @staticmethod
     def _holding(tail: _Tail) -> int:
         """MiB a tail holds on the card, or is about to: what its state says, or - while a CPU step it was
-        offered room runs - the most a step takes, since that step reports only when it is over."""
+        offered room runs, before any step of the tail has held - the most a step takes, since a step that will
+        hold may not have written it yet. Once a step has held, the state is trusted: a later CPU step that says
+        nothing (an export after the bake let go) holds nothing."""
         said = int(tail.steps.state.get("card_mib") or 0)
-        coming = min(tail.offered, int(tail.steps.holds_mib or 0)) if tail.open else 0
+        coming = min(tail.offered, int(tail.steps.holds_mib or 0)) if tail.open and not tail.held else 0
         return max(said, coming)
 
     def _let_go(self) -> bool:
@@ -651,10 +655,15 @@ class StagedRunner:
             return classify(exc), describe(exc), traceback.format_exc()
         return None
 
-    def _step_event(self, tail: _Tail) -> None:
-        """The hook's steps count on after the three of the decode phase."""
+    def _step_done(self, tail: _Tail) -> None:
+        """A step of the tail is over: the hook's steps count on after the three of the decode phase; the event
+        says what room the step was offered and what the prop holds on the card now."""
+        held = tail.steps.state.get("card_mib")
+        if held:
+            tail.held = True
         total = 3 + len(tail.steps.steps)
-        self.ctx.emit(Event("step", "finish", tail.prop.id, 3 + tail.index, total))
+        self.ctx.emit(Event("step", "finish", tail.prop.id, 3 + tail.index, total,
+                            detail={"room_mib": tail.offered, "card_mib": int(held or 0)}))
 
     def _end_tail(self, tail: _Tail, failure: tuple[str, str, str] | None) -> None:
         self._tails.remove(tail)

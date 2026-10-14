@@ -90,9 +90,11 @@ the cap at most - both decoders with the margin of `decoders_fit` - or what anot
 nothing held (`parts.HOLD_BESIDE_MIB`), whichever is more, less what the other props in their steps hold already
 and a slack; and no more than the RAM allows twice over beside the floor, for things that keep a copy in RAM). A
 step that keeps something writes the MiB it holds into `state["card_mib"]` - a CPU step as soon as it starts
-taking it, and the runner counts `FinishSteps.holds_mib`, the most a step takes, from the offer until the step is
-over, since a CPU step reports only then; the step that uses it up removes the key. A CPU step may touch the card
-for such a hold and for nothing else. `FinishSteps.release(state)` lets go of the hold at once: the runner calls
+taking it, and until a step of the prop has held something the runner counts `FinishSteps.holds_mib`, the most a
+step takes, from the offer of a CPU step until that step is over, since the step may not have written the key yet;
+once a step has held, the key alone counts (a later CPU step that says nothing holds nothing); the step that uses
+the hold up removes the key. A CPU step may touch the card for such a hold and for nothing else. Every `step`
+event says what room the step was offered and what the prop holds now (`detail` room_mib, card_mib). `FinishSteps.release(state)` lets go of the hold at once: the runner calls
 it on every tail when a decode runs out of memory, before the retry. The runner hands every tail's CPU step to
 the worker before it runs any GPU step, so the worker never waits behind another prop's GPU step, and up to
 `runner.IN_FLIGHT` (3) props are in their steps at once. Spellcast3D's GLB steps hold the cuBVH of the decoded
