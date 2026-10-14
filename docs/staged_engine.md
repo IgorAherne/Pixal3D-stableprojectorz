@@ -139,6 +139,17 @@ The flow networks exist once per kind (`<name>.sv` from `pipeline.json`, `<name>
 inside every part the multi-view props go first, then the networks are exchanged and the single-view props follow.
 The decoders, DINOv3, NAF and background removal serve both kinds.
 
+The flows' transformer blocks run their elementwise chains (LayerNorm32 and the adaLN modulation, the gated
+residuals, the q / k RMS norm with the rotary embedding) as fused Triton kernels (`pixal3d/modules/fused.py`), on
+by default: `PIXAL3D_FUSED=off` in the environment gives the eager PyTorch ops, bit for bit the numbers of before.
+The kernels reproduce every bf16 rounding of the eager chain; only its reductions are summed in another order, and
+the samplers amplify that - as they amplify any change of card or cuBLAS - into a slightly different sample of the
+same quality. A detail-flow pass is 11-14 % faster, a sparse-structure pass 21 %, a batch 8-10 %; the memory peak
+of a pass is unchanged. Before the first fused pass of a process the kernels are tried against the eager ops on
+small tables; a card or a Triton that cannot run them turns the switch off with a `[FUSED]` warning and the flows
+run eagerly.
+
+
 A part function is `fn(ctx, prop, mode)` in `parts.py`. It reads from the batch's store, computes, and writes its
 results **as its last actions**, so an attempt that failed has changed nothing.
 

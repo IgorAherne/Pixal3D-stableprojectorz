@@ -32,12 +32,8 @@ class SparseRotaryPositionEmbedder(nn.Module):
         x_embed = torch.view_as_real(x_rotated).reshape(*x_rotated.shape[:-1], -1).to(x.dtype)
         return x_embed
         
-    def forward(self, q: SparseTensor, k: Optional[SparseTensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            q (SparseTensor): [..., N, H, D] tensor of queries
-            k (SparseTensor): [..., N, H, D] tensor of keys
-        """
+    def phases(self, q: SparseTensor) -> torch.Tensor:
+        """The complex64 [N, head_dim / 2] rotation of every token of q, kept in q's spatial cache."""
         assert q.coords.shape[-1] == self.dim + 1, "Last dimension of coords must be equal to dim+1"
         phases_cache_name = f'rope_phase_{self.dim}d_freq{self.rope_freq[0]}-{self.rope_freq[1]}_hd{self.head_dim}'
         phases = q.get_spatial_cache(phases_cache_name)
@@ -51,6 +47,15 @@ class SparseRotaryPositionEmbedder(nn.Module):
                     torch.zeros(*phases.shape[:-1], padn, device=phases.device)
                 )], dim=-1)
             q.register_spatial_cache(phases_cache_name, phases)
+        return phases
+
+    def forward(self, q: SparseTensor, k: Optional[SparseTensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            q (SparseTensor): [..., N, H, D] tensor of queries
+            k (SparseTensor): [..., N, H, D] tensor of keys
+        """
+        phases = self.phases(q)
         q_embed = q.replace(self._rotary_embedding(q.feats, phases))
         if k is None:
             return q_embed

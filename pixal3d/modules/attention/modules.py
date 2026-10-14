@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .full_attn import scaled_dot_product_attention
 from .rope import RotaryPositionEmbedder
+from .. import fused
 
 
 class MultiHeadRMSNorm(nn.Module):
@@ -63,6 +64,21 @@ class MultiHeadAttention(nn.Module):
             
         self.to_out = nn.Linear(channels, channels)
     
+    def _fused_qk(self, q: torch.Tensor, k: torch.Tensor,
+                  phases: Optional[torch.Tensor]) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """q and k ([B, L, H, D]) through the RMS norm (and the rotary embedding when phases, [L, D / 2], are
+        given) in one fused kernel each (modules/fused.py), or None when their layout does not suit it: the eager
+        code runs then."""
+        if phases is not None and (phases.dim() != 2 or phases.shape[0] != q.shape[1]):
+            return None
+        fq = fused.qk_norm_rope(q, self.q_rms_norm.gamma, self.q_rms_norm.scale, phases)
+        if fq is None:
+            return None
+        fk = fused.qk_norm_rope(k, self.k_rms_norm.gamma, self.k_rms_norm.scale, phases)
+        if fk is None:
+            return None
+        return fq, fk
+
     def forward(self, x: torch.Tensor, context: Optional[torch.Tensor] = None, phases: Optional[torch.Tensor] = None) -> torch.Tensor:
         B, L, C = x.shape
         if self._type == "self":
@@ -72,13 +88,19 @@ class MultiHeadAttention(nn.Module):
             if self.attn_mode == "full":
                 if self.qk_rms_norm or self.use_rope:
                     q, k, v = qkv.unbind(dim=2)
-                    if self.qk_rms_norm:
-                        q = self.q_rms_norm(q)
-                        k = self.k_rms_norm(k)
-                    if self.use_rope:
-                        assert phases is not None, "Phases must be provided for RoPE"
-                        q = RotaryPositionEmbedder.apply_rotary_embedding(q, phases)
-                        k = RotaryPositionEmbedder.apply_rotary_embedding(k, phases)
+                    normed = (self._fused_qk(q, k, phases if self.use_rope else None)
+                              if self.qk_rms_norm and (phases is not None or not self.use_rope)
+                              and fused.active(q) else None)
+                    if normed is not None:
+                        q, k = normed
+                    else:
+                        if self.qk_rms_norm:
+                            q = self.q_rms_norm(q)
+                            k = self.k_rms_norm(k)
+                        if self.use_rope:
+                            assert phases is not None, "Phases must be provided for RoPE"
+                            q = RotaryPositionEmbedder.apply_rotary_embedding(q, phases)
+                            k = RotaryPositionEmbedder.apply_rotary_embedding(k, phases)
                     h = scaled_dot_product_attention(q, k, v)
                 else:
                     h = scaled_dot_product_attention(qkv)
@@ -91,9 +113,13 @@ class MultiHeadAttention(nn.Module):
             q = q.reshape(B, L, self.num_heads, -1)
             kv = kv.reshape(B, Lkv, 2, self.num_heads, -1)
             if self.qk_rms_norm:
-                q = self.q_rms_norm(q)
                 k, v = kv.unbind(dim=2)
-                k = self.k_rms_norm(k)
+                normed = self._fused_qk(q, k, None) if fused.active(q) else None
+                if normed is not None:
+                    q, k = normed
+                else:
+                    q = self.q_rms_norm(q)
+                    k = self.k_rms_norm(k)
                 h = scaled_dot_product_attention(q, k, v)
             else:
                 h = scaled_dot_product_attention(q, kv)

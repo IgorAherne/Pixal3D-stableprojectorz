@@ -4,9 +4,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .. import VarLenTensor, SparseTensor
 from .. import config
+from ... import fused
 from .full_attn import sparse_scaled_dot_product_attention
 from .windowed_attn import sparse_windowed_scaled_dot_product_self_attention
 from .rope import SparseRotaryPositionEmbedder
+
+
+def _feats(x: Union[VarLenTensor, torch.Tensor]) -> torch.Tensor:
+    return x.feats if isinstance(x, VarLenTensor) else x
 
 
 class SparseMultiHeadRMSNorm(nn.Module):
@@ -97,6 +102,20 @@ class SparseMultiHeadAttention(nn.Module):
         x_feats = x_feats.reshape(*x_feats.shape[:2], num_fused, self.num_heads, -1)
         return x.replace(x_feats.squeeze(0)) if isinstance(x, VarLenTensor) else x_feats
     
+    def _fused_qk(self, q: Union[VarLenTensor, torch.Tensor], k: Union[VarLenTensor, torch.Tensor],
+                  rope: bool = True) -> Optional[Tuple[Union[VarLenTensor, torch.Tensor], ...]]:
+        """q and k through the RMS norm (and the rotary embedding when the block uses it) in one fused kernel each
+        (modules/fused.py), or None when their layout does not suit it: the eager code runs then."""
+        phases = self.rope.phases(q) if rope and self.use_rope else None
+        fq = fused.qk_norm_rope(_feats(q), self.q_rms_norm.gamma, self.q_rms_norm.scale, phases)
+        if fq is None:
+            return None
+        fk = fused.qk_norm_rope(_feats(k), self.k_rms_norm.gamma, self.k_rms_norm.scale, phases)
+        if fk is None:
+            return None
+        wrap = lambda t, f: t.replace(f) if isinstance(t, VarLenTensor) else f
+        return wrap(q, fq), wrap(k, fk)
+
     def forward(self, x: SparseTensor, context: Optional[Union[VarLenTensor, torch.Tensor]] = None) -> SparseTensor:
         if self._type == "self":
             qkv = self._linear(self.to_qkv, x)
@@ -104,11 +123,15 @@ class SparseMultiHeadAttention(nn.Module):
             apart = None
             if self.qk_rms_norm or self.use_rope:
                 q, k, v = qkv.unbind(dim=-3)
-                if self.qk_rms_norm:
-                    q = self.q_rms_norm(q)
-                    k = self.k_rms_norm(k)
-                if self.use_rope:
-                    q, k = self.rope(q, k)
+                normed = self._fused_qk(q, k) if self.qk_rms_norm and fused.active(q.feats) else None
+                if normed is not None:
+                    q, k = normed
+                else:
+                    if self.qk_rms_norm:
+                        q = self.q_rms_norm(q)
+                        k = self.k_rms_norm(k)
+                    if self.use_rope:
+                        q, k = self.rope(q, k)
                 if self.attn_mode == "full" and config.ATTN == 'flash_attn':
                     # flash_attn's packed call only slices q, k and v back out of the stack and runs the kernel
                     # of the unpacked call with the same arguments, so the stack would be a copy for nothing.
@@ -137,9 +160,13 @@ class SparseMultiHeadAttention(nn.Module):
             kv = self._linear(self.to_kv, context)
             kv = self._fused_pre(kv, num_fused=2)
             if self.qk_rms_norm:
-                q = self.q_rms_norm(q)
                 k, v = kv.unbind(dim=-3)
-                k = self.k_rms_norm(k)
+                normed = self._fused_qk(q, k, rope=False) if fused.active(_feats(q)) else None
+                if normed is not None:
+                    q, k = normed
+                else:
+                    q = self.q_rms_norm(q)
+                    k = self.k_rms_norm(k)
                 h = sparse_scaled_dot_product_attention(q, k, v)
             else:
                 h = sparse_scaled_dot_product_attention(q, kv)
