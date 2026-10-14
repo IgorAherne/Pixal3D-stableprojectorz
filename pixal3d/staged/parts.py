@@ -101,6 +101,17 @@ HOOK_RAM_MIB_PER_MVOXEL = 310
 RAM_FLOOR_MIB = 1_500               # what must stay available to Windows and the hub beside the hook's own need
 
 
+# What a finish hook's GPU step may keep on the card between its steps (types.FinishSteps: state["room_mib"]): a
+# cuBVH of the decoded mesh, built for the remesh and needed again for the bake (60-70 bytes a face, 0.6-0.9 GB for
+# the meshes of a 1024 prop; cuBVH keeps a copy of its tree in RAM as well). The room is what the card has beside
+# what the props still to decode need under the finish cap, or beside what another prop's hook steps need with
+# nothing held (HOLD_BESIDE_MIB: the remesh, nvdiffrast, the texture volume and a BVH of their own), whichever is
+# more, less a slack; and never more than the RAM allows twice over beside the floor.
+HOLD_BESIDE_MIB = 3_000
+HOLD_SLACK_MIB = 512
+HOLD_RAM_FACTOR = 2
+
+
 def glb_reserve(faces: int) -> int:
     """MiB of native memory the caller's finish hook needs for a decoded mesh of `faces` faces (to_glb: the
     nvdiffrast context, one BVH at a time, cumesh). A starting figure: too small and the hook spills into
@@ -163,6 +174,29 @@ def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: in
     if available is not None and hook_ram_mib(voxels) > available - RAM_FLOOR_MIB:
         return "ram"
     return None
+
+
+def tail_room(ctx: PartContext, pending: list, held_mib: int) -> int:
+    """MiB a finish hook's GPU step may keep on the card when it returns, for a later step of the same prop
+    (runner: state["room_mib"]). `pending`: the props of the finish part still to be decoded; `held_mib`: what the
+    other props in their steps hold already. 0 when nothing may stay: a CPU run, a prop whose decode size is not
+    known, or no room."""
+    headroom = ctx.loader.headroom_mib() if hasattr(ctx.loader, "headroom_mib") else None
+    if headroom is None:
+        return 0
+    need = 0.0
+    for prop in pending:
+        try:
+            stored = ctx.store.get_small(prop.id, "coords_hr")
+        except Exception:
+            return 0
+        need = max(need, 1.1 * decode_mib(decode_voxels(stored), decoders=2))
+    room = (headroom - (NATIVE_RESERVE["finish"] + FINISH_SAFETY_MIB) - max(need, HOLD_BESIDE_MIB) - held_mib
+            - HOLD_SLACK_MIB)
+    available = ram_available_mib()
+    if available is not None:
+        room = min(room, (available - RAM_FLOOR_MIB - HOOK_RAM_BASE_MIB) // HOLD_RAM_FACTOR)
+    return max(0, int(room))
 
 
 def networks(part: str, kind: str) -> tuple[str, ...]:

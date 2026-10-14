@@ -12,7 +12,9 @@ and it owns everything around them:
 - cancel: checked before every prop (the parts check inside); everything unfinished is closed;
 - resume: a prop whose finished latents a killed run left in the work folder runs only its last part;
 - the finish steps a hook hands back (types.FinishSteps): their GPU steps run here between the other props'
-  turns, their CPU steps on one worker thread meanwhile;
+  turns, their CPU steps on one worker thread meanwhile; before each step the hook is told how much it may keep
+  on the card for its later steps (plan.tail_room: what the props still to be decoded leave), and what it holds
+  is let go when a decode runs out of memory;
 - the events the caller's progress is made of.
 
 One rule shapes the code: nothing is retried, closed or trimmed while an exception is being handled. A caught
@@ -25,6 +27,7 @@ Everything here runs on the GPU thread, except the CPU steps of a FinishSteps.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -191,6 +194,7 @@ class StagedRunner:
         self._returned: Any = None  # what the last part function returned
         self._tails: list[_Tail] = []
         self._worker: concurrent.futures.ThreadPoolExecutor | None = None
+        self._wave_now: list[PropState] = []
 
     def _modes(self) -> tuple[str, ...]:
         """The ladder: the cap is lifted only where the options allow a spill into shared memory."""
@@ -327,6 +331,7 @@ class StagedRunner:
 
     def _wave(self, index: int) -> None:
         ctx, wave = self.ctx, self.waves[index]
+        self._wave_now = wave
         for part in PARTS:
             alive = self._alive(part, wave)
             if not alive:
@@ -448,6 +453,8 @@ class StagedRunner:
         loader = self.ctx.loader
         loader.trim()
         self.ctx.store.pump(upload=False)       # the next prop's inputs went ahead; the retry needs the room
+        if failure[0] == "oom" and self._let_go():
+            loader.trim()
         if failure[0] == "error" and any(words in failure[1].lower() for words in BROKEN_CONTEXT):
             loader.clear_cap()                  # the probe asks whether the card works, not whether the cap fits
             if not probe(self.ctx.device):
@@ -541,6 +548,7 @@ class StagedRunner:
             self._step_event(tail)
         while tail.index < len(steps.steps):
             kind, fn = steps.steps[tail.index]
+            steps.state["room_mib"] = self._room(tail)
             if kind == "cpu":
                 if self._worker is None:
                     self._worker = concurrent.futures.ThreadPoolExecutor(max_workers=1,
@@ -578,6 +586,32 @@ class StagedRunner:
             if failure[0] != "oom" or mode == modes[-1]:
                 break
         return failure
+
+    def _room(self, tail: _Tail) -> int:
+        """MiB the next step of `tail` may keep on the card when it returns (plan.tail_room): bounded by the props
+        of the finish part that are still to be decoded, and by what the other tails hold."""
+        room = getattr(self.plan, "tail_room", None)
+        if room is None:
+            return 0
+        pending = [prop for prop in self._alive("finish", self._wave_now) if prop.part != "finish"]
+        held = sum(int(other.steps.state.get("card_mib") or 0) for other in self._tails if other is not tail)
+        try:
+            return int(room(self.ctx, pending, held))
+        except Exception:
+            return 0
+
+    def _let_go(self) -> bool:
+        """Every tail lets go of what it holds on the card (a decode ran out of memory). True when one did."""
+        gone = False
+        for tail in self._tails:
+            steps = tail.steps
+            if steps.release is None or not steps.state.get("card_mib"):
+                continue
+            with contextlib.suppress(Exception):
+                steps.release(steps.state)
+            steps.state.pop("card_mib", None)
+            gone = True
+        return gone
 
     def _result(self, tail: _Tail) -> tuple[str, str, str] | None:
         """The prop's result from its finished steps."""

@@ -83,6 +83,19 @@ bounds the RAM their meshes and textures hold. The hook's steps are reported as 
 `prop_done` comes when the last step is over, so a prop's turn on the card and its `prop_done` are no longer back
 to back.
 
+One thing a GPU step may leave on the card: what the engine has room for. Before every step the runner writes
+`state["room_mib"]`, the MiB the step may keep for a later step of the same prop (`parts.tail_room`: what the card
+has beside PyTorch's reserve, less the finish part's reserves, less what the props still to be decoded need under
+the cap at most - both decoders with the margin of `decoders_fit` - or what another prop's hook steps need with
+nothing held (`parts.HOLD_BESIDE_MIB`), whichever is more, less what the other props in their steps hold already
+and a slack; and no more than the RAM allows twice over beside the floor, for things that keep a copy in RAM). A
+step that keeps something writes the MiB it holds into `state["card_mib"]`; the step that uses it up removes the
+key. `FinishSteps.release(state)` lets go of the hold at once: the runner calls it on every tail when a decode
+runs out of memory, before the retry. Spellcast3D's GLB steps hold the cuBVH of the decoded mesh this way (built
+once for the remesh, needed again for the bake; 60-70 bytes a face, 0.6-0.9 GB for the meshes of a 1024 prop;
+a build takes 5-7 s on the CPU with Python's lock held), so a batch builds it once per prop where the card has
+room, and twice where it has not, as before.
+
 ### Events
 
 `on_event(Event)` is called on the GPU thread and must not block.

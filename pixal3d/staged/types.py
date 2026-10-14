@@ -135,15 +135,21 @@ class FinishSteps:
     A "gpu" step runs on the GPU thread under the memory cap, with `native_mib` left free outside PyTorch's
     allocator and `safety_mib` for everybody else; it may run twice after an out-of-memory (it must compute from
     its inputs and may overwrite its outputs), and it leaves nothing on the card when it returns, so that the next
-    prop's decode gets the whole card. A "cpu" step runs on the worker thread: it must not touch the card nor the
-    engine (no events, no store). `result(state)` runs on the GPU thread once every step is done and returns what
-    the prop's result carries. Exceptions fail the prop as the hook's own would; a cancel does not stop the steps
-    of a prop that has reached this point. At most runner.IN_FLIGHT props are in their steps at once."""
+    prop's decode gets the whole card - except what the engine lets it hold: before every step the runner writes
+    `state["room_mib"]`, the MiB a GPU step may keep on the card for a later step of the same prop (a BVH built
+    once for two uses), from what the props still to be decoded need; a step that keeps something writes the MiB
+    it holds into `state["card_mib"]`, and the step that frees it removes that key. `release(state)` lets go of
+    the hold at once; the runner calls it when a decode runs out of memory. A "cpu" step runs on the worker
+    thread: it must not touch the card nor the engine (no events, no store). `result(state)` runs on the GPU
+    thread once every step is done and returns what the prop's result carries. Exceptions fail the prop as the
+    hook's own would; a cancel does not stop the steps of a prop that has reached this point. At most
+    runner.IN_FLIGHT props are in their steps at once."""
     steps: list                     # [("gpu" | "cpu", Callable[[dict], None])]
     state: dict
     result: Callable[[dict], dict]
     native_mib: int = 0             # 0: the engine's own figure for a mesh of this size (parts.glb_reserve)
     safety_mib: int | None = None   # None: the engine's figure for the last part (parts.FINISH_SAFETY_MIB)
+    release: Callable[[dict], None] | None = None     # lets go of what the steps hold on the card (state["card_mib"])
 
 
 @dataclass

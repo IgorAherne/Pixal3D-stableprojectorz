@@ -234,6 +234,22 @@ class NetworkLoader:
     def capped(self) -> bool:
         return self._cap_mib is not None
 
+    def headroom_mib(self) -> int | None:
+        """MiB the card can still give this process, PyTorch's reserve counted in (the allocator reuses it before
+        it grows): what set_cap budgets before it takes the reserves off, the driver's figure where that is lower,
+        and under an emulated size what that size leaves beside what is allocated. None off the card."""
+        if self.device.type != "cuda":
+            return None
+        card = self._card()
+        free, _ = torch.cuda.mem_get_info(card)
+        seen = _driver_free(card)
+        if seen is not None:
+            free = min(free, seen)
+        room = (free + torch.cuda.memory_reserved(card)) // MIB
+        if self.max_vram_mib:
+            room = min(room, self.max_vram_mib - CONTEXT_MIB - torch.cuda.memory_allocated(card) // MIB)
+        return int(room)
+
     def loaded(self) -> list[str]:
         return list(self._modules)
 
