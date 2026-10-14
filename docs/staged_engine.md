@@ -135,6 +135,20 @@ where the card has no room the GPU thread builds it twice as before.
 | `tex` | texture flow | `cond_tex`, `coords_hr`, `shape_slat`, `rng_hr` | `tex_slat`, the checkpoint |
 | `finish` | shape decoder, texture decoder | `coords_hr`, `shape_slat`, `tex_slat`, `notes` | the prop's file, through the hook |
 
+The two last parts go prop by prop (`EngineOptions.paired_finish`, on by default): a prop is decoded and handed
+to its finish as soon as its texture is sampled, instead of after every prop's texture. The CPU work of its finish
+steps (the BVH, the UV unwrap, the file) then runs on the worker threads while the next prop's texture is sampled -
+a minute and more at 1536 - rather than only while the next prop is decoded, and only the last prop's steps are left
+with nothing to hide under. The texture network leaves the card before each decode (the decode needs the room,
+and the cap `finish` sets counts what is allocated as room) and is read again for the next prop, from the file
+cache in most cases (its file is read ahead again meanwhile); what the store sent ahead for the next prop's
+texture goes back to its slot for the decode. Props resumed from a checkpoint, which run `finish` alone, go
+first in their kind. The events are those of the two parts with overlapping brackets: `tex` opens before its
+first prop, `finish` before its first prop, `tex` closes after its last prop, `finish` after the last prop's steps
+are over. A process that dies in a prop's finish leaves that prop's checkpoint alone: the props after it have not
+sampled their texture yet. With `paired_finish=False` every prop's texture is sampled, then every prop is finished,
+as the other parts go.
+
 The flow networks exist once per kind (`<name>.sv` from `pipeline.json`, `<name>.mv` from `pipeline_mv.json`);
 inside every part the multi-view props go first, then the networks are exchanged and the single-view props follow.
 The decoders, DINOv3, NAF and background removal serve both kinds.

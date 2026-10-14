@@ -171,3 +171,9 @@ class EngineOptions:
     spill: bool = False                             # True: a prop-part that does not fit under the cap after the
     #                                                 tight retry runs once more with the cap lifted and may spill
     #                                                 into shared memory (slow). False: it fails with kind "oom"
+    paired_finish: bool = True                      # True: each prop is decoded and handed to its finish steps
+    #                                                 right after its texture is sampled (the texture network
+    #                                                 leaves the card for the decode and is read again for the
+    #                                                 next prop), so the steps' CPU work runs while the next prop's
+    #                                                 texture is sampled. False: every prop's texture, then every
+    #                                                 prop's finish, as the other parts go

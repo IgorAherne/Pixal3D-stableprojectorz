@@ -1,9 +1,9 @@
 {
-  "wheel": "cumesh-0.0.1+cu128torch2.8-cp311-cp311-win_amd64.whl",
-  "sha256": "4b7150ffbd355473ba518843fe6518c4cb222809698c66c9d8b5e181cba2122b",
-  "size_bytes": 13421947,
-  "built": "2026-10-14T13:08:03+00:00",
-  "build_seconds": 510,
+  "wheel": "cumesh-0.0.1.post1+cu128torch2.8-cp311-cp311-win_amd64.whl",
+  "sha256": "6b7bbd502a9f7a2a769d94c1df850daddeb209967872d885542eb461b824b5f5",
+  "size_bytes": 13424681,
+  "built": "2026-10-14T22:56:47+00:00",
+  "build_seconds": 607,
   "sources": {
     "cumesh": {
       "repo": "https://github.com/JeffreyXiang/CuMesh.git",
@@ -28,7 +28,7 @@
   "patches": {
     "script": "code/release/wheels/cumesh/patch_cumesh_win.py",
     "applied_to": "clean `git archive` exports of the pinned commits (the clones stay untouched)",
-    "why": "MSVC 2022 + CUDA 12.8 build (ssize_t, compiler flags, no torch pin), Pixal3D's memory edits of remeshing.py (the wheel the fork shipped: chunked BVH queries and frees, value-neutral) and cuBVH's build without Python's lock (create_cuBVH: py::call_guard<py::gil_scoped_release>)",
+    "why": "MSVC 2022 + CUDA 12.8 build (ssize_t, compiler flags, no torch pin), Pixal3D's memory edits of remeshing.py (the wheel the fork shipped: chunked BVH queries and frees, value-neutral), cuBVH's build without Python's lock (create_cuBVH: py::call_guard<py::gil_scoped_release>), cuBVH's card copy on demand (create_cuBVH(..., upload=False) builds on the CPU only; upload(), release_device(), on_device; the queries upload first; the tree's construction unchanged) and get_manifold_boundary_adjacency's leak of 4 bytes per vertex mended (a cudaFree)",
     "hunks": [
       {
         "id": "pyproject-no-torch-pin",
@@ -65,6 +65,62 @@
       {
         "id": "cubvh-build-without-the-gil",
         "file": "third_party/cubvh/src/bindings.cpp"
+      },
+      {
+        "id": "cubvh-tree-upload-release",
+        "file": "third_party/cubvh/include/gpu/bvh.cuh"
+      },
+      {
+        "id": "cubvh-tree-build-without-upload",
+        "file": "third_party/cubvh/src/bvh.cu"
+      },
+      {
+        "id": "cubvh-api-upload-release",
+        "file": "third_party/cubvh/include/gpu/api_gpu.h"
+      },
+      {
+        "id": "cubvh-impl-mutex-include",
+        "file": "third_party/cubvh/src/api_gpu.cu"
+      },
+      {
+        "id": "cubvh-impl-upload-flag",
+        "file": "third_party/cubvh/src/api_gpu.cu"
+      },
+      {
+        "id": "cubvh-impl-build-without-upload",
+        "file": "third_party/cubvh/src/api_gpu.cu"
+      },
+      {
+        "id": "cubvh-impl-upload-release",
+        "file": "third_party/cubvh/src/api_gpu.cu"
+      },
+      {
+        "id": "cubvh-impl-lazy-upload",
+        "file": "third_party/cubvh/src/api_gpu.cu"
+      },
+      {
+        "id": "cubvh-impl-state-and-factory",
+        "file": "third_party/cubvh/src/api_gpu.cu"
+      },
+      {
+        "id": "cubvh-bindings-upload-release",
+        "file": "third_party/cubvh/src/bindings.cpp"
+      },
+      {
+        "id": "cubvh-bindings-create-upload-arg",
+        "file": "third_party/cubvh/src/bindings.cpp"
+      },
+      {
+        "id": "connectivity-free-manifold-vert-idx",
+        "file": "src/connectivity.cu"
+      },
+      {
+        "id": "bvh-py-upload-arg",
+        "file": "cumesh/bvh.py"
+      },
+      {
+        "id": "bvh-py-upload-release",
+        "file": "cumesh/bvh.py"
       },
       {
         "id": "msvc-compat-header",
@@ -205,7 +261,7 @@
   },
   "wheel_files": 13,
   "wheel_license_files": [
-    "cumesh-0.0.1+cu128torch2.8.dist-info/licenses/LICENSE"
+    "cumesh-0.0.1.post1+cu128torch2.8.dist-info/licenses/LICENSE"
   ],
-  "build_log": "release\\cache\\wheels\\logs\\cumesh-build.log"
+  "build_log": "C:\\Users\\Igor\\AppData\\Local\\Temp\\claude\\C---myDrive-repos-spellcast3d\\38f8a3fe-7839-49b9-b425-e32eaee948b1\\scratchpad\\logs-post1\\cumesh-build.log"
 }

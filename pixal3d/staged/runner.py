@@ -339,10 +339,24 @@ class StagedRunner:
                 if not prop.over and self.plan.applies(part, prop) and (part == "finish" or not prop.resumed)
                 and (kind is None or prop.kind == kind)]
 
+    def _paired(self) -> tuple[str, str] | None:
+        """The two last parts when each prop goes through them back to back (EngineOptions.paired_finish): the
+        texture and the finish. None: every part for all the props, in turn."""
+        if not getattr(self.ctx.options, "paired_finish", True) or PARTS[-2:] != ("tex", "finish"):
+            return None
+        return "tex", "finish"
+
     def _wave(self, index: int) -> None:
         ctx, wave = self.ctx, self.waves[index]
         self._wave_now = wave
+        paired = self._paired()
         for part in PARTS:
+            if paired and part == paired[1]:
+                continue                            # ran with its mate
+            if paired and part == paired[0]:
+                if self._alive(part, wave) or self._alive(paired[1], wave):
+                    self._pair(index, *paired)
+                continue
             alive = self._alive(part, wave)
             if not alive:
                 continue
@@ -359,6 +373,102 @@ class StagedRunner:
                 self._pump_tails(until=lambda: not self._tails)
             ctx.store.flush()
             ctx.emit(Event("part_end", part))
+
+    def _pair(self, index: int, first: str, last: str) -> None:
+        """The parts `first` and `last` (the texture and the finish) for the wave, each prop through both back
+        to back: a prop is decoded and handed to its finish steps as soon as its texture is sampled, instead of
+        after every prop's texture. Its steps' CPU work (the BVH, the UV unwrap, the file) then runs on the worker
+        threads while the next prop's texture is sampled - a minute and more, against the seconds of the next
+        prop's decode it overlapped with before - and only the last prop's steps are left with nothing to hide
+        under. The card pays the texture network's turn-round: it leaves the card before each decode (the decode
+        needs the room, and the cap `finish` sets takes what is allocated for room) and is read again for the next
+        prop, from the file cache in most cases. What the store sent ahead for the next prop's texture goes back
+        to its slot meanwhile, so the decode has the whole card. The events are those of the two parts, their
+        brackets overlapping: `first` opens before its first prop, `last` before its first prop, `first` closes
+        after its last prop, `last` after the last prop's steps are over. Props that run `last` alone (resumed
+        from a checkpoint) come before the pairs of their kind: they are nearly done, and their steps' CPU work
+        hides under the textures that follow. A process that dies in a prop's finish leaves the checkpoint of
+        that prop alone: the props after it have not sampled their texture yet."""
+        ctx, store, wave = self.ctx, self.ctx.store, self._wave_now
+        firsts, lasts = self._alive(first, wave), self._alive(last, wave)
+        waves = {"wave": index + 1, "waves": len(self.waves)}
+        ctx.emit(Event("part_start", first, detail={"props": [prop.id for prop in firsts], **waves}))
+        opened = False
+        done_first = done_last = 0
+
+        def run_last(prop: PropState) -> None:
+            nonlocal opened, done_last
+            if not opened:
+                opened = True
+                ctx.emit(Event("part_start", last, detail={"props": [prop.id for prop in lasts], **waves}))
+            done_last += 1
+            ctx.part = last
+            self._prop_part(last, prop, done_last, len(lasts))
+
+        for kind in KINDS:
+            group = [prop for prop in firsts if prop.kind == kind]
+            alone = [prop for prop in lasts if prop.kind == kind and prop not in group]
+            if not group and not alone:
+                continue
+            for prop in alone:
+                ctx.check()
+                store.pump()
+                if self._tails:
+                    self._pump_tails(until=lambda: len(self._tails) < IN_FLIGHT)
+                run_last(prop)
+            if not group:
+                continue
+            failure = self._enter(first, kind)
+            if failure is not None:
+                if kind == "mv" and failure[0] == "missing_file" and ctx.entering.endswith(".mv"):
+                    failure = ("mv_missing", failure[1], failure[2])
+                for prop in group:
+                    self._fail(prop, first, failure)
+                continue
+            self._read_ahead(index, first, kind)
+            self._want(first, group[0])
+            for position, prop in enumerate(group):
+                ctx.check()
+                if position + 1 < len(group):
+                    self._want(first, group[position + 1])
+                store.pump()
+                if self._tails:
+                    self._pump_tails(until=lambda: len(self._tails) < IN_FLIGHT)
+                ctx.part = first
+                self._prop_part(first, prop, done_first + position + 1, len(firsts))
+                if prop.over:
+                    continue
+                self._set_aside(first, kind, more=position + 1 < len(group))
+                if not position + 1 < len(group):
+                    self._read_ahead(index, first, kind)
+                run_last(prop)
+            done_first += len(group)
+            later = self._later(index, last, kind)
+            ctx.keep = frozenset(later[0]) if later else frozenset()
+            self.plan.leave(ctx, first, kind)
+            self.plan.leave(ctx, last, kind)
+        store.flush()
+        ctx.emit(Event("part_end", first))
+        if not opened:                              # no prop reached its finish: the bracket still closes below
+            opened = True
+            ctx.emit(Event("part_start", last, detail={"props": [prop.id for prop in lasts], **waves}))
+        if self._tails:
+            self._pump_tails(until=lambda: not self._tails)
+        store.flush()
+        ctx.emit(Event("part_end", last))
+
+    def _set_aside(self, part: str, kind: str, more: bool) -> None:
+        """Before a prop's finish in a pair: the part's networks leave the card (with `more` props of the group to
+        come, its file is read ahead again meanwhile), and what the store uploaded ahead for the next prop goes
+        back to its slot, so the decode has the whole card."""
+        loader = self.ctx.loader
+        held = [name for name in self.plan.networks(part, kind) if loader.get(name) is not None]
+        if held:
+            loader.drop(*held)
+            if more and held[0] not in self.plan.LIGHT:
+                self._ahead = held[0]
+                loader.prefetch(held[0])
+        self.ctx.store.pump(upload=False)
 
     def _later(self, index: int, part: str, kind: str) -> list[tuple[str, ...]]:
         """The networks of every group that runs after (part, kind) of wave `index`, group by group: the rest of
