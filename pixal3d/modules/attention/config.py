@@ -2,12 +2,14 @@ from typing import *
 
 BACKEND = 'flash_attn' 
 DEBUG = False
+SAGE = False        # PIXAL3D_SAGE: the dense full self-attention through SageAttention (modules/sage.py)
 
 def __from_env():
     import os
     
     global BACKEND
     global DEBUG
+    global SAGE
     
     env_attn_backend = os.environ.get('ATTN_BACKEND')
     env_attn_debug = os.environ.get('ATTN_DEBUG')
@@ -17,7 +19,11 @@ def __from_env():
     if env_attn_debug is not None:
         DEBUG = env_attn_debug == '1'
 
-    print(f"[ATTENTION] Using backend: {BACKEND}")
+    from .. import sage
+    SAGE = sage.from_env()
+
+    print(f"[ATTENTION] Using backend: {BACKEND}"
+          + ("; full self-attention: SageAttention (PIXAL3D_SAGE)" if SAGE else ""))
         
 
 __from_env()
@@ -30,3 +36,7 @@ def set_backend(backend: Literal['xformers', 'flash_attn', 'flash_attn_3', 'flas
 def set_debug(debug: bool):
     global DEBUG
     DEBUG = debug
+
+def set_sage(on: bool):
+    global SAGE
+    SAGE = bool(on)

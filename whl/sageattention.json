@@ -1,0 +1,25 @@
+{
+  "wheel": "sageattention-2.2.0+cu128torch2.8.0.post3-cp39-abi3-win_amd64.whl",
+  "sha256": "7dabcd00e63229b28f046c5a69ec37cf4756afb375dbadd1975dadec045ae21c",
+  "size_bytes": 11964789,
+  "origin": {
+    "release": "https://github.com/woct0rdho/SageAttention/releases (the build for torch 2.8.0 + cu128; post4-post6 need torch >= 2.9)",
+    "upstream": "https://github.com/thu-ml/SageAttention",
+    "license": "Apache-2.0 (LICENSE inside the wheel)",
+    "downloaded": "2026-10-15, sha256 equal to the release asset's digest"
+  },
+  "what_for": "The flows' full self-attention (one sequence, 12 heads x 128, bf16) through int8 Q.K^T and fp16 P.V kernels: pixal3d/modules/sage.py, switch PIXAL3D_SAGE (on by default after a first-use self-check; off = flash_attn, bit for bit as before). Measured on an RTX 3060: an hr / tex pass at 1536 -26 %, a five-prop batch -20 %, the allocated memory peak of a pass unchanged.",
+  "cuobjdump": {
+    "_qattn_sm80.pyd": {"sass_sm": [80], "ptx_compute": [], "note": "runs on every sm_8x card (RTX 30xx / 40xx, A100): the kernel the fork uses there"},
+    "_qattn_sm89.pyd": {"sass_sm": [89, 120], "ptx_compute": [], "note": "fp8 kernels, not used by the fork"},
+    "_qattn_sm90.pyd": {"sass_sm": [90], "ptx_compute": [], "note": "not used by the fork: sm_90+ runs the package's Triton kernel"},
+    "_fused.pyd": {"sass_sm": [80, 89, 90, 120], "ptx_compute": []}
+  },
+  "declared_dependencies": "none in the wheel's METADATA (needs torch 2.8.x+cu128 and, for sm_90+, triton-windows, both installed in Pixal3D's venv)",
+  "runtime_requirements": {
+    "install": "pip install <this wheel>  (Pixal3D's install.py installs every wheel in its whl folder)",
+    "cards": "sm_80 and newer; below that pixal3d/modules/sage.py refuses it and the flows keep their attention backend"
+  },
+  "known_issue_of_this_build": "post6 upstream fixed stale shared memory for key rows past the sequence end; in this build it only matters for sequences of 64 keys or fewer, which the fork never hands to it (sage.MIN_TOKENS 65)",
+  "measurements": "code/logs/profiling/pixal3d-lowmem/round-g/sage/REPORT.md and round-g/sage-full, sage-7g (Spellcast3D hub, git-ignored); scripts in code/devtools/pixal3d-lowmem/round-g/sage/"
+}

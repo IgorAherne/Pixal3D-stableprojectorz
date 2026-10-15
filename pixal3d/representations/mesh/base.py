@@ -33,11 +33,16 @@ class Mesh:
         return self.to('cpu')
     
     def fill_holes(self, max_hole_perimeter=3e-2):
-        vertices = self.vertices.clone().cuda().contiguous()
-        faces = self.faces.clone().cuda().contiguous()
+        # Spellcast3D: no clones. CuMesh.init copies the rows into cumesh's own buffers and never writes the tensors
+        # it is given, so the clones only kept a second copy of the mesh on the card (18 bytes a face) through the
+        # whole hole filling, its widest moment at 1536. .cuda().contiguous() is the mesh's own tensors when they are
+        # on the card and contiguous already (the decoders' meshes are), a copy otherwise, as before.
+        vertices = self.vertices.cuda().contiguous()
+        faces = self.faces.cuda().contiguous()
         
         mesh = cumesh.CuMesh()
         mesh.init(vertices, faces)
+        del vertices, faces
         mesh.get_edges()
         mesh.get_boundary_info()
         if mesh.num_boundaries == 0:

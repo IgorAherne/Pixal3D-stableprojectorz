@@ -1,9 +1,9 @@
 {
-  "wheel": "cumesh-0.0.1.post1+cu128torch2.8-cp311-cp311-win_amd64.whl",
-  "sha256": "6b7bbd502a9f7a2a769d94c1df850daddeb209967872d885542eb461b824b5f5",
-  "size_bytes": 13424681,
-  "built": "2026-10-14T22:56:47+00:00",
-  "build_seconds": 607,
+  "wheel": "cumesh-0.0.1.post2+cu128torch2.8-cp311-cp311-win_amd64.whl",
+  "sha256": "8603ecabbfba07e16da93bc53b1de497364f8fdbb8ad68086c711108d191962b",
+  "size_bytes": 13721787,
+  "built": "2026-10-15T16:49:14+00:00",
+  "build_seconds": 500,
   "sources": {
     "cumesh": {
       "repo": "https://github.com/JeffreyXiang/CuMesh.git",
@@ -28,7 +28,7 @@
   "patches": {
     "script": "code/release/wheels/cumesh/patch_cumesh_win.py",
     "applied_to": "clean `git archive` exports of the pinned commits (the clones stay untouched)",
-    "why": "MSVC 2022 + CUDA 12.8 build (ssize_t, compiler flags, no torch pin), Pixal3D's memory edits of remeshing.py (the wheel the fork shipped: chunked BVH queries and frees, value-neutral), cuBVH's build without Python's lock (create_cuBVH: py::call_guard<py::gil_scoped_release>), cuBVH's card copy on demand (create_cuBVH(..., upload=False) builds on the CPU only; upload(), release_device(), on_device; the queries upload first; the tree's construction unchanged) and get_manifold_boundary_adjacency's leak of 4 bytes per vertex mended (a cudaFree)",
+    "why": "MSVC 2022 + CUDA 12.8 build (ssize_t, compiler flags, no torch pin), Pixal3D's memory edits of remeshing.py (the wheel the fork shipped: chunked BVH queries and frees, value-neutral), cuBVH's build without Python's lock (create_cuBVH: py::call_guard<py::gil_scoped_release>), cuBVH's card copy on demand (create_cuBVH(..., upload=False) builds on the CPU only; upload(), release_device(), on_device; the queries upload first; the tree's construction unchanged), get_manifold_boundary_adjacency's leak of 4 bytes per vertex mended (a cudaFree), and fill_holes' chain in less card memory with the same tables bit for bit (get_edges: a DoubleBuffer sort, outputs of their exact length, its scratch freed; get_boundary_info and get_manifold_boundary_adjacency: counting iterators and exact outputs; fill_holes: the tables it no longer reads freed before the mesh buffers are extended)",
     "hunks": [
       {
         "id": "pyproject-no-torch-pin",
@@ -121,6 +121,22 @@
       {
         "id": "bvh-py-upload-release",
         "file": "cumesh/bvh.py"
+      },
+      {
+        "id": "connectivity-get-edges-lean",
+        "file": "src/connectivity.cu"
+      },
+      {
+        "id": "connectivity-boundaries-exact",
+        "file": "src/connectivity.cu"
+      },
+      {
+        "id": "connectivity-manifold-boundary-verts-exact",
+        "file": "src/connectivity.cu"
+      },
+      {
+        "id": "clean-up-fill-holes-free-tables-first",
+        "file": "src/clean_up.cu"
       },
       {
         "id": "msvc-compat-header",
@@ -261,7 +277,7 @@
   },
   "wheel_files": 13,
   "wheel_license_files": [
-    "cumesh-0.0.1.post1+cu128torch2.8.dist-info/licenses/LICENSE"
+    "cumesh-0.0.1.post2+cu128torch2.8.dist-info/licenses/LICENSE"
   ],
-  "build_log": "C:\\Users\\Igor\\AppData\\Local\\Temp\\claude\\C---myDrive-repos-spellcast3d\\38f8a3fe-7839-49b9-b425-e32eaee948b1\\scratchpad\\logs-post1\\cumesh-build.log"
+  "build_log": "release\\cache\\wheels\\logs-post2\\cumesh-build.log"
 }

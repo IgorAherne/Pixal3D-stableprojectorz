@@ -41,7 +41,12 @@ MODES = ("normal", "tight", "uncapped")
 KINDS = ("mv", "sv")                # the order inside every part: multi-view props first
 IN_FLIGHT = 3                       # props that may be in their finish steps while another prop is decoded: each
 #                                     holds its decoded mesh and its textures in RAM meanwhile (and the tree of its
-#                                     BVH, when the engine gave it room: cuBVH keeps a copy in RAM)
+#                                     BVH, when the engine gave it room: cuBVH keeps a copy in RAM). A prop in its
+#                                     last step (the hub's export) no longer counts (_in_flight); a fresh prop's
+#                                     first CPU step (the hub's BVH build) is handed over after the boundary's GPU
+#                                     steps while props remain to decode (_fresh_tails), so two trees are in RAM
+#                                     at that moment rather than three; the pair's props go biggest first
+#                                     (plan.pair_order), so the last tail, which nothing hides, is the smallest
 WORKERS = 2                         # threads for the CPU steps: one prop's export no longer waits behind another's
 #                                     BVH build or unwrap (measured on a tight card: exports of 3 s queued for 23 s
 #                                     behind one thread). The steps' libraries (cuBVH's build, xatlas, OpenCV) let
@@ -406,7 +411,7 @@ class StagedRunner:
             self._prop_part(last, prop, done_last, len(lasts))
 
         for kind in KINDS:
-            group = [prop for prop in firsts if prop.kind == kind]
+            group = self._pair_order([prop for prop in firsts if prop.kind == kind])
             alone = [prop for prop in lasts if prop.kind == kind and prop not in group]
             if not group and not alone:
                 continue
@@ -414,7 +419,7 @@ class StagedRunner:
                 ctx.check()
                 store.pump()
                 if self._tails:
-                    self._pump_tails(until=lambda: len(self._tails) < IN_FLIGHT)
+                    self._pump_tails(until=lambda: self._in_flight() < IN_FLIGHT)
                 run_last(prop)
             if not group:
                 continue
@@ -433,7 +438,7 @@ class StagedRunner:
                     self._want(first, group[position + 1])
                 store.pump()
                 if self._tails:
-                    self._pump_tails(until=lambda: len(self._tails) < IN_FLIGHT)
+                    self._pump_tails(until=lambda: self._in_flight() < IN_FLIGHT)
                 ctx.part = first
                 self._prop_part(first, prop, done_first + position + 1, len(firsts))
                 if prop.over:
@@ -456,6 +461,20 @@ class StagedRunner:
             self._pump_tails(until=lambda: not self._tails)
         store.flush()
         ctx.emit(Event("part_end", last))
+
+    def _pair_order(self, group: list[PropState]) -> list[PropState]:
+        """The order the props of a group go through the pair: the plan's (`plan.pair_order`: the biggest shape
+        first, so that the steps left with nothing to hide under - the last prop's - are the smallest prop's),
+        or the batch's own where the plan has none. The numbers of a prop do not depend on its place: every
+        part draws from the generator state its own prop stored."""
+        order = getattr(self.plan, "pair_order", None)
+        if order is None or len(group) < 2:
+            return group
+        try:
+            ordered = list(order(self.ctx, group))
+        except Exception:
+            return group
+        return ordered if sorted(map(id, ordered)) == sorted(map(id, group)) else group
 
     def _set_aside(self, part: str, kind: str, more: bool) -> None:
         """Before a prop's finish in a pair: the part's networks leave the card (with `more` props of the group to
@@ -505,7 +524,7 @@ class StagedRunner:
             if self._tails:
                 # Steps of the props finished before: their GPU steps now, while this prop's inputs are still on
                 # their way, and no more than IN_FLIGHT of them in RAM beside this prop's decode.
-                self._pump_tails(until=lambda: len(self._tails) < IN_FLIGHT)
+                self._pump_tails(until=lambda: self._in_flight() < IN_FLIGHT)
             self._prop_part(part, prop, done + position + 1, count)
         later = self._later(index, part, kind)
         ctx.keep = frozenset(later[0]) if later else frozenset()
@@ -643,16 +662,40 @@ class StagedRunner:
         runs, so no worker waits for a GPU step of another prop. Then, while `until()` is false, wait for
         the CPU steps and go on; `until` is true at once for a look that does not wait."""
         while True:
+            fresh = self._fresh_tails()
             for tail in list(self._tails):
-                self._advance(tail, gpu=False)
+                if tail not in fresh:
+                    self._advance(tail, gpu=False)
             for tail in list(self._tails):
-                self._advance(tail, gpu=True)
+                if tail not in fresh:
+                    self._advance(tail, gpu=True)
+            for tail in fresh:
+                if tail in self._tails:
+                    self._advance(tail, gpu=False)
             if until() or not self._tails:
                 return
             running = [tail.future for tail in self._tails if tail.future is not None]
             if not running:
                 return                              # nothing is under way: `until` cannot come true by waiting
             concurrent.futures.wait(running, timeout=STEP_WAIT, return_when=concurrent.futures.FIRST_COMPLETED)
+
+    def _fresh_tails(self) -> list[_Tail]:
+        """The tails that have run no step yet and begin with a CPU step, while props of the finish part are
+        still to be decoded. Their first step is handed to the worker after this pump's GPU steps, not before
+        them: what it makes (the hub's cuBVH tree of the freshly decoded mesh, a gigabyte in RAM for a 1536
+        prop) is needed one texture later, while the GPU steps that run now let go of an older prop's; so two
+        trees are in RAM at that moment, not three. The last prop's tail has nothing to wait for and is not
+        deferred; nor is any tail whose first step takes the card."""
+        if not any(prop.part != "finish" for prop in self._alive("finish", self._wave_now)):
+            return []
+        return [tail for tail in self._tails
+                if tail.index == 0 and tail.future is None and tail.steps.steps
+                and tail.steps.steps[0][0] == "cpu"]
+
+    def _in_flight(self) -> int:
+        """The tails whose steps still hold their prop's mesh and textures in RAM: every tail but those in their
+        last step (the hub's export, which holds little beside the file it writes)."""
+        return sum(1 for tail in self._tails if tail.index < len(tail.steps.steps) - 1)
 
     def _advance(self, tail: _Tail, gpu: bool = True) -> None:
         """Collect the tail's CPU step when it is over, hand its next CPU step to the worker, and with `gpu` run

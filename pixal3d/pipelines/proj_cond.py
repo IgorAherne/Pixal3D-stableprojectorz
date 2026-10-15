@@ -278,10 +278,12 @@ def cond_tokens_pair(spec_a: Spec, spec_b: Spec, z: torch.Tensor, image: torch.T
     # The views as tokens_to_features / view_tokens_to_features hand each one to project_view.
     if camera.transform_matrix is None:
         proj_grid = proj_grid_for(ProjGrid, grid, spec_a.image_size, device)
-        views = [(z_patch, camera.camera_angle_x, camera.distance, torch.tensor([camera.mesh_scale], device=device),
-                  None, image)]
+        mesh_scale = torch.tensor([camera.mesh_scale], device=device)
         count = 1
         z_global = z_global_all
+
+        def view(v: int) -> tuple:
+            return z_patch, camera.camera_angle_x, camera.distance, mesh_scale, None, image
     else:
         proj_grid = proj_grid_for(ProjGridMV, grid, spec_a.image_size, device)
         matrix = camera.transform_matrix
@@ -292,23 +294,34 @@ def cond_tokens_pair(spec_a: Spec, spec_b: Spec, z: torch.Tensor, image: torch.T
         mesh_scale = torch.as_tensor(camera.mesh_scale, dtype=torch.float32, device=device).reshape(-1)
         scale_flat = mesh_scale[:, None].expand(batch, count).reshape(batch * count)
         calc_flat = calc_mat.reshape(batch * count, 4, 4)
-        views = []
-        for v in range(count):
+
+        def view(v: int) -> tuple:
+            """One view's tokens, camera and picture, gathered when its turn comes (not all views beforehand)."""
             idx = torch.arange(v, batch * count, count, device=device)
-            views.append((z_patch[idx], angle_flat[idx], distance_flat[idx], scale_flat[idx], calc_flat[idx],
-                          image[idx]))
+            return z_patch[idx], angle_flat[idx], distance_flat[idx], scale_flat[idx], calc_flat[idx], image[idx]
+
         z_global = z_global_all.reshape(batch, count, z_global_all.shape[-2], z_global_all.shape[-1]).mean(dim=1)
+    # The views' sums. The first view's conditionings are written into them, every later view is added in place
+    # as it is made - its DINOv3 half at once, its NAF half a slice of channels at a time (naf_sampled(add=True))
+    # - the additions view_tokens_to_features makes with `acc.add_(z_view)`, element by element in the same order,
+    # without a copy of the view: what is on the card at a view's widest moment is the two sums.
     acc_a = acc_b = None
-    for z_patch_v, angle_v, distance_v, scale_v, matrix_v, image_v in views:
+    for v in range(count):
+        z_patch_v, angle_v, distance_v, scale_v, matrix_v, image_v = view(v)
         for target in targets:
             if naf_sliced.guide_input(image_v, target) is not image_v:
                 raise ValueError(f"NAF would bring the picture down for a target of {target}: no shared guide")
         lr = proj_grid(z_patch_v, angle_v, distance_v, scale_v, matrix_v, point_index=point_index)   # [B, K, D]
         width = lr.shape[-1]
-        z_a = lr.new_empty(*lr.shape[:-1], 2 * width)
-        z_a[..., :width] = lr
-        z_b = lr.new_empty(*lr.shape[:-1], 2 * width)
-        z_b[..., :width] = lr
+        first = acc_a is None
+        if first:
+            acc_a = lr.new_empty(*lr.shape[:-1], 2 * width)
+            acc_a[..., :width] = lr
+            acc_b = lr.new_empty(*lr.shape[:-1], 2 * width)
+            acc_b[..., :width] = lr
+        else:
+            acc_a[..., :width] += lr
+            acc_b[..., :width] += lr
         del lr
         lr_features = z_patch_v.permute(0, 3, 1, 2)                 # [B, D, h, w]
 
@@ -317,10 +330,11 @@ def cond_tokens_pair(spec_a: Spec, spec_b: Spec, z: torch.Tensor, image: torch.T
 
         raw = naf_sliced.guide_map(naf, image_v)
         guide = torch.nn.functional.adaptive_avg_pool2d(raw, targets[0])
-        naf_sliced.naf_sampled(naf, image_v, lr_features, targets[0], sample, out=z_a[..., width:], guide=guide)
+        naf_sliced.naf_sampled(naf, image_v, lr_features, targets[0], sample, out=acc_a[..., width:], guide=guide,
+                               add=not first)
         del guide
         if first_dtype is not None and count == 1:
-            z_a = z_a.type(first_dtype)
+            acc_a = acc_a.type(first_dtype)
         if tuple(raw.shape[-2:]) == targets[1]:
             guide = raw
         else:
@@ -328,14 +342,9 @@ def cond_tokens_pair(spec_a: Spec, spec_b: Spec, z: torch.Tensor, image: torch.T
         del raw
         if device.type == "cuda":
             torch.cuda.empty_cache()    # the first pass's blocks, before the widest moment
-        naf_sliced.naf_sampled(naf, image_v, lr_features, targets[1], sample, out=z_b[..., width:], guide=guide)
-        del guide
-        if acc_a is None:
-            acc_a, acc_b = z_a.contiguous(), z_b.contiguous()
-        else:
-            acc_a.add_(z_a)
-            acc_b.add_(z_b)
-        del z_a, z_b
+        naf_sliced.naf_sampled(naf, image_v, lr_features, targets[1], sample, out=acc_b[..., width:], guide=guide,
+                               add=not first)
+        del guide, z_patch_v, image_v, lr_features
     if count > 1:
         acc_a.div_(count)
         acc_b.div_(count)

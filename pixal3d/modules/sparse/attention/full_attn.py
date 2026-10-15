@@ -2,6 +2,7 @@ from typing import *
 import torch
 from .. import VarLenTensor, SparseTensor
 from .. import config
+from ... import sage
 
 
 __all__ = [
@@ -109,6 +110,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
     assert num_all_args in arg_names_dict, f"Invalid number of arguments, got {num_all_args}, expected 1, 2, or 3"
     for key in arg_names_dict[num_all_args][len(args):]:
         assert key in kwargs, f"Missing argument {key}"
+    one_self = False     # the full self-attention of one sequence: SageAttention may take it (modules/sage.py)
 
     if num_all_args == 1:
         qkv = args[0] if len(args) > 0 else kwargs['qkv']
@@ -181,6 +183,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             assert len(k.shape) == 3, f"Invalid shape for k, got {k.shape}, expected [N, *, H, Ci]"
             assert len(v.shape) == 3, f"Invalid shape for v, got {v.shape}, expected [N, *, H, Co]"
             kv_seqlen = [k.layout[i].stop - k.layout[i].start for i in range(k.shape[0])]
+            one_self = s is not None and len(q_seqlen) == 1 and q_seqlen == kv_seqlen
             k = k.feats     # [T_KV, H, Ci]
             v = v.feats     # [T_KV, H, Co]
         else:
@@ -191,7 +194,9 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             k = k.reshape(N * L, H, CI)     # [T_KV, H, Ci]
             v = v.reshape(N * L, H, CO)     # [T_KV, H, Co]
 
-    if config.ATTN == 'xformers':
+    if one_self and config.SAGE and sage.usable(q, k, v):
+        out = sage.attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0))[0]
+    elif config.ATTN == 'xformers':
         if 'xops' not in globals():
             import xformers.ops as xops
         if num_all_args == 1:

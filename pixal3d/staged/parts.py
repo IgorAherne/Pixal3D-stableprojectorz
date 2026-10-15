@@ -111,10 +111,13 @@ CHUNK_ABOVE_MIB = 3_000
 CHUNK_VOXELS = 2_000_000
 CHUNKED_MIB_PER_KVOXEL = 0.17
 CHUNK_MIB_PER_KVOXEL = 0.30
-# Closing the mesh's holes (cumesh: native memory, outside PyTorch's cap but on the card): about 144 bytes a face
-# (its edge tables and the copies of the mesh it takes), 2.0-2.2 faces a voxel, beside the mesh itself; the texture
-# tables are off the card by then. The finish part's widest moment once the decode runs in boxes.
-FILL_MIB_PER_KVOXEL = 0.36
+# Closing the mesh's holes (cumesh: native memory, outside PyTorch's cap but on the card): about 67 bytes a face
+# (get_edges' sort: two buffers of 3F keys beside cumesh's copy of the mesh; cumesh 0.0.1.post2, whose get_edges
+# frees its sort buffers and whose tables are allocated at their exact size, and Mesh.fill_holes without its clones
+# of the mesh - 160 bytes a face before, round G), 2.0-2.2 faces a voxel, beside the mesh itself; the texture tables
+# are off the card by then. Measured 0.129 / 0.138 MiB per thousand voxels above the mesh (sv1536 / big1536), kept
+# with the same margin as before. The decode in boxes is the finish part's widest moment again.
+FILL_MIB_PER_KVOXEL = 0.15
 SAMPLER_BASE_MIB = 2_700
 SAMPLER_MIB_PER_KTOKEN = 50
 SAMPLER_SLACK = 1.25
@@ -122,10 +125,10 @@ HOOK_RAM_BASE_MIB = 1_500
 HOOK_RAM_MIB_PER_MVOXEL = 200
 RAM_FLOOR_MIB = 1_500               # what must stay available to Windows and the hub beside the hook's own need
 # `cond_hr` makes the shape and the texture conditionings together (proj_cond.cond_tokens_pair: NAF's image encoder
-# once per view instead of twice, about 0.36 s a view). A single-view prop pays nothing for it on the card; a
-# multi-view prop keeps the shape conditioning's running sum in float32 through the texture pass, its widest
-# moment, so it goes this way only under a cap of at least this much (a 7.2 GiB card gives about 6,800).
-FUSED_COND_MV_CAP_MIB = 7_400
+# once per view instead of twice, about 0.36 s a view), for every prop: a multi-view prop adds each view into the
+# two float32 sums in place, so at its widest moment it holds the two sums and no copy of a view, and it passes
+# under a lower cap than the two calls (round G: 3,776 against 4,448 MiB for 3 views at 31k tokens, 3,552 against
+# 4,704 for the 4 views of mv1024, 3,360 against 3,392 for sv1536). The two calls remain the ladder's second rung.
 
 
 # What a finish hook's GPU step may keep on the card between its steps (types.FinishSteps: state["room_mib"]): a
@@ -137,6 +140,19 @@ FUSED_COND_MV_CAP_MIB = 7_400
 HOLD_BESIDE_MIB = 3_000
 HOLD_SLACK_MIB = 512
 HOLD_RAM_FACTOR = 2
+
+
+def pair_order(ctx: PartContext, props: list) -> list:
+    """The order the props of a group go through the paired texture and finish (runner._pair_order): the biggest
+    shape first, by the voxels `upsample` foresaw (coords_hr["voxels"]; a resumed prop by its token count), so
+    that the last prop's finish steps - the only ones nothing hides under - are the smallest prop's. A prop's
+    numbers do not depend on its place."""
+    def voxels(prop: PropState) -> int:
+        try:
+            return decode_voxels(ctx.store.get_small(prop.id, "coords_hr"))
+        except Exception:
+            return 0
+    return sorted(props, key=voxels, reverse=True)       # stable: equal shapes keep the batch's order
 
 
 def glb_reserve(faces: int) -> int:
@@ -544,8 +560,7 @@ def cond_hr(ctx: PartContext, prop: PropState, mode: str) -> None:
     grid = int(stored["res"][0]) // 16
     z1024 = ctx.take(prop, "dino1024")["z"]
     image = proj_cond.image_tensor(source, 1024, ctx.device)
-    limits = card_limits(ctx)
-    together = mode == "normal" and (not prop.req.multi or limits is None or limits[1] >= FUSED_COND_MV_CAP_MIB)
+    together = mode == "normal"
     pair_fn = getattr(proj_cond, "cond_tokens_pair", None)      # a conditioning module without it: the two calls
     pair = None
     if together and pair_fn is not None:

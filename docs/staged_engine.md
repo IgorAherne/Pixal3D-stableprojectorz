@@ -78,10 +78,18 @@ size, and `safety_mib`); the `"cpu"` steps run on `runner.WORKERS` (2) worker th
 decoded while this one is unwrapped, and one prop's export does not wait behind another's BVH build. Rules: a GPU step may run twice after an out-of-memory (it must compute from its inputs and
 may overwrite its outputs) and leaves nothing on the card when it returns; a CPU step touches neither the card
 nor the engine (no events, no store). An exception in a step fails the prop as the hook's own would; a cancel does
-not stop a prop that has reached its steps. At most `runner.IN_FLIGHT` (2) props are in their steps at once, which
-bounds the RAM their meshes and textures hold. The hook's steps are reported as `step` events `4..3+n` of `3+n`;
+not stop a prop that has reached its steps. At most `runner.IN_FLIGHT` (3) props are in their steps at once, which
+bounds the RAM their meshes and textures hold; a prop in its last step (the hub's export, which holds little beside
+the file it writes) no longer counts. The hook's steps are reported as `step` events `4..3+n` of `3+n`;
 `prop_done` comes when the last step is over, so a prop's turn on the card and its `prop_done` are no longer back
-to back.
+to back. Two more rules of the runner keep the RAM and the tail down (round G): a tail that has run no step yet and
+begins with a CPU step is handed to the worker after the GPU steps of the other tails at that boundary, not before
+them, while props are still to be decoded (what its first step makes - the hub's cuBVH tree, a gigabyte for a 1536
+prop - is needed one texture later, and the GPU steps that run now let go of an older prop's: two trees in RAM at
+that moment, not three; the last prop's tail is not deferred); and the props of a paired group go through the
+texture and the finish biggest shape first (`parts.pair_order`, by the voxels `upsample` foresaw), so that the last
+prop's steps, which nothing hides, are the smallest prop's. A prop's numbers do not depend on its place: every
+part draws from the generator state its own prop stored.
 
 One thing a step may leave on the card: what the engine has room for. Before every step the runner writes
 `state["room_mib"]`, the MiB the step may keep for a later step of the same prop (`parts.tail_room`: what the card
@@ -130,7 +138,7 @@ where the card has no room the GPU thread builds it twice as before.
 | `cond_lr` | NAF | `dino512`, pictures, `prep`, `coords_ss` | `cond_lr` |
 | `lr` | shape flow 512 | `cond_lr`, `coords_ss`, `rng_ss` | `lr_slat`, `rng_lr` |
 | `upsample` | shape decoder | `lr_slat`, `coords_ss` | `coords_hr` (with the resolution used) |
-| `cond_hr` | NAF | `dino1024`, pictures, `prep`, `coords_hr` | `cond_hr`, `cond_tex` (both at once, `proj_cond.cond_tokens_pair`: NAF's image encoder once per view; a multi-view prop only under a cap of `FUSED_COND_MV_CAP_MIB`, else the two calls) |
+| `cond_hr` | NAF | `dino1024`, pictures, `prep`, `coords_hr` | `cond_hr`, `cond_tex` (both at once, `proj_cond.cond_tokens_pair`: NAF's image encoder once per view, every view added into the two sums in place, a head's values through the attention 128 channels at a time at 1024 px; the two calls are the ladder's tight rung) |
 | `hr` | shape flow 1024 | `cond_hr`, `coords_hr`, `rng_lr` | `shape_slat`, `rng_hr` |
 | `tex` | texture flow | `cond_tex`, `coords_hr`, `shape_slat`, `rng_hr` | `tex_slat`, the checkpoint |
 | `finish` | shape decoder, texture decoder | `coords_hr`, `shape_slat`, `tex_slat`, `notes` | the prop's file, through the hook |
@@ -162,6 +170,16 @@ same quality. A detail-flow pass is 11-14 % faster, a sparse-structure pass 21 %
 of a pass is unchanged. Before the first fused pass of a process the kernels are tried against the eager ops on
 small tables; a card or a Triton that cannot run them turns the switch off with a `[FUSED]` warning and the flows
 run eagerly.
+
+The full self-attention of one prop's tokens (the sparse flows: lr, hr, tex; the dense sparse-structure flow's 4096
+tokens) runs SageAttention (`pixal3d/modules/sage.py`: int8 Q.K^T, fp16 P.V with fp32 accumulation, the wheel in
+`whl/`) on sm_80+ cards, on by default after a first-use self-check: `PIXAL3D_SAGE=off` gives flash_attn, bit for
+bit the numbers of before. flash_attn and cuBLAS already run at the card's bf16 tensor peak, so this cheaper number
+format is what moves the samplers: an hr or tex pass at 1536 is 26 % faster, a batch about 20 %, the memory peak of
+a pass unchanged. Its error at the attention output is about 4x the bf16 rounding of flash_attn's output, which the
+samplers amplify into a different sample of the same quality (Chamfer distance 0.17-0.24 % of the bounding-box
+diagonal on the five test props, the class of the fused kernels' own change). The cross-attention (5 context tokens)
+and every other call keep their backend.
 
 A part function is `fn(ctx, prop, mode)` in `parts.py`. It reads from the batch's store, computes, and writes its
 results **as its last actions**, so an attempt that failed has changed nothing.
@@ -220,8 +238,10 @@ figures at the top of `parts.py`, measured on an RTX 3060):
   `parts.CHUNK_VOXELS` (2 M) fine voxels at a time (`models/sc_vaes/chunked.py`, `decoder.chunk_voxels`): the
   same vertices and faces, bit for bit, in a peak that no longer grows with the prop - about 0.13 MiB per thousand
   voxels plus 600 MiB for the boxes, 3.4 GB where the whole-table decode of a 16.45 M-voxel shape took 9.2 GB -
-  for 4-9 % of the decode's time. What then bounds a big prop on the card is the closing of its holes (cumesh's
-  native tables, about 144 bytes a face: `parts.fill_mib`), the widest moment of `finish` (`parts.finish_mib`).
+  for 4-9 % of the decode's time. What then bounded a big prop on the card was the closing of its holes (cumesh's
+  native tables: `parts.fill_mib`), the widest moment of `finish` (`parts.finish_mib`) - about 67 bytes a face
+  since round G (cumesh 0.0.1.post2 frees its edge sort's buffers and sizes its tables exactly, `Mesh.fill_holes`
+  takes no clones of the mesh; 160 before), so that the decode in boxes is the widest moment again.
 - **The resolution of a 1536 prop follows the memory as well as the token cap.** `upsample` walks the resolutions
   down as the reference does (1536, 1408, ..., 1024) and stops at the first whose token count is under the cap
   AND whose finish (`finish_mib`: the decode, in boxes for a big shape, or the closing of the holes) fits the cap
@@ -236,7 +256,8 @@ figures at the top of `parts.py`, measured on an RTX 3060):
 Before the decode in boxes, a bulky prop (41.6k tokens at 1408 by the token cap alone, 16.45 M voxels) was thus
 made at 1024 on a card that leaves Pixal3D 7.2 GiB, inside it, in 299 s - instead of at 1408 in 801 s with 2.6 GB
 of its decode spilled into shared memory. By the rules now its decode fits at 1408 and the closing of its holes
-(5.9 GB there) does not: it is made at 1280 (foreseen by the figures, not measured).
+(5.9 GB there) did not: it was made at 1280 (foreseen by the figures, not measured); with the leaner hole filling
+(2.5 GB there by the figures) its decode is the widest moment and it is made at 1408 - its token cap.
 
 Nothing is retried, closed or freed while an exception is being handled: its traceback holds the failed attempt's
 tensors. The runner reduces a failure to strings, leaves the `except` block and only then acts.

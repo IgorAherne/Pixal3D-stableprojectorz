@@ -2,6 +2,7 @@ from typing import *
 import torch
 import math
 from . import config
+from .. import sage
 
 
 __all__ = [
@@ -94,7 +95,9 @@ def scaled_dot_product_attention(*args, **kwargs):
         assert len(v.shape) == 4, f"Invalid shape for v, got {v.shape}, expected [N, L, H, Co]"
         device = q.device    
 
-    if config.BACKEND == 'xformers':
+    if num_all_args == 3 and config.SAGE and k.shape[1] == q.shape[1] and sage.usable(q, k, v):
+        out = sage.attention(q, k, v)     # the full self-attention (as many keys as queries): modules/sage.py
+    elif config.BACKEND == 'xformers':
         if 'xops' not in globals():
             import xformers.ops as xops
         if num_all_args == 1:

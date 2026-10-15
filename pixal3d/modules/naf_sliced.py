@@ -9,9 +9,10 @@ NAF's heads do not see each other: the rotation is element-wise with the same an
 an average pool per channel, the values are copied by a nearest resize, and the attention kernel works a head at a
 time. So `naf_sampled` turns the guide's map by RoPE over itself a head at a time, then runs the key pool, the
 resize and the attention for one head, hands that head's map [B, C / heads, T, T] to `sample` and keeps only what
-`sample` returns. The values are those of the whole call, bit for bit; the largest moment is one head's attention -
-at T = 1024 the guide's map (1 GiB), that head's queries and keys (0.25 GiB each), its values and its output (1 GiB
-each).
+`sample` returns. The values are those of the whole call, bit for bit. At T = 1024 a head's 256 value channels go
+through the attention VALUE_SLICE at a time (each output channel is a weighted sum of its own value channel, with
+weights made from the queries and keys alone), so the largest moment of a head there is the guide's map (1 GiB),
+that head's queries and keys (0.25 GiB each), a slice's values and output (0.5 GiB each).
 """
 
 from __future__ import annotations
@@ -22,6 +23,20 @@ from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+# Value channels per attention call. natten's cutlass-fna kernel gives a head's output channels bit for bit the
+# same whether it is handed the head's 256 value channels at once or in slices of 128 (checked on an RTX 3060,
+# natten 0.21.6, float32, at T = 512 and 1024: Spellcast3D code/devtools/pixal3d-lowmem/round-g/cond_hr/
+# naf_slices.py); slices of 64 or 32 - no wider than the queries' 64 channels - take another kernel and round
+# differently. A slice is used only where it is wider than the queries' channels and divides the head's, and only
+# where a head's values would take more than VALUE_SLICE_ABOVE_MIB (T = 1024: 1 GiB; at T = 512 the whole head is
+# faster and its 256 MiB are not the widest moment).
+VALUE_SLICE = 128
+VALUE_SLICE_ABOVE_MIB = 512
+# guide_map empties PyTorch's cache before the conv stacks: under a cap, the blocks the previous view's attention
+# left cut up would otherwise keep cuDNN's work area out, and cuDNN would go on with another algorithm (an
+# out-of-memory event the runner counts as a failure). It costs about 0.03 s a run at 1024 px.
+TRIM_BEFORE_ENCODERS = True
 
 
 def _attention_of(naf) -> Optional[Callable]:
@@ -86,31 +101,43 @@ def guide_map(naf, image: torch.Tensor) -> torch.Tensor:
     its last line (model/naf.py:31-35), the two convolution stacks over the whole picture - about 0.36 s a view at
     1024 px, the same whatever the target. `image` as guide_input gives it. Pooled to a target with
     `F.adaptive_avg_pool2d(map, target)`, it is forward_encoder's result for that target; at the map's own size
-    the pool averages one pixel each, so the map itself is that result."""
+    the pool averages one pixel each, so the map itself is that result.
+
+    The 3x3 stack runs first: its widest moment (a 1024 px picture: its input, the padded copy, the output and
+    cuDNN's work area, about 2 GiB) then comes without the other stack's map on the card. The two stacks do not
+    see each other, and the map is put together in NAF's order."""
     encoder = naf.image_encoder
     if not encoder.use_encoder:
         return image
-    return torch.cat([encoder.encoder(image), encoder.sem_encoder(image)], dim=1)
+    if TRIM_BEFORE_ENCODERS and image.is_cuda:
+        torch.cuda.empty_cache()
+    sem = encoder.sem_encoder(image)
+    return torch.cat([encoder.encoder(image), sem], dim=1)
 
 
 @torch.no_grad()
 def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size: Tuple[int, int],
                 sample: Callable[[torch.Tensor], torch.Tensor], out: Optional[torch.Tensor] = None,
-                guide: Optional[torch.Tensor] = None) -> torch.Tensor:
+                guide: Optional[torch.Tensor] = None, add: bool = False) -> torch.Tensor:
     """NAF.forward(image, lr_features, target_size) fed head by head to `sample`.
 
-    image [B, 3, H, W] in 0..1; lr_features [B, C, h, w]; sample(fmap [B, C / heads, T, T]) -> [B, K, C / heads];
-    returns [B, K, C] (written into `out` when given). Same operations as NAF's own code: model/naf.py:37-52 and
-    105-117, layers/rope.py:137-174, layers/attentions.py:55-74.
+    image [B, 3, H, W] in 0..1; lr_features [B, C, h, w]; sample(fmap [B, c, T, T]) -> [B, K, c] for a slice of c
+    channels of a head; returns [B, K, C] (written into `out` when given). Same operations as NAF's own code:
+    model/naf.py:37-52 and 105-117, layers/rope.py:137-174, layers/attentions.py:55-74.
 
-    `sample` is given one head's map; on the fall-back below, where the whole map is built at once, it is given
-    all the channels in one call instead. Both callers sample each channel on its own, so that makes no
-    difference to them.
+    `sample` is given a head's map a slice of VALUE_SLICE channels at a time (the whole head where the slice does
+    not apply); on the fall-back below, where the whole map is built at once, it is given all the channels in one
+    call instead. Both callers sample each channel on its own, so that makes no difference to them.
 
     `guide`: the guide's map at `target_size` made outside (guide_map, pooled), in place of the encoder's run
     here; it is written over by the rotation and not usable afterwards. A caller that needs the encoder's map at
     two targets makes it once this way.
+
+    `add`: the rows are added into `out` (float32, element by element: what `out.add_(rows)` would give) instead
+    of written over it, for a caller that sums views into one tensor without a copy per view.
     """
+    if add and out is None:
+        raise ValueError("add=True needs the tensor to add into (out=)")
     na2d = _attention_of(naf)
     if na2d is None:
         if guide is not None:
@@ -118,7 +145,10 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
         rows = sample(naf(image, lr_features, target_size))      # an older natten: no kernel to call per head
         if out is None:
             return rows
-        out.copy_(rows)
+        if add:
+            out.add_(rows)
+        else:
+            out.copy_(rows)
         return out
 
     encoder, attention = naf.image_encoder, naf.upsampler
@@ -126,7 +156,11 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
     if lr_features.shape[1] % heads:
         raise ValueError(f"NAF's {lr_features.shape[1]} channels do not divide into {heads} heads")
     if guide is None:
-        x = encoder.forward_encoder(guide_input(image, target_size), target_size)   # the guide's map before RoPE
+        # The guide's map before RoPE: forward_encoder's result (the two stacks, the pool to the target), the
+        # stacks as guide_map runs them; at the map's own size the pool is the identity and is left out.
+        x = guide_map(naf, guide_input(image, target_size))
+        if tuple(x.shape[-2:]) != tuple(target_size):
+            x = F.adaptive_avg_pool2d(x, target_size)
     else:
         if tuple(guide.shape[-2:]) != tuple(target_size):
             raise ValueError(f"the guide's map is {tuple(guide.shape[-2:])}, the target {tuple(target_size)}")
@@ -147,6 +181,8 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
 
     d = channels // heads
     dv = lr_features.shape[1] // heads
+    big = batch * height * width * dv * lr_features.element_size() > VALUE_SLICE_ABOVE_MIB << 20
+    step = VALUE_SLICE if big and dv > VALUE_SLICE > d and dv % VALUE_SLICE == 0 else dv
     low = lr_features.shape[-2:]
     dilation = (height // low[0], width // low[1])
     for i in range(heads):
@@ -159,15 +195,20 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
         k = F.adaptive_avg_pool2d(xh, low)
         del xh
         k = _heads_last(F.interpolate(k, size=(height, width), mode="nearest-exact")).to(q.dtype)
-        v = _heads_last(
-            F.interpolate(lr_features[:, dv * i:dv * (i + 1)], size=(height, width), mode="nearest-exact")
-        ).to(q.dtype)
-        o = na2d(q, k, v, kernel_size=attention.kernel_size, dilation=dilation, stride=1, backend="cutlass-fna")
-        del q, k, v
-        rows = sample(o.reshape(batch, height, width, dv).permute(0, 3, 1, 2))
-        del o
-        if out is None:
-            out = rows.new_empty(*rows.shape[:-1], dv * heads)
-        out[..., dv * i:dv * (i + 1)] = rows
-        del rows
+        for c in range(dv * i, dv * (i + 1), step):        # the head's value channels, a slice at a time
+            v = _heads_last(
+                F.interpolate(lr_features[:, c:c + step], size=(height, width), mode="nearest-exact")
+            ).to(q.dtype)
+            o = na2d(q, k, v, kernel_size=attention.kernel_size, dilation=dilation, stride=1, backend="cutlass-fna")
+            del v
+            rows = sample(o.reshape(batch, height, width, step).permute(0, 3, 1, 2))
+            del o
+            if out is None:
+                out = rows.new_empty(*rows.shape[:-1], dv * heads)
+            if add:
+                out[..., c:c + step] += rows
+            else:
+                out[..., c:c + step] = rows
+            del rows
+        del q, k
     return out
