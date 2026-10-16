@@ -63,6 +63,7 @@ class MultiHeadAttention(nn.Module):
             self.k_rms_norm = MultiHeadRMSNorm(self.head_dim, num_heads)
             
         self.to_out = nn.Linear(channels, channels)
+        self.sage_folded = False        # sage.fold: v's 2^-8 and the answer's 2^8 live in to_qkv / to_out
     
     def _fused_qk(self, q: torch.Tensor, k: torch.Tensor,
                   phases: Optional[torch.Tensor]) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
@@ -101,7 +102,7 @@ class MultiHeadAttention(nn.Module):
                             assert phases is not None, "Phases must be provided for RoPE"
                             q = RotaryPositionEmbedder.apply_rotary_embedding(q, phases)
                             k = RotaryPositionEmbedder.apply_rotary_embedding(k, phases)
-                    h = scaled_dot_product_attention(q, k, v)
+                    h = scaled_dot_product_attention(q, k, v, v_scaled=self.sage_folded)
                 else:
                     h = scaled_dot_product_attention(qkv)
             elif self.attn_mode == "windowed":

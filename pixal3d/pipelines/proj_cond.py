@@ -391,4 +391,4 @@ def cond_tokens_pair(spec_a: Spec, spec_b: Spec, z: torch.Tensor, image: torch.T
 
 def negative(cond: dict) -> dict:
     """The unconditional twin of a conditioning: zeros of the same shapes and dtypes, on the same device."""
-    return {"global": torch.zeros_like(cond["global"]), "proj": torch.zeros_like(cond["proj"])}
+    return {"global": torch.zeros_like(cond["global"]), "proj": torch.zeros_like(cond["proj"]), "zero": True}

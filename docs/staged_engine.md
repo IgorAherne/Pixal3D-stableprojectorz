@@ -187,6 +187,24 @@ samplers amplify into a different sample of the same quality (Chamfer distance 0
 diagonal on the five test props, the class of the fused kernels' own change). The cross-attention (5 context tokens)
 and every other call keep their backend.
 
+Two savings around the attention change no bit. A guided sampling runs the flow once on the prop's conditioning
+and once on an all-zero conditioning per step inside the guidance interval (hr and lr: 9 of 21 passes, ss: 10 of
+22). On the zero one, every block's cross-attention branch (norm2, to_q, the q/k norms, the attention over the five
+zero context tokens, to_out, proj_linear) answers the same row for every token, and that row depends on the weights
+alone: to_kv of zeros is its bias, so the five keys and values are identical, the softmax is exactly uniform and
+the attention returns the value row whatever the query; to_out of identical rows gives identical rows; proj_linear
+of zeros is its bias. The engine marks the zero conditioning (`"zero": True` in neg_cond, `parts._token_cond` and
+`proj_cond.negative`); the block runs the branch in full on the first zero pass of a token count and keeps its first
+row (`SparseProjectAttention._zero_rows`, keyed by the token count, since cuBLAS may pick another kernel for
+another count), and the next zero passes of that count add the kept row instead: a zero hr pass at 1536 4.72 ->
+4.24 s, a whole hr sampling 85.5 -> 82.2 s, ss 11.0 -> 10.4, lr 5.4 -> 5.1 (about 21 s of a five-prop batch); the
+golden engine check and the fused + SageAttention samplings are bit-equal with and without it
+(`code/devtools/pixal3d-lowmem/round-i/zero/`). And SageAttention's scaling of v by 2^-8 into the kernel and of
+the answer by 2^8 after it is folded into the weights when the switch is on (`sage.fold`, called by the engine's
+`_prepare_flow` once a flow is loaded: to_qkv's v rows and bias times 2^-8, to_out's weight times 2^8; powers of
+two scale every product and sum exactly, so flash_attn, SDPA and the int8 layers give the same bits too): the
+kernel is called without its two elementwise passes (`sage.attention(..., scaled=True)`).
+
 DINOv3 (part `features`) runs under float16 autocast on cards from sm_75 up (`proj_cond.dino_fp16`, switch
 `PIXAL3D_DINO_FP16` auto/on/off; a GTX 10xx keeps float32, where fp16 is slow): the features part 3.6x faster
 (18.7 -> 9.1 s of a five-prop batch at 1536), the tokens within 7e-4 relative L2 of float32, a different sample of

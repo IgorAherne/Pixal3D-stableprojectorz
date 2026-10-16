@@ -76,6 +76,7 @@ class SparseMultiHeadAttention(nn.Module):
             self.k_rms_norm = SparseMultiHeadRMSNorm(self.head_dim, num_heads)
             
         self.to_out = nn.Linear(channels, channels)
+        self.sage_folded = False        # sage.fold: v's 2^-8 and the answer's 2^8 live in to_qkv / to_out
 
         if use_rope:
             self.rope = SparseRotaryPositionEmbedder(self.head_dim, rope_freq=rope_freq)
@@ -139,7 +140,8 @@ class SparseMultiHeadAttention(nn.Module):
                 else:
                     qkv = qkv.replace(torch.stack([q.feats, k.feats, v.feats], dim=1))
             if self.attn_mode == "full":
-                h = sparse_scaled_dot_product_attention(*apart) if apart else sparse_scaled_dot_product_attention(qkv)
+                h = (sparse_scaled_dot_product_attention(*apart, v_scaled=self.sage_folded) if apart
+                     else sparse_scaled_dot_product_attention(qkv))
             elif self.attn_mode == "windowed":
                 h = sparse_windowed_scaled_dot_product_self_attention(
                     qkv, self.window_size, shift_window=self.shift_window

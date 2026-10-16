@@ -62,6 +62,7 @@ def scaled_dot_product_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tens
     ...
 
 def scaled_dot_product_attention(*args, **kwargs):
+    v_scaled = kwargs.pop("v_scaled", False)     # v carries SageAttention's 2^-8 already (modules/sage.py fold)
     arg_names_dict = {
         1: ['qkv'],
         2: ['q', 'kv'],
@@ -96,7 +97,7 @@ def scaled_dot_product_attention(*args, **kwargs):
         device = q.device    
 
     if num_all_args == 3 and config.SAGE and k.shape[1] == q.shape[1] and sage.usable(q, k, v):
-        out = sage.attention(q, k, v)     # the full self-attention (as many keys as queries): modules/sage.py
+        out = sage.attention(q, k, v, scaled=v_scaled)   # the full self-attention (as many keys as queries)
     elif config.BACKEND == 'xformers':
         if 'xops' not in globals():
             import xformers.ops as xops

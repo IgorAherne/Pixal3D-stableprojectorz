@@ -224,6 +224,7 @@ class SLatFlowModel(nn.Module):
             h = h + manual_cast(pe, self.dtype)
             
         # Handle different conditioning modes
+        zero = isinstance(cond, dict) and bool(cond.get("zero", False))     # all zeros: the unconditional pass
         if self.image_attn_mode == 'proj':
             if isinstance(cond, dict):
                 global_cond = cond['global']
@@ -249,7 +250,7 @@ class SLatFlowModel(nn.Module):
             cond = manual_cast(cond, self.dtype)
 
         for block in self.blocks:
-            h = block(h, t_emb, cond)
+            h = block(h, t_emb, cond, zero=zero)
 
         h = manual_cast(h, x.dtype)
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))

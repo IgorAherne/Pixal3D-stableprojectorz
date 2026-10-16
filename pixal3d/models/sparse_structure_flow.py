@@ -300,6 +300,7 @@ class SparseStructureFlowModel(nn.Module):
         h = manual_cast(h, self.dtype)
         
         # Handle different conditioning modes
+        zero = isinstance(cond, dict) and bool(cond.get("zero", False))     # all zeros: the unconditional pass
         if self.image_attn_mode == 'proj':
             if isinstance(cond, dict):
                 global_cond = cond['global']
@@ -318,7 +319,7 @@ class SparseStructureFlowModel(nn.Module):
             cond = manual_cast(cond, self.dtype)
             
         for block in self.blocks:
-            h = block(h, t_emb, cond, self.rope_phases)
+            h = block(h, t_emb, cond, self.rope_phases, zero=zero)
         h = manual_cast(h, x.dtype)
         h = F.layer_norm(h, h.shape[-1:])
         h = self.out_layer(h)

@@ -94,11 +94,49 @@ def usable(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
     return bool(_state)
 
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scaled: bool = False) -> torch.Tensor:
     """Softmax(q k^T / sqrt(D)) v for q, k, v [B, N, H, D] (last dimension contiguous), not causal: [B, N, H, D] in
-    q's dtype. Call only where usable() said True."""
+    q's dtype. Call only where usable() said True. `scaled`: v already carries the 2^-V_SHIFT (the weights were
+    folded, `fold`): the answer keeps it, and the folded to_out undoes it."""
+    if scaled:
+        return _kernel(q, k, v)
     out = _kernel(q, k, v * 2.0 ** -V_SHIFT)
     return out.mul_(2.0 ** V_SHIFT)
+
+
+def fold(model: torch.nn.Module) -> int:
+    """The 2^-V_SHIFT of v and the 2^V_SHIFT of the answer folded into the weights of every full self-attention of
+    `model`: to_qkv's v rows (weight and bias) times 2^-V_SHIFT, to_out's weight times 2^V_SHIFT. Powers of two
+    scale a floating-point value exactly (no value of the flows comes near the exponent's ends), and every product
+    and sum of the attention and of the two GEMMs scales with them, so every path - SageAttention without its two
+    scaling passes (0.8 ms a block at 21.5k tokens), flash_attn, SDPA, the int8 layers (their row and channel
+    scales carry the powers) - gives the same bits as before. Done once per loaded network (the module's
+    `sage_folded` says so), by the engine when the switch is on. Returns how many modules were folded."""
+    down, up = 2.0 ** -V_SHIFT, 2.0 ** V_SHIFT
+    count = 0
+    with torch.no_grad():
+        for module in model.modules():
+            if (type(module).__name__ not in ("SparseMultiHeadAttention", "MultiHeadAttention")
+                    or getattr(module, "_type", None) != "self" or getattr(module, "attn_mode", None) != "full"
+                    or getattr(module, "sage_folded", False)):
+                continue
+            C = module.channels
+            _scale_rows(module.to_qkv, slice(2 * C, 3 * C), down)
+            _scale_rows(module.to_out, slice(0, C), up, bias=False)
+            module.sage_folded = True
+            count += 1
+    return count
+
+
+def _scale_rows(linear: torch.nn.Module, rows: slice, factor: float, bias: bool = True) -> None:
+    """The output rows `rows` of a linear layer (nn.Linear, or an int8 layer with `weight_q` and `scale`) times
+    `factor`: the weight rows, or the int8 layer's channel scales, and the bias rows when `bias`."""
+    if hasattr(linear, "weight_q"):
+        linear.scale[rows].mul_(factor)
+    else:
+        linear.weight[rows].mul_(factor)
+    if bias and getattr(linear, "bias", None) is not None:
+        linear.bias[rows].mul_(factor)
 
 
 def _choose(device: torch.device) -> tuple[Callable, str]:

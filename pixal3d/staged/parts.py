@@ -511,7 +511,8 @@ def _token_cond(cond: dict, coords: torch.Tensor, negative: bool = True) -> dict
             "neg_cond": None}
     if negative:
         zero = _proj_cond().negative(cond)
-        pair["neg_cond"] = {"global": zero["global"], "proj": SparseTensor(feats=zero["proj"], coords=coords)}
+        pair["neg_cond"] = {"global": zero["global"], "proj": SparseTensor(feats=zero["proj"], coords=coords),
+                            "zero": True}       # the flows' blocks compute the zero context's row once
     return pair
 
 

@@ -200,7 +200,8 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         else:
             self.modulation = nn.Parameter(torch.randn(6 * channels) / channels ** 0.5)
 
-    def _forward(self, x: SparseTensor, mod: torch.Tensor, context: Union[torch.Tensor, VarLenTensor]) -> SparseTensor:
+    def _forward(self, x: SparseTensor, mod: torch.Tensor, context: Union[torch.Tensor, VarLenTensor],
+                 zero: bool = False) -> SparseTensor:
         if self.share_mod:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation + mod).type(mod.dtype).chunk(6, dim=1)
         else:
@@ -208,14 +209,17 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
         rows = _fused_rows(x)
         if rows is not None:
             return self._forward_fused(x, context, rows, shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp,
-                                       gate_mlp)
+                                       gate_mlp, zero)
         h = x.replace(self.norm1(x.feats))
         h = h * (1 + scale_msa) + shift_msa
         h = self.self_attn(h)
         h = h * gate_msa
         x = x + h
         h = x.replace(self.norm2(x.feats))
-        h = self.cross_attn(h, context)
+        if zero and type(self.cross_attn) is _ProjectAttention:
+            h = self.cross_attn(h, context, zero=True)      # the zero context's one row (proj_attention.py)
+        else:
+            h = self.cross_attn(h, context)
         x = x + h
         h = x.replace(self.norm3(x.feats))
         h = h * (1 + scale_mlp) + shift_mlp
@@ -226,35 +230,48 @@ class ModulatedSparseTransformerCrossBlock(nn.Module):
 
     def _forward_fused(self, x: SparseTensor, context: Union[torch.Tensor, VarLenTensor], rows: dict,
                        shift_msa: torch.Tensor, scale_msa: torch.Tensor, gate_msa: torch.Tensor,
-                       shift_mlp: torch.Tensor, scale_mlp: torch.Tensor, gate_mlp: torch.Tensor) -> SparseTensor:
+                       shift_mlp: torch.Tensor, scale_mlp: torch.Tensor, gate_mlp: torch.Tensor,
+                       zero: bool = False) -> SparseTensor:
         """_forward with the elementwise ops fused (modules/fused.py: the switch PIXAL3D_FUSED); the same
         sub-layers in the same order."""
         h = x.replace(fused.norm_modulate(x.feats, self.norm1.eps, scale=scale_msa, shift=shift_msa, **rows))
         h = self.self_attn(h)
         x = x.replace(fused.residual(x.feats, h.feats, gate=gate_msa, **rows))
-        h = x.replace(fused.norm_modulate(x.feats, self.norm2.eps, weight=self.norm2.weight, bias=self.norm2.bias,
-                                          **rows))
-        if type(self.cross_attn) is _ProjectAttention:
+        tokens = x.feats.shape[0]
+        cached = self.cross_attn.zero_row(tokens) if zero and type(self.cross_attn) is _ProjectAttention else None
+        if cached is not None:
+            # the zero context's one row for every token (proj_attention.py); norm2 is not needed for it
+            x = x.replace(fused.residual(x.feats, cached.expand(tokens, -1).contiguous()))
+        elif type(self.cross_attn) is _ProjectAttention:
+            h = x.replace(fused.norm_modulate(x.feats, self.norm2.eps, weight=self.norm2.weight,
+                                              bias=self.norm2.bias, **rows))
             # SparseProjectAttention.forward, its sum (proj + global) done in the residual kernel
             global_context, proj_context = ((context['global'], context['proj']) if isinstance(context, dict)
                                             else context)
             global_out = self.cross_attn.cross_attn_block(h, global_context)
             proj_feats = self.cross_attn.proj_linear(proj_context.feats if isinstance(proj_context, SparseTensor)
                                                      else proj_context)
+            if zero:
+                # the sum as the residual kernel rounds it (one bf16 add), first row
+                self.cross_attn.remember_zero_row(tokens, proj_feats[:1] + global_out.feats[:1])
             if proj_feats.shape == global_out.feats.shape and proj_feats.is_contiguous():
                 x = x.replace(fused.residual(x.feats, global_out.feats, second=proj_feats))
             else:
                 x = x.replace(fused.residual(x.feats, (proj_feats + global_out.feats).contiguous()))
             del global_out, proj_feats          # freed here, as on the eager path's return: not alive in the MLP
         else:
+            h = x.replace(fused.norm_modulate(x.feats, self.norm2.eps, weight=self.norm2.weight,
+                                              bias=self.norm2.bias, **rows))
             h = self.cross_attn(h, context)
             x = x.replace(fused.residual(x.feats, h.feats))
         h = x.replace(fused.norm_modulate(x.feats, self.norm3.eps, scale=scale_mlp, shift=shift_mlp, **rows))
         h = self.mlp(h)
         return x.replace(fused.residual(x.feats, h.feats, gate=gate_mlp, **rows))
 
-    def forward(self, x: SparseTensor, mod: torch.Tensor, context: Union[torch.Tensor, VarLenTensor]) -> SparseTensor:
+    def forward(self, x: SparseTensor, mod: torch.Tensor, context: Union[torch.Tensor, VarLenTensor],
+                zero: bool = False) -> SparseTensor:
+        """`zero`: the context is all zeros (a guided sampling's unconditional pass; proj_attention.py)."""
         if self.use_checkpoint:
-            return torch.utils.checkpoint.checkpoint(self._forward, x, mod, context, use_reentrant=False)
+            return torch.utils.checkpoint.checkpoint(self._forward, x, mod, context, zero, use_reentrant=False)
         else:
-            return self._forward(x, mod, context)
+            return self._forward(x, mod, context, zero)

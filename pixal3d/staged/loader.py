@@ -92,6 +92,7 @@ _driver_cards: dict[int, Any] = {}  # card index -> (NVML library, its handle of
 class _Checkpoint:
     config_file: Path
     file: Path
+    convert: Callable[[nn.Module], nn.Module] | None = None     # applied to the loaded module (modules/int8.py)
 
 
 @dataclass
@@ -141,12 +142,15 @@ class NetworkLoader:
 
     # ------------------------------------------------------------------------------------------------ registration
 
-    def register_checkpoint(self, name: str, ckpt: Path) -> None:
+    def register_checkpoint(self, name: str, ckpt: Path,
+                            convert: Callable[[nn.Module], nn.Module] | None = None) -> None:
         """A flow model or decoder: `ckpt` is the path without extension (<ckpt>.json and <ckpt>.safetensors; a
         copy of the latter in the model's dtypes, weights.copy_of, is read in its place while it is valid).
-        Nothing is read here: files that are missing or broken are reported by `load`."""
+        Nothing is read here: files that are missing or broken are reported by `load`. `convert`, when given, is
+        applied to the module once its weights are on the device and before its size is measured (the flows'
+        linears as int8 GEMMs, modules/int8.py: it returns the module unchanged when that is off)."""
         self._free_name(name)
-        self._sources[name] = _Checkpoint(Path(f"{ckpt}.json"), Path(f"{ckpt}.safetensors"))
+        self._sources[name] = _Checkpoint(Path(f"{ckpt}.json"), Path(f"{ckpt}.safetensors"), convert)
 
     def register_builder(self, name: str, build: Callable[[str], nn.Module], file: Path | None = None) -> None:
         """A model with a loader of its own: `build(device)` returns it on that device. `file` is what `prefetch`
@@ -174,6 +178,8 @@ class NetworkLoader:
                 module, size = self._build(name, source)
             else:
                 module, size = self._read(name, source, state, cancelled)
+                if module is not None and source.convert is not None:
+                    module = source.convert(module)
             if module is not None:
                 module.eval()
                 module.requires_grad_(False)

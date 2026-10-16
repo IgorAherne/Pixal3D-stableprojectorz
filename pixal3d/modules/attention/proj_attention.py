@@ -34,17 +34,37 @@ class ProjectAttention(nn.Module):
         super().__init__()
         self.cross_attn_block = cross_attn_block
         self.proj_linear = nn.Linear(proj_in_channels, channels, bias=True)
-        
-    def forward(self, x: torch.Tensor, context: Union[Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
+        # Zero context (the unconditional passes of a guided sampling): the branch's answer is one row per batch
+        # item, the same for every token and independent of the tokens (see the sparse module's note). The first
+        # zero pass of a shape [B, N] runs in full and keeps its first rows, [B, 1, C]; the next ones add them.
+        self._zero_rows: Dict[Tuple[int, int], torch.Tensor] = {}
+
+    def zero_row(self, shape: Tuple[int, int]) -> Optional[torch.Tensor]:
+        """The branch's answer to a zero context for x of shape [B, N, C], as [B, 1, C], if a pass computed it."""
+        return self._zero_rows.get(shape)
+
+    def remember_zero_row(self, shape: Tuple[int, int], rows: torch.Tensor) -> None:
+        """`rows` [B, 1, C]: what every token of each batch item got from the branch on a zero context."""
+        self._zero_rows[shape] = rows.detach().clone()
+
+    def forward(self, x: torch.Tensor, context: Union[Dict[str, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]],
+                zero: bool = False) -> torch.Tensor:
+        """`zero`: the context is all zeros: the kept rows serve when there are any."""
+        shape = (x.shape[0], x.shape[1])
+        cached = self.zero_row(shape) if zero else None
+        if cached is not None:
+            return cached.expand(x.shape[0], x.shape[1], -1)
         if isinstance(context, dict):
             global_context = context['global']
             proj_context = context['proj']
         else:
             global_context, proj_context = context
-        
+
         global_out = self.cross_attn_block(x, global_context)
         proj_out = self.proj_linear(proj_context)
         context_combined = proj_out + global_out
+        if zero:
+            self.remember_zero_row(shape, context_combined[:, :1])
         return context_combined
 
 
