@@ -1,23 +1,31 @@
 {
-  "wheel": "cumesh-0.0.1.post3+cu128torch2.8-cp311-cp311-win_amd64.whl",
-  "sha256": "724cd15e800db4d789a6c94a9c2616b3db5c959361eb2a0737f6319b10f953b4",
-  "size_bytes": 13723743,
-  "built": "2026-10-15T21:41:26+00:00",
-  "build_seconds": 533,
+  "wheel": "cumesh-0.0.1.post4+cu128torch2.8-cp311-cp311-win_amd64.whl",
+  "sha256": "983454292791df2503466c957a3369141c14320de8e88e8582a27af19bb78dcd",
+  "size_bytes": 13730764,
+  "built": "2026-10-16T06:51:28+00:00",
+  "build_seconds": 534,
   "sources": {
-    "cumesh": {
-      "repo": "https://github.com/JeffreyXiang/CuMesh.git",
-      "commit": "b84410e9c01f68f5236c328cba610e9051cd1063",
+    "fork": {
+      "repo": "https://github.com/IgorAherne/CuMesh.git",
+      "branch": "spellcast3d",
+      "commit": "229384c42819b9024e0ce6023d1281023738536d",
       "license": "MIT (Microsoft TRELLIS.2's CuMesh)"
+    },
+    "upstream": {
+      "repo": "https://github.com/JeffreyXiang/CuMesh.git",
+      "commit": "12289e1062f0603f2f0d0771b02e1395d247f26f",
+      "how": "merged into the fork's branch"
     },
     "cubvh": {
       "repo": "https://github.com/JeffreyXiang/cubvh.git",
-      "commit": "ff89002e3c7fdcac63cf71ddb638e7934ca3fc6e",
+      "commit": "ce92267a24ef6ad7d2c8ccbc2ae2c021a6597e70",
+      "how": "vendored as plain files in third_party/cubvh (the commit upstream's submodule pins)",
       "license": "MIT (ashawkey/cubvh lineage; NVIDIA instant-ngp's BVH code under its licence, LICENSE_NVIDIA in the tree)"
     },
     "eigen": {
       "repo": "https://gitlab.com/libeigen/eigen",
       "commit": "e63d9f6ccb7f6f29f31241b87c542f3f0ab3112b",
+      "how": "the fork's submodule",
       "license": "MPL-2.0 (headers only)"
     },
     "xatlas": {
@@ -27,138 +35,190 @@
   },
   "patches": {
     "script": "code/release/wheels/cumesh/patch_cumesh_win.py",
-    "applied_to": "clean `git archive` exports of the pinned commits (the clones stay untouched)",
-    "why": "MSVC 2022 + CUDA 12.8 build (ssize_t, compiler flags, no torch pin), Pixal3D's memory edits of remeshing.py (the wheel the fork shipped: chunked BVH queries and frees, value-neutral), cuBVH's build without Python's lock (create_cuBVH: py::call_guard<py::gil_scoped_release>), cuBVH's card copy on demand (create_cuBVH(..., upload=False) builds on the CPU only; upload(), release_device(), on_device; the queries upload first; the tree's construction unchanged), get_manifold_boundary_adjacency's leak of 4 bytes per vertex mended (a cudaFree), fill_holes' chain in less card memory with the same tables bit for bit (get_edges: a DoubleBuffer sort, outputs of their exact length, its scratch freed; get_boundary_info and get_manifold_boundary_adjacency: counting iterators and exact outputs; fill_holes: the tables it no longer reads freed before the mesh buffers are extended), and the ray-stab's inside test (signed_distance mode raystab) with an any-hit traversal: ray_intersect_any stops at the first hit and accepts a hit and prunes a box exactly as ray_intersect does before its first hit (t < MAX_DIST, entry distance < MAX_DIST, the same escape-link fallback), boxes wholly behind the ray's origin visited last; the same verdicts bit for bit; ray_intersect and the other queries untouched",
+    "applied_to": "nothing at build time: the fork's commit is built as committed; the hunks are its commits' contents, and `patch_cumesh_win.py check` holds the commit equal to upstream + cubvh + the hunks",
+    "check": "equal: upstream 12289e106 + cubvh ce92267a2 + 31 hunks, file by file (README.md aside); eigen's link at e63d9f6cc",
+    "why": "the version (0.0.1.post4+cu128torch2.8) and no torch pin; cuBVH's build without Python's lock; cuBVH's card copy on demand (upload=False builds on the CPU only; upload(), release_device(), on_device; the queries upload first); fill_holes' chain in less card memory with the same tables bit for bit (get_edges: a DoubleBuffer sort, outputs of their exact length, its scratch freed; get_boundary_info and get_manifold_boundary_adjacency: counting iterators and exact outputs; fill_holes: the tables it no longer reads freed before the mesh buffers are extended), on upstream's stream handling; the ray-stab's inside test with an any-hit traversal (the same verdicts bit for bit); Pixal3D's memory edits of remeshing.py (chunked BVH queries and frees, value-neutral). Upstream's own Windows build (setup.py since f149d59) as it is",
     "hunks": [
       {
         "id": "pyproject-no-torch-pin",
-        "file": "pyproject.toml"
-      },
-      {
-        "id": "setup-msvc-flags",
-        "file": "setup.py"
-      },
-      {
-        "id": "setup-ext-C-flags",
-        "file": "setup.py"
-      },
-      {
-        "id": "setup-ext-cubvh-flags",
-        "file": "setup.py"
-      },
-      {
-        "id": "setup-ext-xatlas-flags",
-        "file": "setup.py"
-      },
-      {
-        "id": "ext-ssize_t",
-        "file": "src/ext.cpp"
-      },
-      {
-        "id": "cubvh-bindings-ssize_t",
-        "file": "third_party/cubvh/src/bindings.cpp"
-      },
-      {
-        "id": "atlas-cub-sum-for-cuda-12.8",
-        "file": "src/atlas.cu"
-      },
-      {
-        "id": "cubvh-build-without-the-gil",
-        "file": "third_party/cubvh/src/bindings.cpp"
-      },
-      {
-        "id": "cubvh-tree-upload-release",
-        "file": "third_party/cubvh/include/gpu/bvh.cuh"
-      },
-      {
-        "id": "cubvh-tree-build-without-upload",
-        "file": "third_party/cubvh/src/bvh.cu"
-      },
-      {
-        "id": "cubvh-api-upload-release",
-        "file": "third_party/cubvh/include/gpu/api_gpu.h"
-      },
-      {
-        "id": "cubvh-impl-mutex-include",
-        "file": "third_party/cubvh/src/api_gpu.cu"
-      },
-      {
-        "id": "cubvh-impl-upload-flag",
-        "file": "third_party/cubvh/src/api_gpu.cu"
-      },
-      {
-        "id": "cubvh-impl-build-without-upload",
-        "file": "third_party/cubvh/src/api_gpu.cu"
-      },
-      {
-        "id": "cubvh-impl-upload-release",
-        "file": "third_party/cubvh/src/api_gpu.cu"
-      },
-      {
-        "id": "cubvh-impl-lazy-upload",
-        "file": "third_party/cubvh/src/api_gpu.cu"
-      },
-      {
-        "id": "cubvh-impl-state-and-factory",
-        "file": "third_party/cubvh/src/api_gpu.cu"
-      },
-      {
-        "id": "cubvh-bindings-upload-release",
-        "file": "third_party/cubvh/src/bindings.cpp"
-      },
-      {
-        "id": "cubvh-bindings-create-upload-arg",
-        "file": "third_party/cubvh/src/bindings.cpp"
-      },
-      {
-        "id": "connectivity-free-manifold-vert-idx",
-        "file": "src/connectivity.cu"
-      },
-      {
-        "id": "bvh-py-upload-arg",
-        "file": "cumesh/bvh.py"
-      },
-      {
-        "id": "bvh-py-upload-release",
-        "file": "cumesh/bvh.py"
-      },
-      {
-        "id": "connectivity-get-edges-lean",
-        "file": "src/connectivity.cu"
-      },
-      {
-        "id": "connectivity-boundaries-exact",
-        "file": "src/connectivity.cu"
-      },
-      {
-        "id": "connectivity-manifold-boundary-verts-exact",
-        "file": "src/connectivity.cu"
-      },
-      {
-        "id": "clean-up-fill-holes-free-tables-first",
-        "file": "src/clean_up.cu"
-      },
-      {
-        "id": "cubvh-ray-intersect-any",
-        "file": "third_party/cubvh/src/bvh.cu"
-      },
-      {
-        "id": "cubvh-raystab-any-hit",
-        "file": "third_party/cubvh/src/bvh.cu"
-      },
-      {
-        "id": "msvc-compat-header",
-        "file": "src/cumesh_msvc_compat.h (new)"
-      },
-      {
-        "id": "remeshing-memory-edits",
-        "file": "cumesh/remeshing.py (replaced by remeshing_pixal3d.py)"
+        "file": "pyproject.toml",
+        "commit": "the fork's a04452a (kept as it is)"
       },
       {
         "id": "local-version",
-        "file": "pyproject.toml"
+        "file": "pyproject.toml",
+        "commit": "Version 0.0.1.post4+cu128torch2.8; README: the Windows wheel build"
+      },
+      {
+        "id": "gitignore-vs",
+        "file": ".gitignore",
+        "commit": "the fork's b9ab99b (kept as it is)"
+      },
+      {
+        "id": "gitmodules-eigen",
+        "file": ".gitmodules",
+        "commit": "cubvh: vendored at ce92267 instead of a submodule"
+      },
+      {
+        "id": "cubvh-build-without-the-gil",
+        "file": "third_party/cubvh/src/bindings.cpp",
+        "commit": "cubvh: build the tree without Python's lock"
+      },
+      {
+        "id": "cubvh-tree-upload-release",
+        "file": "third_party/cubvh/include/gpu/bvh.cuh",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-tree-build-without-upload",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-api-upload-release",
+        "file": "third_party/cubvh/include/gpu/api_gpu.h",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-impl-mutex-include",
+        "file": "third_party/cubvh/src/api_gpu.cu",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-impl-upload-flag",
+        "file": "third_party/cubvh/src/api_gpu.cu",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-impl-build-without-upload",
+        "file": "third_party/cubvh/src/api_gpu.cu",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-impl-upload-release",
+        "file": "third_party/cubvh/src/api_gpu.cu",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-impl-lazy-upload",
+        "file": "third_party/cubvh/src/api_gpu.cu",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-impl-state-and-factory",
+        "file": "third_party/cubvh/src/api_gpu.cu",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-bindings-upload-release",
+        "file": "third_party/cubvh/src/bindings.cpp",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-bindings-create-upload-arg",
+        "file": "third_party/cubvh/src/bindings.cpp",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "bvh-py-upload-arg",
+        "file": "cumesh/bvh.py",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "bvh-py-upload-release",
+        "file": "cumesh/bvh.py",
+        "commit": "cubvh: the card copy of the tree on demand"
+      },
+      {
+        "id": "cubvh-ray-intersect-any",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: the ray-stab's inside test with an any-hit traversal"
+      },
+      {
+        "id": "cubvh-raystab-any-hit",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: the ray-stab's inside test with an any-hit traversal"
+      },
+      {
+        "id": "connectivity-get-edges-lean",
+        "file": "src/connectivity.cu",
+        "commit": "fill_holes' chain in less card memory"
+      },
+      {
+        "id": "connectivity-boundaries-exact",
+        "file": "src/connectivity.cu",
+        "commit": "fill_holes' chain in less card memory"
+      },
+      {
+        "id": "connectivity-manifold-boundary-verts-exact",
+        "file": "src/connectivity.cu",
+        "commit": "fill_holes' chain in less card memory"
+      },
+      {
+        "id": "clean-up-fill-holes-free-tables-first",
+        "file": "src/clean_up.cu",
+        "commit": "fill_holes' chain in less card memory"
+      },
+      {
+        "id": "remeshing-grid-bvh-chunks",
+        "file": "cumesh/remeshing.py",
+        "commit": "remeshing: Pixal3D's memory edits, without the chunked grid expansion"
+      },
+      {
+        "id": "remeshing-vertex-bvh-chunks",
+        "file": "cumesh/remeshing.py",
+        "commit": "remeshing: Pixal3D's memory edits, without the chunked grid expansion"
+      },
+      {
+        "id": "remeshing-free-after-dual-contouring",
+        "file": "cumesh/remeshing.py",
+        "commit": "remeshing: Pixal3D's memory edits, without the chunked grid expansion"
+      },
+      {
+        "id": "remeshing-free-topology-a",
+        "file": "cumesh/remeshing.py",
+        "commit": "remeshing: Pixal3D's memory edits, without the chunked grid expansion"
+      },
+      {
+        "id": "remeshing-free-topology-b",
+        "file": "cumesh/remeshing.py",
+        "commit": "remeshing: Pixal3D's memory edits, without the chunked grid expansion"
+      },
+      {
+        "id": "remeshing-free-topology-c",
+        "file": "cumesh/remeshing.py",
+        "commit": "remeshing: Pixal3D's memory edits, without the chunked grid expansion"
+      },
+      {
+        "id": "remeshing-free-topology-d",
+        "file": "cumesh/remeshing.py",
+        "commit": "remeshing: Pixal3D's memory edits, without the chunked grid expansion"
       }
-    ]
+    ],
+    "structure": [
+      {
+        "id": "cubvh-vendored",
+        "file": "third_party/cubvh/ (cubvh ce92267's tree as plain files)",
+        "commit": "cubvh: vendored at ce92267 instead of a submodule"
+      },
+      {
+        "id": "eigen-submodule",
+        "file": "third_party/cubvh/third_party/eigen (submodule link at eigen e63d9f6cc)",
+        "commit": "cubvh: vendored at ce92267 instead of a submodule"
+      }
+    ],
+    "dropped_since_post3": {
+      "setup-msvc-flags": "upstream's setup.py has its own Windows flags since f149d59 (/O2 /std:c++17 and more)",
+      "setup-ext-C-flags": "as setup-msvc-flags",
+      "setup-ext-cubvh-flags": "as setup-msvc-flags; the cubvh include of src/ was for the ssize_t header only",
+      "setup-ext-xatlas-flags": "as setup-msvc-flags",
+      "ext-ssize_t": "CuMesh's own sources never use ssize_t; the need was cubvh's api_cpu.h, fixed in cubvh a3d8d25",
+      "cubvh-bindings-ssize_t": "cubvh a3d8d25 uses py::ssize_t",
+      "msvc-compat-header": "as ext-ssize_t",
+      "atlas-cub-sum-for-cuda-12.8": "upstream f149d59/063a714 moved the #if out of the macro's arguments",
+      "connectivity-free-manifold-vert-idx": "upstream 4843631 frees the list (after a stream sync)",
+      "remeshing-memory-edits": "the whole-file copy of remeshing_pixal3d.py is now the three remeshing-* hunks"
+    }
   },
   "python": "CPython 3.11.9 (spellcast3d tools/python), throw-away build venv",
   "torch_at_build": "2.8.0+cu128 (CUDA 12.8) from code\\venvs\\pixal3d via a .pth (not installed/modified)",
@@ -207,7 +267,7 @@
   "pyds": [
     "cumesh/_C.cp311-win_amd64.pyd",
     "cumesh/_cubvh.cp311-win_amd64.pyd",
-    "cumesh/_xatlas.cp311-win_amd64.pyd"
+    "cumesh/_cumesh_xatlas.cp311-win_amd64.pyd"
   ],
   "pyd_dll_imports": {
     "_C.cp311-win_amd64.pyd": [
@@ -215,6 +275,7 @@
       "torch_cpu.dll",
       "torch_python.dll",
       "cudart64_12.dll",
+      "c10_cuda.dll",
       "MSVCP140.dll",
       "python311.dll",
       "KERNEL32.dll",
@@ -245,7 +306,7 @@
       "api-ms-win-crt-math-l1-1-0.dll",
       "api-ms-win-crt-stdio-l1-1-0.dll"
     ],
-    "_xatlas.cp311-win_amd64.pyd": [
+    "_cumesh_xatlas.cp311-win_amd64.pyd": [
       "c10.dll",
       "torch_cpu.dll",
       "torch_python.dll",
@@ -285,7 +346,7 @@
   },
   "wheel_files": 13,
   "wheel_license_files": [
-    "cumesh-0.0.1.post3+cu128torch2.8.dist-info/licenses/LICENSE"
+    "cumesh-0.0.1.post4+cu128torch2.8.dist-info/licenses/LICENSE"
   ],
-  "build_log": "release\\cache\\wheels\\logs-post3\\cumesh-build.log"
+  "build_log": "release\\cache\\wheels\\logs-post4\\cumesh-build.log"
 }
