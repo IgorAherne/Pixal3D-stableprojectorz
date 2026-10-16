@@ -819,6 +819,9 @@ def sparse_cat(inputs: List[SparseTensor], dim: int = 0) -> SparseTensor:
         output = SparseTensor(
             coords=coords,
             feats=feats,
+            # the batch size is known (the inputs' shapes): without it the tensor would read it off the card,
+            # a host sync in every pass that concatenates (the texture flow's concat_cond)
+            shape=torch.Size([start] + list(feats.shape[1:])),
         )
     else:
         feats = torch.cat([input.feats for input in inputs], dim=dim)
