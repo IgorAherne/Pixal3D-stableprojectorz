@@ -1162,10 +1162,11 @@ class PropStore:
 
 
 def _small_size(value: Any) -> int:
-    """Roughly the bytes of a small item (for stats): a dict's tensors, a picture's pixels."""
+    """Roughly the bytes of a small item (for stats): a dict's tensors (those of the dicts in it too: a view
+    bundle's pictures), a picture's pixels."""
     if isinstance(value, dict):
-        return sum(entry.numel() * entry.element_size() for entry in value.values()
-                   if isinstance(entry, torch.Tensor))
+        return sum(entry.numel() * entry.element_size() if isinstance(entry, torch.Tensor) else _small_size(entry)
+                   for entry in value.values() if isinstance(entry, (torch.Tensor, dict)))
     size, bands = getattr(value, "size", None), getattr(value, "getbands", None)
     if callable(bands) and isinstance(size, tuple) and len(size) == 2:
         return size[0] * size[1] * len(bands())

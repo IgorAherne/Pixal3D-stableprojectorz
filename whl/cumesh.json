@@ -1,9 +1,9 @@
 {
-  "wheel": "cumesh-0.0.1.post2+cu128torch2.8-cp311-cp311-win_amd64.whl",
-  "sha256": "8603ecabbfba07e16da93bc53b1de497364f8fdbb8ad68086c711108d191962b",
-  "size_bytes": 13721787,
-  "built": "2026-10-15T16:49:14+00:00",
-  "build_seconds": 500,
+  "wheel": "cumesh-0.0.1.post3+cu128torch2.8-cp311-cp311-win_amd64.whl",
+  "sha256": "724cd15e800db4d789a6c94a9c2616b3db5c959361eb2a0737f6319b10f953b4",
+  "size_bytes": 13723743,
+  "built": "2026-10-15T21:41:26+00:00",
+  "build_seconds": 533,
   "sources": {
     "cumesh": {
       "repo": "https://github.com/JeffreyXiang/CuMesh.git",
@@ -28,7 +28,7 @@
   "patches": {
     "script": "code/release/wheels/cumesh/patch_cumesh_win.py",
     "applied_to": "clean `git archive` exports of the pinned commits (the clones stay untouched)",
-    "why": "MSVC 2022 + CUDA 12.8 build (ssize_t, compiler flags, no torch pin), Pixal3D's memory edits of remeshing.py (the wheel the fork shipped: chunked BVH queries and frees, value-neutral), cuBVH's build without Python's lock (create_cuBVH: py::call_guard<py::gil_scoped_release>), cuBVH's card copy on demand (create_cuBVH(..., upload=False) builds on the CPU only; upload(), release_device(), on_device; the queries upload first; the tree's construction unchanged), get_manifold_boundary_adjacency's leak of 4 bytes per vertex mended (a cudaFree), and fill_holes' chain in less card memory with the same tables bit for bit (get_edges: a DoubleBuffer sort, outputs of their exact length, its scratch freed; get_boundary_info and get_manifold_boundary_adjacency: counting iterators and exact outputs; fill_holes: the tables it no longer reads freed before the mesh buffers are extended)",
+    "why": "MSVC 2022 + CUDA 12.8 build (ssize_t, compiler flags, no torch pin), Pixal3D's memory edits of remeshing.py (the wheel the fork shipped: chunked BVH queries and frees, value-neutral), cuBVH's build without Python's lock (create_cuBVH: py::call_guard<py::gil_scoped_release>), cuBVH's card copy on demand (create_cuBVH(..., upload=False) builds on the CPU only; upload(), release_device(), on_device; the queries upload first; the tree's construction unchanged), get_manifold_boundary_adjacency's leak of 4 bytes per vertex mended (a cudaFree), fill_holes' chain in less card memory with the same tables bit for bit (get_edges: a DoubleBuffer sort, outputs of their exact length, its scratch freed; get_boundary_info and get_manifold_boundary_adjacency: counting iterators and exact outputs; fill_holes: the tables it no longer reads freed before the mesh buffers are extended), and the ray-stab's inside test (signed_distance mode raystab) with an any-hit traversal: ray_intersect_any stops at the first hit and accepts a hit and prunes a box exactly as ray_intersect does before its first hit (t < MAX_DIST, entry distance < MAX_DIST, the same escape-link fallback), boxes wholly behind the ray's origin visited last; the same verdicts bit for bit; ray_intersect and the other queries untouched",
     "hunks": [
       {
         "id": "pyproject-no-torch-pin",
@@ -137,6 +137,14 @@
       {
         "id": "clean-up-fill-holes-free-tables-first",
         "file": "src/clean_up.cu"
+      },
+      {
+        "id": "cubvh-ray-intersect-any",
+        "file": "third_party/cubvh/src/bvh.cu"
+      },
+      {
+        "id": "cubvh-raystab-any-hit",
+        "file": "third_party/cubvh/src/bvh.cu"
       },
       {
         "id": "msvc-compat-header",
@@ -277,7 +285,7 @@
   },
   "wheel_files": 13,
   "wheel_license_files": [
-    "cumesh-0.0.1.post2+cu128torch2.8.dist-info/licenses/LICENSE"
+    "cumesh-0.0.1.post3+cu128torch2.8.dist-info/licenses/LICENSE"
   ],
-  "build_log": "release\\cache\\wheels\\logs-post2\\cumesh-build.log"
+  "build_log": "release\\cache\\wheels\\logs-post3\\cumesh-build.log"
 }

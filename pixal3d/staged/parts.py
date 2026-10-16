@@ -68,6 +68,8 @@ ENTER = {
 }
 LAZY = {"cutout": ("rembg",), "finish": ("shape_dec", "tex_dec")}
 LIGHT = frozenset({"naf"})              # megabytes: reading its file ahead gains nothing
+FIRST_NETWORK = LAZY["cutout"][0]       # what a batch loads first: read ahead when the engine is made, and after a
+#                                         batch's last network for the next batch (engine.py, runner._read_next_batch)
 
 # Large store items: what a part takes (the runner asks the store for the next prop's ahead of time), what it puts,
 # and what nobody reads once the part is done.
@@ -76,8 +78,8 @@ WANTS = {"ss": ("cond_ss",), "cond_lr": ("dino512",), "lr": ("cond_lr",), "cond_
 PRODUCES = {"features": ("dino512", "dino1024", "cond_ss"), "cond_lr": ("cond_lr",),
             "cond_hr": ("cond_hr", "cond_tex")}
 SPENT = {"ss": ("cond_ss",), "cond_lr": ("dino512",), "lr": ("cond_lr", "rng_ss"),
-         "upsample": ("coords_ss", "lr_slat"), "cond_hr": ("dino1024", "prep"), "hr": ("cond_hr", "rng_lr"),
-         "tex": ("cond_tex", "rng_hr")}
+         "upsample": ("coords_ss", "lr_slat"), "cond_hr": ("dino1024", "prep", "bundle"),
+         "hr": ("cond_hr", "rng_lr"), "tex": ("cond_tex", "rng_hr")}
 
 # What the end of a prop needs, as measured on an RTX 3060 over the captured reference cases and the bulky prop
 # (code/logs/profiling/pixal3d-lowmem/staged in Spellcast3D). The decoders: the weights of one; what a decode
@@ -124,6 +126,8 @@ SAMPLER_SLACK = 1.25
 HOOK_RAM_BASE_MIB = 1_500
 HOOK_RAM_MIB_PER_MVOXEL = 200
 RAM_FLOOR_MIB = 1_500               # what must stay available to Windows and the hub beside the hook's own need
+BUNDLE_RAM_MIB = RAM_FLOOR_MIB + HOOK_RAM_BASE_MIB     # RAM that must stay available beside a multi-view prop's
+#                                                       view bundle for it to be kept from `features` to `cond_hr`
 # `cond_hr` makes the shape and the texture conditionings together (proj_cond.cond_tokens_pair: NAF's image encoder
 # once per view instead of twice, about 0.36 s a view), for every prop: a multi-view prop adds each view into the
 # two float32 sums in place, so at its widest moment it holds the two sums and no copy of a view, and it passes
@@ -140,6 +144,101 @@ RAM_FLOOR_MIB = 1_500               # what must stay available to Windows and th
 HOLD_BESIDE_MIB = 3_000
 HOLD_SLACK_MIB = 512
 HOLD_RAM_FACTOR = 2
+
+# The paired texture and finish (runner._pair) take the texture network off the card before each decode and read it
+# again for the next prop, and load both decoders again for every prop (0.8-1.4 s of reading and trimming a prop at
+# 1536). Where the card has room for it they stay instead (pair_keep): the texture network through a prop's finish,
+# when another prop of the group follows, and both decoders from one prop's finish to the next, when there is room
+# for that as well. Room is judged against the caps the finish will set, with every margin the finish takes itself:
+# its decode with both decoders (decoders_fit's), the closing of the holes beside what is kept (finish_mib's), the
+# finish hook's GPU steps beside it (their native reserve, glb_reserve, the largest of this prop's and of the props
+# in their steps, and what they allocate through PyTorch, HOOK_TORCH_MIB, within what the hook's cap leaves the
+# card), and the next prop's texture sampler beside the decoders (sampler_mib, under the cap in force).
+FACES_PER_VOXEL = 2.2               # faces of a decoded mesh per voxel of its shape (2.0-2.2 measured), for the
+#                                     hook's reserve of a mesh that is not decoded yet
+HOOK_TORCH_MIB = 1_500              # what Spellcast3D's GLB GPU steps reserve through PyTorch at the default texture
+#                                     size of 2048 (measured: geometry 1,034-1,444 MiB, bake 1,068-1,234 on the
+#                                     golden mv1024 / sv1536 meshes; 2,454-2,498 for the bake at 4096): the figure
+#                                     where the hook says nothing. A hook that knows its texture size says it
+#                                     (Hooks.gpu_torch_mib(req), hook_torch_mib below), so a larger texture keeps
+#                                     less rather than running out of memory beside what is kept (that would only
+#                                     cost the step a second run with it gone, runner._after_failure)
+
+# The decoders give their cache back level by level (decoder.lean: an empty_cache between the levels, the
+# results moved through RAM once to leave the card unfragmented) only where the decode needs it. Without it a
+# decode reserves more than it allocates - measured with no cap (check_decode.py --no-trim, RTX 3060): on whole
+# tables 2.07 / 2.04 times (sv1024: 6,302 / 6,460 MiB reserved for 3,038 / 3,171 allocated, shape / texture), in
+# boxes of 2 M voxels 1.27 / 1.23 times (sv1536: 2,476 / 3,354 for 1,943 / 2,724) - and saves 0.2 s a decoder
+# (sv1024 5.20 -> 4.81 s for both, sv1536's texture 5.14 -> 4.75 s), the same values both ways (12 of 12
+# comparisons each). Where that reserve, with the margin decoders_fit takes, does not fit the room the cap leaves,
+# the lean form is used (lean_needed), and always on the ladder's tight rung.
+UNLEAN_WHOLE = 2.1
+UNLEAN_BOXES = 1.3
+
+
+def hook_torch_mib(hooks: Any, req: Any) -> int:
+    """MiB the finish hook's GPU steps reserve through PyTorch for `req`: what the hook says
+    (`gpu_torch_mib(req)`, when it has the method and answers a number), else HOOK_TORCH_MIB."""
+    ask = getattr(hooks, "gpu_torch_mib", None)
+    if ask is None:
+        return HOOK_TORCH_MIB
+    try:
+        return max(int(ask(req)), 0)
+    except Exception:
+        return HOOK_TORCH_MIB
+
+
+def pair_keep(ctx: PartContext, prop: PropState, following: PropState, natives: list) -> frozenset:
+    """The networks that may stay on the card through `prop`'s finish in the paired texture and finish, so that
+    `following` (the next prop of the group) does not load them again: its texture network, and both decoders after
+    the finish when there is room for them as well; nothing where the card cannot be judged (a CPU run, no cap).
+    `natives`: the native reserves of the props in their finish steps, whose GPU steps run beside what is kept.
+    The texture network stays only when, with it on the card, the decode with both decoders fits under the cap the
+    finish will set (with decoders_fit's margin), the closing of the holes beside it does, and so do the finish
+    steps: their native reserve (glb_reserve of the faces the voxels foresee, or a larger one of a prop in its
+    steps) and HOOK_TORCH_MIB within what the hook's cap leaves the card (the finish cap and its native reserve);
+    the decoders stay only when, beside it, the holes and the steps fit as well and the next prop's texture sampler
+    (sampler_mib) fits beside them under the cap in force."""
+    loader = ctx.loader
+    size_of = getattr(loader, "size_mib", None)
+    headroom = loader.headroom_mib() if hasattr(loader, "headroom_mib") else None
+    limits = card_limits(ctx)
+    flow = f"tex_flow.{prop.kind}"
+    if size_of is None or headroom is None or limits is None or loader.get(flow) is None:
+        return frozenset()
+    flow_mib = size_of(flow)
+    try:
+        voxels = decode_voxels(ctx.store.get_small(prop.id, "coords_hr"))
+        tokens = int(ctx.store.get_small(following.id, "coords_hr")["coords"].shape[0])
+    except Exception:
+        return frozenset()
+    if not flow_mib:
+        return frozenset()
+    finish_limit, cap_now = limits
+    budget = finish_limit / 1.1
+    decoders_mib = sum(size_of(name) or DECODER_MIB for name in LAZY["finish"])
+    # the hook's cap leaves FINISH_SAFETY_MIB of the card free: what the decode's cap does, less its native reserve
+    steps = (max([glb_reserve(int(FACES_PER_VOXEL * voxels)), *[int(mib) for mib in natives]])
+             + hook_torch_mib(getattr(ctx, "hooks", None), prop.req))
+    steps_room = finish_limit + NATIVE_RESERVE["finish"]
+
+    def fits(decoders: bool) -> bool:
+        after = flow_mib + (decoders_mib if decoders else 0)
+        return (flow_mib + decode_mib(voxels, 2, chunk_for(voxels)) <= budget and after + fill_mib(voxels) <= budget
+                and after + steps <= steps_room
+                and (not decoders or sampler_mib(tokens) + decoders_mib <= cap_now))
+
+    if fits(decoders=True):
+        return frozenset({flow, *LAZY["finish"]})
+    return frozenset({flow}) if fits(decoders=False) else frozenset()
+
+
+def lean_needed(voxels: int, decoders: int, chunk: int, room_mib: float) -> bool:
+    """Must a decode of `voxels` voxels with `decoders` decoders on the card give its cache back level by level
+    (decoder.lean) to fit `room_mib` (the cap less what else is kept on the card)? A CPU run (no room known) needs
+    nothing."""
+    factor = UNLEAN_BOXES if chunk else UNLEAN_WHOLE
+    return room_mib > 0 and factor * decode_mib(voxels, decoders, chunk) > room_mib / 1.1
 
 
 def pair_order(ctx: PartContext, props: list) -> list:
@@ -283,7 +382,7 @@ def produces(part: str) -> tuple[str, ...]:
 
 
 def discards(part: str, prop: PropState) -> tuple[str, ...]:
-    keys = SPENT.get(part, ())
+    keys = tuple(key for key in SPENT.get(part, ()) if key != "bundle" or prop.bundled)
     if part == "cond_hr":
         keys += tuple(f"image_{index}" for index in range(prop.views))
     return keys
@@ -314,13 +413,22 @@ def _network(ctx: PartContext, name: str) -> Any:
     return module if module is not None else ctx.loader.load(name, ctx.cancelled)
 
 
-def _decoder(ctx: PartContext, name: str, chunk: int = 0) -> Any:
-    """A sparse decoder in its memory-saving form (it gives each level's cache back as soon as the level is done),
-    decoding in boxes of `chunk` fine voxels when `chunk` is given (chunk_for; models/sc_vaes/chunked.py)."""
+def _decoder(ctx: PartContext, name: str, chunk: int = 0, lean: bool = True) -> Any:
+    """A sparse decoder, in its memory-saving form with `lean` (it gives each level's cache back as soon as the
+    level is done: lean_needed says where a decode needs it; the values are the same either way), decoding in
+    boxes of `chunk` fine voxels when `chunk` is given (chunk_for; models/sc_vaes/chunked.py)."""
     decoder = _network(ctx, name)
-    decoder.lean = True
+    decoder.lean = lean
     decoder.chunk_voxels = chunk
     return decoder
+
+
+def _kept_beside(ctx: PartContext) -> int:
+    """MiB of the networks on the card that the finish does not use (what the pair kept there for the next prop)."""
+    size_of = getattr(ctx.loader, "size_mib", None)
+    if size_of is None:
+        return 0
+    return sum(int(size_of(name) or 0) for name in ctx.loader.loaded() if name not in LAZY["finish"])
 
 
 def _proj_cond() -> Any:
@@ -337,14 +445,44 @@ def _decode() -> Any:
 
 def _source(ctx: PartContext, prop: PropState) -> tuple[Any, Any]:
     """The prop's picture(s) as the conditioning functions take them, and its camera. A multi-view prop's bundle
-    (63 MiB of floats for four views) is built again by every part that needs it and never stored."""
+    (47 MiB of floats for three views, 63 for four) is built by the first part that needs it (`features`) and kept
+    in the store as the small item "bundle" for `cond_lr` and `cond_hr` (spent after cond_hr), where the RAM has
+    room for it (BUNDLE_RAM_MIB); where the store has none, the part builds it again: the hook's function of the
+    same pictures and the same views, so the same tensors either way. The part keeps it as its last action
+    (_keep_bundle)."""
     proj_cond = _proj_cond()
-    images = [ctx.store.get_small(prop.id, f"image_{index}") for index in range(prop.views)]
     prep = ctx.store.get_small(prop.id, "prep")
     if prop.req.multi:
-        views = ctx.hooks.bundle(prop.req, images, prep["meta"])
+        if prop.bundled:
+            views = ctx.store.get_small(prop.id, "bundle")
+        else:
+            images = [ctx.store.get_small(prop.id, f"image_{index}") for index in range(prop.views)]
+            views = ctx.hooks.bundle(prop.req, images, prep["meta"])
         return views, proj_cond.Camera.from_bundle(views, ctx.device)
+    images = [ctx.store.get_small(prop.id, f"image_{index}") for index in range(prop.views)]
     return images, proj_cond.Camera.single(prep["camera"], ctx.device)
+
+
+def _keep_bundle(ctx: PartContext, prop: PropState, views: Any) -> None:
+    """Keep a multi-view prop's bundle for the later parts that read it, unless the store has it already or the RAM
+    would keep less than BUNDLE_RAM_MIB beside it."""
+    if not prop.req.multi or prop.bundled or not isinstance(views, dict):
+        return
+    size = _bundle_mib(views)
+    available = ram_available_mib()
+    if available is not None and available - size < BUNDLE_RAM_MIB:
+        return
+    ctx.store.put_small(prop.id, "bundle", views)
+    prop.bundled = True
+
+
+def _bundle_mib(value: Any) -> float:
+    """MiB of the tensors in a bundle (its dicts walked through)."""
+    if isinstance(value, dict):
+        return sum(_bundle_mib(entry) for entry in value.values())
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size() / (1 << 20)
+    return 0.0
 
 
 def _bf16(cond: dict) -> dict:
@@ -434,6 +572,7 @@ def features(ctx: PartContext, prop: PropState, mode: str) -> None:
     ctx.store.put_device(prop.id, "dino512", {"z": z512})
     ctx.store.put_device(prop.id, "dino1024", {"z": z1024})
     ctx.store.put_device(prop.id, "cond_ss", cond)
+    _keep_bundle(ctx, prop, source)
 
 
 def draw_sparse_structure(ctx: PartContext, prop: PropState, mode: str, cond: dict, resolution: int,
@@ -482,6 +621,7 @@ def cond_lr(ctx: PartContext, prop: PropState, mode: str) -> None:
     image = proj_cond.image_tensor(source, 512, ctx.device)
     cond = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["shape_512"], z512, image, naf, view, coords, 32))
     ctx.store.put_device(prop.id, "cond_lr", cond)
+    _keep_bundle(ctx, prop, source)
 
 
 def _shape_latent(ctx: PartContext, prop: PropState, mode: str, part: str, coords_key: str, rng_key: str,
@@ -633,21 +773,26 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None"
     capped = mode != "uncapped"
     voxels = decode_voxels(stored)
 
-    # Phase 1, the decoders. A decoder's weights go onto the card before the latents it decodes.
+    # Phase 1, the decoders. A decoder's weights go onto the card before the latents it decodes. What the pair
+    # keeps beside them for the next prop (its texture network: runner._set_aside, pair_keep) is counted out of
+    # the cap, which counts what is allocated as room; the decoders themselves are in decode_mib.
     limit = loader.set_cap(NATIVE_RESERVE["finish"], safety_mib=FINISH_SAFETY_MIB) if capped else 0
+    room = limit - _kept_beside(ctx) if capped else 0
     chunk = chunk_for(voxels)           # a big shape in boxes: the same mesh, a peak that does not grow with it
-    if capped and finish_mib(voxels / VOXELS_PER_OCCUPIED) > limit:
+    if capped and finish_mib(voxels / VOXELS_PER_OCCUPIED) > room:
         # Hopeless under the cap, even with every margin taken off: an attempt would run out of memory after a
         # minute and leave nothing. Said at once; the ladder lifts the cap when the caller allows a spill.
         raise PropFailed(f"Finishing this shape ({voxels / 1e6:.1f} M voxels) needs about "
                          f"{finish_mib(voxels / VOXELS_PER_OCCUPIED):,.0f} MiB of video memory; the card has "
-                         f"{limit:,} MiB free for it.", "oom")
-    together = mode == "normal" and decoders_fit(voxels, limit)
+                         f"{room:,} MiB free for it.", "oom")
+    together = mode == "normal" and decoders_fit(voxels, room)
+    # The lean form (each level's cache given back at once) where the decode needs it, and on the tight rung
+    lean = mode != "normal" or lean_needed(voxels, 2 if together else 1, chunk, room)
     ctx.check()
     if not together and loader.get("tex_dec") is not None:      # left by an attempt that failed with both loaded
         loader.drop("tex_dec")
     for name in LAZY["finish"] if together else LAZY["finish"][:1]:
-        _decoder(ctx, name, chunk)
+        _decoder(ctx, name, chunk, lean)
     coords = stored["coords"].to(device)
     shape_feats = store.get_small(prop.id, "shape_slat")["feats"].to(device)
     mesh, subs = decode.decode_shape(loader.get("shape_dec"), shape_feats, coords, resolution)
@@ -658,12 +803,16 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None"
         loader.drop("shape_dec")
     ctx.emit(Event("step", "finish", prop.id, 1, 3))
     ctx.check()
-    _decoder(ctx, "tex_dec", chunk)
+    _decoder(ctx, "tex_dec", chunk, lean)
     tex_feats = store.get_small(prop.id, "tex_slat")["feats"].to(device)
     tex_coords, attrs = decode.decode_texture(loader.get("tex_dec"), tex_feats, coords, subs)
     del tex_feats, subs, coords
     tex_coords, attrs = tex_coords.cpu(), attrs.cpu()     # off the card before the holes are closed: cumesh's
-    loader.drop(*(name for name in LAZY["finish"] if loader.get(name) is not None))     # tables need the room
+    gone = [name for name in LAZY["finish"] if loader.get(name) is not None and name not in ctx.hold]
+    if gone:                                            # tables need the room (the decoders stay only where the
+        loader.drop(*gone)                              # pair found room for them beside the holes: ctx.hold)
+    else:
+        loader.trim()
     ctx.emit(Event("step", "finish", prop.id, 2, 3))
     decode.fill_holes(mesh)
     ctx.emit(Event("step", "finish", prop.id, 3, 3))

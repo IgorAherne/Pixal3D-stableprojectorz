@@ -20,8 +20,10 @@ the pipeline's method of that name.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import json
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -39,6 +41,28 @@ FLOWS = {"ss_flow": "sparse_structure_flow_model", "lr_flow": "shape_slat_flow_m
 DECODERS = {"ss_dec": "sparse_structure_decoder", "shape_dec": "shape_slat_decoder", "tex_dec": "tex_slat_decoder"}
 SAMPLERS = {"ss": "sparse_structure_sampler", "shape": "shape_slat_sampler", "tex": "tex_slat_sampler"}
 BUILDERS = ("rembg", "moge", "dino", "naf")
+# Libraries the flows' first pass of a process imports when it first needs them, on the GPU thread inside the first
+# sparse-structure pass (SageAttention's import alone: 0.5-0.8 s); none of them touches the card when imported.
+KERNEL_LIBRARIES = ("triton", "flash_attn")
+
+
+def _import_ahead() -> None:
+    """Import the flows' kernel libraries (and SageAttention's, when the switch is on), on a thread of its own: by
+    the time a batch reaches its first flow they are there. A library that cannot be imported is left to the first
+    pass, which handles it as it did."""
+    names = list(KERNEL_LIBRARIES)
+    try:
+        from ..modules.attention import config
+
+        if config.SAGE:
+            names.append("sageattention")
+    except Exception:       # noqa: BLE001 - the first pass imports what it needs as before
+        pass
+    for name in names:
+        try:
+            importlib.import_module(name)
+        except Exception:   # noqa: BLE001
+            pass
 
 
 def _pipeline_file(path: Path) -> dict:
@@ -77,8 +101,9 @@ def _builder_file(name: str, build: Callable[[str], Any]) -> Path | None:
 class StagedEngine:
     def __init__(self, options: EngineOptions, hooks: Hooks, *, loader_factory: Callable[..., Any] | None = None,
                  store_factory: Callable[..., Any] | None = None):
-        """Reads the pipeline files, tells the loader where the networks lie and builds the samplers. No weights
-        are read and CUDA is not initialised. The two factories replace NetworkLoader and PropStore (tests)."""
+        """Reads the pipeline files, tells the loader where the networks lie, builds the samplers and starts
+        reading the first network's file ahead into the system's file cache. No weights are loaded and CUDA is not
+        initialised. The two factories replace NetworkLoader and PropStore (tests)."""
         self.options = options
         self.hooks = hooks
         self.device = options.device
@@ -104,6 +129,13 @@ class StagedEngine:
         for name in BUILDERS:
             build = options.builders[name]
             self.loader.register_builder(name, build, _builder_file(name, build))
+        # The first network a batch loads (background removal, at its first cut-out: 0.9 GB, read from a cold disk
+        # in the first batch otherwise) is read into the system's file cache now, by the loader's read-ahead
+        # thread; nothing is kept in the process and the card is not touched. The runner does the same after a
+        # batch's last network, for the next batch.
+        self.loader.prefetch(parts.FIRST_NETWORK)
+        if torch.device(options.device).type == "cuda":
+            threading.Thread(target=_import_ahead, name="p3d-import-ahead", daemon=True).start()
 
         self._store: Any = None             # the store, context and event callback of the batch that runs
         self._ctx: PartContext | None = None

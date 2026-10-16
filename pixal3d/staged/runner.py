@@ -123,6 +123,7 @@ class PropState:
     part: str = ""                  # the last part begun
     resumed: bool = False           # its latents came from a checkpoint: only "finish" runs
     views: int = 0                  # pictures the cut-out stored (image_0 ..)
+    bundled: bool = False           # its multi-view bundle is kept in the store (parts._keep_bundle)
     slow: list = field(default_factory=list)        # parts that needed the memory cap lifted
     seconds: float = 0.0            # GPU-thread seconds of its own prop-parts
     resolution: int = 0             # the resolution used, known after "finish"
@@ -173,6 +174,8 @@ class PartContext:
     device: str
     inputs: dict = field(default_factory=dict)      # (prop id, key) -> the device tensors taken from the store
     keep: frozenset = frozenset()   # networks the next group needs: `leave` does not drop them
+    hold: frozenset = frozenset()   # networks the prop-part that runs leaves on the card for the next prop (the
+    #                                 paired finish: both decoders, where plan.pair_keep found room for them)
     entering: str = ""              # the network `enter` is loading
     part: str = ""                  # the part that runs
 
@@ -210,6 +213,9 @@ class StagedRunner:
         self._tails: list[_Tail] = []
         self._worker: concurrent.futures.ThreadPoolExecutor | None = None
         self._wave_now: list[PropState] = []
+        self._extra: set[str] = set()   # networks on the card that the running prop-part does not use, kept there
+        #                                 for a later prop because plan.pair_keep found room (_set_aside); dropped
+        #                                 at any failure, so that a retry finds the card as it would without them
 
     def _modes(self) -> tuple[str, ...]:
         """The ladder: the cap is lifted only where the options allow a spill into shared memory."""
@@ -269,8 +275,11 @@ class StagedRunner:
             self._tails = []
             ctx.inputs.clear()
             ctx.part = ""
+            ctx.hold = frozenset()
+            self._extra = set()
             ctx.loader.drop_all()
-            ctx.loader.prefetch(None)
+            if self._ahead != getattr(self.plan, "FIRST_NETWORK", None):
+                ctx.loader.prefetch(None)       # a read of the next batch's first network goes on (_read_next_batch)
             if ctx.loader.capped():
                 ctx.loader.clear_cap()
             ctx.store.flush()
@@ -374,6 +383,8 @@ class StagedRunner:
                 if group:
                     self._group(index, part, kind, group, done, len(alive))
                     done += len(group)
+            if part == PARTS[-1]:
+                self._read_next_batch(index)
             if self._tails:
                 self._pump_tails(until=lambda: not self._tails)
             ctx.store.flush()
@@ -432,6 +443,7 @@ class StagedRunner:
                 continue
             self._read_ahead(index, first, kind)
             self._want(first, group[0])
+            own = set(self.plan.networks(first, kind))
             for position, prop in enumerate(group):
                 ctx.check()
                 if position + 1 < len(group):
@@ -439,19 +451,26 @@ class StagedRunner:
                 store.pump()
                 if self._tails:
                     self._pump_tails(until=lambda: self._in_flight() < IN_FLIGHT)
+                self._extra -= own                  # a texture network kept beside the last finish is its own again
                 ctx.part = first
                 self._prop_part(first, prop, done_first + position + 1, len(firsts))
                 if prop.over:
                     continue
-                self._set_aside(first, kind, more=position + 1 < len(group))
+                following = next((other for other in group[position + 1:] if not other.over), None)
+                self._set_aside(first, kind, more=position + 1 < len(group), prop=prop, following=following)
                 if not position + 1 < len(group):
                     self._read_ahead(index, first, kind)
                 run_last(prop)
+                kept = [name for name in ctx.hold if ctx.loader.get(name) is not None]
+                ctx.hold = frozenset()
+                self._extra |= set(kept)            # the decoders, for the next prop's finish
             done_first += len(group)
             later = self._later(index, last, kind)
             ctx.keep = frozenset(later[0]) if later else frozenset()
             self.plan.leave(ctx, first, kind)
             self.plan.leave(ctx, last, kind)
+            self._extra = {name for name in self._extra if ctx.loader.get(name) is not None}
+        self._read_next_batch(index)
         store.flush()
         ctx.emit(Event("part_end", first))
         if not opened:                              # no prop reached its finish: the bracket still closes below
@@ -476,18 +495,63 @@ class StagedRunner:
             return group
         return ordered if sorted(map(id, ordered)) == sorted(map(id, group)) else group
 
-    def _set_aside(self, part: str, kind: str, more: bool) -> None:
+    def _set_aside(self, part: str, kind: str, more: bool, prop: PropState | None = None,
+                   following: PropState | None = None) -> None:
         """Before a prop's finish in a pair: the part's networks leave the card (with `more` props of the group to
         come, its file is read ahead again meanwhile), and what the store uploaded ahead for the next prop goes
-        back to its slot, so the decode has the whole card."""
-        loader = self.ctx.loader
-        held = [name for name in self.plan.networks(part, kind) if loader.get(name) is not None]
+        back to its slot, so the decode has the whole card - unless the plan finds room for them beside everything
+        the finish and the next prop's texture need (plan.pair_keep, with `following` the prop that comes next):
+        then the texture network stays (it is not read again for `following`), and when there is room for that as
+        well, so do both decoders after the finish (ctx.hold: not loaded again for `following`'s finish)."""
+        ctx, loader = self.ctx, self.ctx.loader
+        own = self.plan.networks(part, kind)
+        keep = self._keeps(prop, following) if more and prop is not None and following is not None else frozenset()
+        held = [name for name in own if loader.get(name) is not None and name not in keep]
         if held:
             loader.drop(*held)
             if more and held[0] not in self.plan.LIGHT:
                 self._ahead = held[0]
                 loader.prefetch(held[0])
-        self.ctx.store.pump(upload=False)
+        ctx.store.pump(upload=False)
+        self._extra = {name for name in keep if name in own and loader.get(name) is not None}
+        ctx.hold = frozenset(name for name in keep if name not in own)
+
+    def _keeps(self, prop: PropState, following: PropState) -> frozenset:
+        """What may stay on the card through `prop`'s finish for `following` (plan.pair_keep): nothing where the
+        plan has no such rule or cannot tell."""
+        rule = getattr(self.plan, "pair_keep", None)
+        if rule is None:
+            return frozenset()
+        natives = [int(tail.steps.native_mib or 0) for tail in self._tails]
+        try:
+            return frozenset(rule(self.ctx, prop, following, natives))
+        except Exception:
+            return frozenset()
+
+    def _drop_extra(self) -> None:
+        """The networks kept for a later prop leave the card (a failure: the retry, or the next prop, finds the card
+        as it would without them), and the running part keeps nothing for the next prop."""
+        loader = self.ctx.loader
+        names = [name for name in self._extra if loader.get(name) is not None]
+        self._extra = set()
+        self.ctx.hold = frozenset()
+        if names:
+            loader.drop(*names)
+
+    def _extra_mib(self) -> int:
+        """MiB the networks kept for a later prop take on the card (those a part leaves for the next prop too)."""
+        size = getattr(self.ctx.loader, "size_mib", None)
+        if size is None:
+            return 0
+        return sum(int(size(name) or 0) for name in {*self._extra, *self.ctx.hold})
+
+    def _read_next_batch(self, index: int) -> None:
+        """The batch's last network has been read: the first one a batch loads (plan.FIRST_NETWORK, background
+        removal) is read into the system's file cache for the next batch, while the last props' steps run."""
+        first = getattr(self.plan, "FIRST_NETWORK", None)
+        if first and index == len(self.waves) - 1 and self._ahead != first and self.ctx.loader.get(first) is None:
+            self._ahead = first
+            self.ctx.loader.prefetch(first)
 
     def _later(self, index: int, part: str, kind: str) -> list[tuple[str, ...]]:
         """The networks of every group that runs after (part, kind) of wave `index`, group by group: the rest of
@@ -588,8 +652,10 @@ class StagedRunner:
 
     def _after_failure(self, failure: tuple[str, str, str]) -> None:
         """Between two attempts of the ladder: the cache given back, what went ahead for the next prop too, and
-        the card probed when the failure's words say its context may be gone."""
+        the card probed when the failure's words say its context may be gone. What was kept on the card for a later
+        prop goes first: the retry gets the card it would have had without it."""
         loader = self.ctx.loader
+        self._drop_extra()
         loader.trim()
         self.ctx.store.pump(upload=False)       # the next prop's inputs went ahead; the retry needs the room
         if failure[0] == "oom" and self._let_go():
@@ -765,7 +831,7 @@ class StagedRunner:
         if room is None:
             return 0
         pending = [prop for prop in self._alive("finish", self._wave_now) if prop.part != "finish"]
-        held = sum(self._holding(other) for other in self._tails if other is not tail)
+        held = sum(self._holding(other) for other in self._tails if other is not tail) + self._extra_mib()
         try:
             return int(room(self.ctx, pending, held))
         except Exception:
@@ -841,6 +907,7 @@ class StagedRunner:
         if trace:
             print(trace, flush=True)
         self.ctx.store.close_prop(prop.id)
+        self._drop_extra()
         self.ctx.loader.trim()
         prop.state = "failed"
         prop.error = {"kind": kind, "detail": detail}

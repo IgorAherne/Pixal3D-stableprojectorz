@@ -119,6 +119,9 @@ class Hooks(Protocol):
         """Around the work of one prop in `part` (today only "ss"): yields a dict the hook has filled when the
         block is left; the engine keeps it with the prop's notes."""
 
+    # Optional: `gpu_torch_mib(req) -> int`, the MiB the finish's GPU steps reserve through PyTorch for this prop
+    # (by its texture size); the engine keeps networks on a big card only where that fits beside them
+    # (parts.pair_keep, HOOK_TORCH_MIB where the hook says nothing).
     def finish(self, req: PropRequest, mesh: DecodedMesh, notes: dict) -> "dict | FinishSteps":
         """Write the prop's file from the decoded mesh. Returns what the result carries beside the engine's own
         keys - or a FinishSteps, the rest of the work as steps, so that its CPU-only steps run on the engine's

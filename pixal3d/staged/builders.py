@@ -25,8 +25,9 @@ from __future__ import annotations
 import functools
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
+import os
 import torch
 import torch.nn as nn
 
@@ -82,7 +83,37 @@ class Matte(nn.Module):
     def forward(self, image: Any) -> Any:
         from ..pipelines.rembg.BiRefNet import BiRefNet
 
+        if matte_fp16(next(self.model.parameters()).device):
+            with torch.autocast("cuda", dtype=torch.float16):
+                return BiRefNet.__call__(self, image)
         return BiRefNet.__call__(self, image)
+
+
+# PIXAL3D_MATTE_FP16: the background removal (BiRefNet, RMBG-2.0) under float16 autocast - "auto" (unset): on where
+# the card runs fp16 at full speed (sm_75 and newer; a GTX 10xx keeps float32), "on" / "off" force it. Measured
+# (round G inventory, the boy's front view): 0.58 -> 0.35 s a view (-40 %, about -3 s of a five-prop batch); the
+# matte's map within 1.2e-4 relative L2 of float32 (max 5e-3), the final 8-bit alpha one or two levels off on 24 %
+# of the pixels - a cut-out of the same quality, not the same bytes: the golden checks set it off
+# (p3d_checks/common.py).
+MATTE_FP16 = os.environ.get("PIXAL3D_MATTE_FP16", "auto").strip().lower()
+_matte_fp16_on: Optional[bool] = None
+FP16_FAST_FROM = (7, 5)
+
+
+def matte_fp16(device: torch.device) -> bool:
+    """Whether the matte runs under float16 autocast on `device`, by the switch and the card."""
+    global _matte_fp16_on
+    if _matte_fp16_on is None:
+        if MATTE_FP16 in ("1", "on", "true", "yes"):
+            _matte_fp16_on = True
+        elif MATTE_FP16 in ("0", "off", "false", "no"):
+            _matte_fp16_on = False
+        else:
+            try:
+                _matte_fp16_on = device.type == "cuda" and torch.cuda.get_device_capability(device) >= FP16_FAST_FROM
+            except Exception:       # noqa: BLE001 - a card that cannot be asked keeps float32
+                _matte_fp16_on = False
+    return _matte_fp16_on
 
 
 def _present(path: str, what: str) -> str:

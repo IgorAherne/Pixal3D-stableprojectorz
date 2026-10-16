@@ -21,6 +21,7 @@ from pixal3d.staged.builders import default_builders, default_paths
 options = EngineOptions(pipeline_dir=snapshot,                       # pipeline.json, pipeline_mv.json, ckpts/
                         builders=default_builders(default_paths(models_root)))
 engine = StagedEngine(options, hooks)                                # reads two JSON files; loads nothing
+                                                                     # (reads background removal's file ahead)
 
 requests = [PropRequest(id="chair", seed=11, resolution=1024, multi=False,
                         sampler_params={"ss": {...}, "shape": {...}, "tex": {...}})]
@@ -58,7 +59,7 @@ on the GPU thread; each may raise `PropFailed(detail, kind)` to fail its prop:
 |---|---|---|
 | `prepare(req, matte)` | part `cutout` | `Prepared(images, meta)`: single view `[RGB picture]`, cut out and framed; multi-view the framed RGBA views, front first. `matte(rgb picture)` is background removal on the card; its network is loaded the first time it is called |
 | `camera(req, image, moge)` | part `camera`, single-view props | `{"camera_angle_x", "distance", "mesh_scale"}` as Python floats |
-| `bundle(req, images, meta)` | parts `features`, `cond_lr`, `cond_hr`, multi-view props | the views dict of `run_mv` (`images` at 512 and 1024, `camera_angle_x`, `camera_distance`, `transform_matrix`, `mesh_scale`) |
+| `bundle(req, images, meta)` | part `features` (again in `cond_lr` / `cond_hr` only where the RAM had no room to keep it), multi-view props | the views dict of `run_mv` (`images` at 512 and 1024, `camera_angle_x`, `camera_distance`, `transform_matrix`, `mesh_scale`) |
 | `prop_scope(req, "ss")` | around the sparse-structure stage | a context manager yielding a dict the hook has filled when the block is left; it becomes part of the prop's notes |
 | `finish(req, mesh, notes)` | part `finish` | writes the prop's file from the `DecodedMesh` (four CPU tensors) and returns what the result should carry - or a `FinishSteps` (below) |
 
@@ -147,10 +148,15 @@ The two last parts go prop by prop (`EngineOptions.paired_finish`, on by default
 to its finish as soon as its texture is sampled, instead of after every prop's texture. The CPU work of its finish
 steps (the BVH, the UV unwrap, the file) then runs on the worker threads while the next prop's texture is sampled -
 a minute and more at 1536 - rather than only while the next prop is decoded, and only the last prop's steps are left
-with nothing to hide under. The texture network leaves the card before each decode (the decode needs the room,
-and the cap `finish` sets counts what is allocated as room) and is read again for the next prop, from the file
-cache in most cases (its file is read ahead again meanwhile); what the store sent ahead for the next prop's
-texture goes back to its slot for the decode. Props resumed from a checkpoint, which run `finish` alone, go
+with nothing to hide under. What the store sent ahead for the next prop's texture goes back to its slot for the
+decode. Where the card has room (`parts.pair_keep`, below), the texture network stays on the card through a prop's
+decode and its finish steps when another prop of the group follows, and both decoders stay from that prop's finish
+to the next one's when there is room for them as well: neither is read again for the next prop. Elsewhere - a card
+of 8 GB, the last prop of a group - the texture network leaves the card before the decode (the decode needs the
+room, and the cap `finish` sets counts what is allocated as room) and is read again for the next prop, from the
+file cache in most cases (its file is read ahead again meanwhile), and the decoders are loaded for every prop, as
+before. Whatever is kept for the next prop leaves the card at any failure, before the retry: the ladder's next rung
+finds the card as it would have without it. Props resumed from a checkpoint, which run `finish` alone, go
 first in their kind. The events are those of the two parts with overlapping brackets: `tex` opens before its
 first prop, `finish` before its first prop, `tex` closes after its last prop, `finish` after the last prop's steps
 are over. A process that dies in a prop's finish leaves that prop's checkpoint alone: the props after it have not
@@ -181,6 +187,15 @@ samplers amplify into a different sample of the same quality (Chamfer distance 0
 diagonal on the five test props, the class of the fused kernels' own change). The cross-attention (5 context tokens)
 and every other call keep their backend.
 
+DINOv3 (part `features`) runs under float16 autocast on cards from sm_75 up (`proj_cond.dino_fp16`, switch
+`PIXAL3D_DINO_FP16` auto/on/off; a GTX 10xx keeps float32, where fp16 is slow): the features part 3.6x faster
+(18.7 -> 9.1 s of a five-prop batch at 1536), the tokens within 7e-4 relative L2 of float32, a different sample of
+the same quality (Chamfer 0.16-0.24 % of the bounding-box diagonal on the five test props, the class of the fused
+kernels' and SageAttention's changes); off = the float32 tokens, bit for bit the numbers of before. The background
+removal (part `cutout`, BiRefNet) runs under float16 autocast on the same cards (`builders.matte_fp16`, switch
+`PIXAL3D_MATTE_FP16` auto/on/off): 0.58 -> 0.35 s a view, the 8-bit alpha one or two levels off on a quarter of the
+pixels - a cut-out of the same quality, not the same bytes.
+
 A part function is `fn(ctx, prop, mode)` in `parts.py`. It reads from the batch's store, computes, and writes its
 results **as its last actions**, so an attempt that failed has changed nothing.
 
@@ -201,7 +216,10 @@ Everything a prop needs later lies in the batch's `PropStore`, under the prop's 
 | checkpoint | `coords`, `res`, `shape_slat`, `tex_slat` and the notes, on disk: what a restarted batch resumes from |
 
 Conditionings are stored in bfloat16, cast on the card with `.type(torch.bfloat16)`: the cast the denoisers make
-of them in every pass. Items are thrown away as soon as their last reader is done (`parts.SPENT`).
+of them in every pass. Items are thrown away as soon as their last reader is done (`parts.SPENT`). A multi-view
+prop's view bundle (`hooks.bundle`: 47 MiB for three views) is built by `features` and kept as the small item
+`bundle` for `cond_lr` and `cond_hr` (spent after `cond_hr`), where the RAM keeps `parts.BUNDLE_RAM_MIB` (3,000)
+available beside it; where it does not, each of the three parts builds it again, from the same pictures.
 
 ### Random numbers
 
@@ -251,7 +269,37 @@ figures at the top of `parts.py`, measured on an RTX 3060):
   still lower one there is the closing of the holes of a far bulkier shape, or the RAM.
 - **A finish that cannot fit under the cap is not attempted.** `finish` fails at once with `oom` (an attempt would
   run out of memory after a minute and leave nothing); with `spill=True` the ladder then runs it with the cap
-  lifted, as before.
+  lifted, as before. What the pair keeps on the card beside the decode (the texture network) is counted out of
+  the cap first.
+
+Two rules use the room a big card leaves, and change nothing where it is short:
+
+- **The paired texture and finish keep their networks on the card where it has room** (`parts.pair_keep`, asked
+  by `runner._set_aside` after a prop's texture, when another prop of the group follows). The texture network
+  stays through the prop's finish when, with it on the card, the decode with both decoders fits the cap the finish
+  will set (with `decoders_fit`'s margin), the closing of the holes fits beside it, and the finish steps' GPU steps
+  do within what their cap leaves the card: their native reserve (`glb_reserve` of the faces the voxels foresee -
+  `FACES_PER_VOXEL` 2.2 - or the larger one of a prop in its steps) and what they reserve through PyTorch
+  (`HOOK_TORCH_MIB` 1,500: Spellcast3D's geometry and bake at the default 2048 texture, 1.0-1.4 GB measured; a
+  4096 texture's bake takes 2.5 GB and may then run out of memory once, to run again with what is kept gone);
+  both decoders stay as well when the holes and the steps fit beside them too and the next prop's texture sampler
+  (`sampler_mib`) fits beside them under the cap in force. The sizes are the loaded networks' own
+  (`loader.size_mib`: 2,708 MiB for a texture network, 914 for a decoder). What is kept is counted out of the room a
+  finish step is offered (`tail_room`). On the full RTX 3060 every prop of the test set keeps both; under the caps
+  of a card that leaves Pixal3D 7.2 GiB nothing is kept, as before (a 1536 prop's decode with both decoders beside
+  the texture network needs 7,181 MiB of a 5,749 budget; a 1024 prop's 6,138 of 5,516 under a 7,168 MiB cap).
+  Measured on golden props at 1024 on the full card, the pair's loads went from 14 (8.9 s) to 5 (1.4 s) and its
+  drops from 15 to 6; a prop of the same kind turns round about 1.1 s sooner and decodes 0.4-0.9 s sooner; under a
+  7,168 MiB cap the loads and drops are those of before, and the peaks too (4,116 MiB reserved).
+- **The decoders give their cache back level by level only where the decode needs it** (`parts.lean_needed`):
+  `decoder.lean` (an `empty_cache` between the levels, the results moved through RAM once to leave the card
+  unfragmented) costs about 0.2 s a decoder; without it a decode reserves up to 2.1 times what it allocates on
+  whole tables and 1.3 times in boxes (`UNLEAN_WHOLE`, `UNLEAN_BOXES`, measured with no cap on sv1024 and sv1536),
+  so the lean form is used where that would not fit the cap less what is kept beside it, with `decoders_fit`'s
+  margin, and on the ladder's tight rung. The values are the same either way (`check_decode.py --no-trim`: 12 of 12
+  comparisons on both cases). On the full RTX 3060 no prop of the test set needs it; on a card that leaves
+  Pixal3D 7.2 GiB the bulkiest 1536 props (12.3 M voxels foreseen) and any shape on whole tables keep it, while the
+  golden 1024 props and sv1536 (8.7 M), decoded in boxes, do without. The up-sampling keeps it.
 
 Before the decode in boxes, a bulky prop (41.6k tokens at 1408 by the token cap alone, 16.45 M voxels) was thus
 made at 1024 on a card that leaves Pixal3D 7.2 GiB, inside it, in 299 s - instead of at 1408 in 801 s with 2.6 GB
@@ -265,8 +313,20 @@ tensors. The runner reduces a failure to strings, leaves the `except` block and 
 ## Reading the networks: the copies in the models' dtypes
 
 A part's network is read from disk onto the card when the part starts (`loader.py`): built without weights, its
-file read tensor by tensor through one 64 MiB buffer, each tensor uploaded and cast on the card to the dtype the
-model keeps it in. The four flow checkpoints are stored in float32 (5.4-5.6 GB each), but the models keep 480 of
+file read in file order, each tensor uploaded and cast on the card to the dtype the model keeps it in. Onto the
+card, `loader.READERS` (3) threads read the file at once, `CHUNK_BYTES` (16 MiB) at a time, into slots of
+page-locked RAM - the 64 MiB read buffer and a pool of `POOL_BYTES` (64 MiB) beside it, made at the first load and
+given back by `close()` - and the copies to the card are queued on the stream while the next chunks are read; a
+slot is read into again once an event behind its copies has completed. Every tensor lands in a block of the same
+size, taken in the same order, with the same bytes as the one-buffer way gives it (a tensor larger than the buffer
+assembled in a block of its own, a smaller one that is cast passing through the one block taken for the casts), and
+`cancelled()` is still asked once per tensor. The file cache gives this PC about 11 GB/s whatever the number of
+readers; a flow's 2.8 GB load from the cache takes 0.40-0.47 s instead of 0.71-0.82 s, a third of it the model's
+construction on the meta device. Onto the CPU (tests) the file goes through the one buffer, tensor by tensor. The
+first network a batch loads (background removal) is read into the system's file cache by the read-ahead thread
+when the engine is made, and again after a batch's last network has been loaded, for the next batch (that read is
+left to go on when the batch ends). The four flow checkpoints are stored in float32 (5.4-5.6 GB each), but the
+models keep 480 of
 their 700 tensors, 98.7 % of the bytes, in bfloat16: half of what is read is cast away.
 
 `weights.py` writes, once, a copy of such a checkpoint beside it, `<ckpt>.model-dtypes.safetensors`, with every

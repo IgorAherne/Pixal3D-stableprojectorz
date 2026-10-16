@@ -24,6 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
+import os
 import torch
 import torch.nn as nn
 from torchvision.transforms.functional import normalize
@@ -162,11 +163,46 @@ def image_tensor(images: Union[List, dict], size: int, device) -> torch.Tensor:
     return pictures_to_tensor(images, size).to(device)
 
 
+# PIXAL3D_DINO_FP16: DINOv3's ViT-L under float16 autocast (its matmuls and attention in fp16, the layer norms in
+# fp32; the tokens come out float32 as before). "auto" (unset): on where the card runs fp16 at full speed (sm_75 and
+# newer: tensor cores; a GTX 10xx runs fp16 at 1/64 of its fp32 rate and keeps float32); "on" / "off" force it.
+# Measured (round G inventory on golden mv1024; round H on the five test props at 1536): the features part 3.6x
+# faster (18.7 -> 9.1 s of a five-prop batch), the tokens within 7e-4 relative L2 of float32, 26 % of the first
+# conditioning's bf16 values one ulp off - a different sample of the same quality, as any rounding change (Chamfer
+# 0.16-0.24 % of the bounding-box diagonal against the float32 run, the class the fused kernels and SageAttention
+# were accepted at), not the same bits: the golden checks set it off (p3d_checks/common.py). Read when this module
+# loads; the card's capability the first time a picture is encoded.
+DINO_FP16 = os.environ.get("PIXAL3D_DINO_FP16", "auto").strip().lower()
+_dino_fp16_on: Optional[bool] = None
+FP16_FAST_FROM = (7, 5)
+
+
+def dino_fp16(device: torch.device) -> bool:
+    """Whether DINOv3 runs under float16 autocast on `device`, by the switch and the card."""
+    global _dino_fp16_on
+    if _dino_fp16_on is None:
+        if DINO_FP16 in ("1", "on", "true", "yes"):
+            _dino_fp16_on = True
+        elif DINO_FP16 in ("0", "off", "false", "no"):
+            _dino_fp16_on = False
+        else:
+            try:
+                _dino_fp16_on = device.type == "cuda" and torch.cuda.get_device_capability(device) >= FP16_FAST_FROM
+            except Exception:       # noqa: BLE001 - a card that cannot be asked keeps float32
+                _dino_fp16_on = False
+    return _dino_fp16_on
+
+
 @torch.no_grad()
 def encode(dino: nn.Module, image: torch.Tensor) -> torch.Tensor:
     """DINOv3's tokens z [V, 1 + registers + patches, 1024] of `image_tensor`'s batch: the extractors'
-    ImageNet normalization and extract_features. All views go through the model as one batch."""
-    return dino_tokens(dino, normalize(image, mean=IMAGENET_MEAN, std=IMAGENET_STD))
+    ImageNet normalization and extract_features. All views go through the model as one batch (under float16
+    autocast where dino_fp16 says so)."""
+    normalized = normalize(image, mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    if normalized.is_cuda and dino_fp16(normalized.device):
+        with torch.autocast("cuda", dtype=torch.float16):
+            return dino_tokens(dino, normalized).float()
+    return dino_tokens(dino, normalized)
 
 
 def _features(spec: Spec, z: torch.Tensor, camera: Camera, grid: int, image: Optional[torch.Tensor],
