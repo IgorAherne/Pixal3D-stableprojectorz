@@ -205,6 +205,26 @@ the answer by 2^8 after it is folded into the weights when the switch is on (`sa
 two scale every product and sum exactly, so flash_attn, SDPA and the int8 layers give the same bits too): the
 kernel is called without its two elementwise passes (`sage.attention(..., scaled=True)`).
 
+The detail flows' token-sized linear layers run as int8 GEMMs (`pixal3d/modules/int8.py`, the kernels in
+`modules/int8mm.py`: Triton GEMMs on the int8 tensor cores with the scaling, bias and GELU fused into the epilogue,
+and the quantisers; switch `PIXAL3D_INT8` on/off/a policy name, on by default after a first-use self-check against
+fp64, sm_80+). cuBLAS already runs the bf16 GEMMs at the card's tensor peak (26 TFLOPS on an RTX 3060: half of a
+detail pass), and the same card multiplies int8 at 84-88 TOPS, so the weights are quantised once at load (one
+scale per output channel) and the activations at every call (one scale per token, or per token and 128 input
+channels: "group" scales); the loader's convert hook does it (`register_checkpoint(..., convert=)`, the engine's
+`_prepare_flow`, after the Sage fold). Which flows and layers, and how, is a policy: the default "detail" converts
+the hr and tex flows only (group scales on to_qkv and the MLP, which carry the error; per-row on the three
+1536 -> 1536 layers; proj_linear in bf16, whose input has two channels ~25x the others; the ss and lr flows in
+bf16, whose samples a small change flips the most). Measured: an hr pass at 1536 4.21 -> 3.08 s (-27 %), the five
+test props' batch 954 -> 760 s (-20 %), a flow's weights 2.7 -> 1.6 GB (the hr/tex memory peaks 1.1-1.5 GB lower);
+the final latent moves ~2x as far as the accepted changes (the fused kernels, SageAttention) but the meshes and
+textures do not: Chamfer 0.03-0.08 % of the bounding-box diagonal against the bf16 run (the sampling floor; the
+accepted changes 0.16-0.43 %), the base colour at matched surface points 3-11 levels apart (the Sage change 13-31),
+renders alike (`code/logs/profiling/pixal3d-lowmem/round-i/int8-detail-full/compare`). Off = the bf16 layers, bit
+for bit the numbers of before; "safe" (the three 1536 -> 1536 layers only, -5 % of a pass) and "every" / "all"
+(every flow) are policies for experiments. The kernels compile on first use (~6 s with a cold Triton cache, 0.4 s
+warm; one compilation serves every token count).
+
 DINOv3 (part `features`) runs under float16 autocast on cards from sm_75 up (`proj_cond.dino_fp16`, switch
 `PIXAL3D_DINO_FP16` auto/on/off; a GTX 10xx keeps float32, where fp16 is slow): the features part 3.6x faster
 (18.7 -> 9.1 s of a five-prop batch at 1536), the tokens within 7e-4 relative L2 of float32, a different sample of

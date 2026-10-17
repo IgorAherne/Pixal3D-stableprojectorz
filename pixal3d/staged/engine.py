@@ -20,6 +20,7 @@ the pipeline's method of that name.
 from __future__ import annotations
 
 import contextlib
+import functools
 import importlib
 import json
 import sys
@@ -47,10 +48,11 @@ BUILDERS = ("rembg", "moge", "dino", "naf")
 KERNEL_LIBRARIES = ("triton", "flash_attn")
 
 
-def _prepare_flow(model: Any) -> Any:
-    """A flow network once its weights are on the card (the loader's convert hook): SageAttention's scaling of v
-    folded into its weights when the switch is on (modules/sage.py, exact), then its token-sized linears as int8
-    GEMMs where PIXAL3D_INT8 says so (modules/int8.py; the fold comes first so that the int8 scales carry it)."""
+def _prepare_flow(model: Any, kind: str = "") -> Any:
+    """A flow network (`kind`: ss, lr, hr or tex) once its weights are on the card (the loader's convert hook):
+    SageAttention's scaling of v folded into its weights when the switch is on (modules/sage.py, exact), then its
+    token-sized linears as int8 GEMMs where PIXAL3D_INT8's policy says so for that kind (modules/int8.py; the
+    fold comes first so that the int8 scales carry it)."""
     try:
         from ..modules.sparse import config as sparse_config
 
@@ -59,7 +61,7 @@ def _prepare_flow(model: Any) -> Any:
     except Exception as exc:        # noqa: BLE001 - a network that cannot be folded runs as before
         print(f"[SAGE] the fold of {type(model).__name__} failed ({type(exc).__name__}: {str(exc)[:200]}); the "
               f"network runs unfolded", flush=True)
-    return int8.convert(model)
+    return int8.convert(model, kind)
 
 
 def _import_ahead() -> None:
@@ -140,7 +142,7 @@ class StagedEngine:
         for kind, config in files.items():
             for name, key in FLOWS.items():
                 self.loader.register_checkpoint(f"{name}.{kind}", folder / config["models"][key],
-                                                convert=_prepare_flow)
+                                                convert=functools.partial(_prepare_flow, kind=name.split("_")[0]))
         for name, key in DECODERS.items():
             self.loader.register_checkpoint(name, folder / files["sv"]["models"][key])
         for name in BUILDERS:
