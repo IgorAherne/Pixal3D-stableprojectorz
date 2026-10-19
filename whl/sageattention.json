@@ -35,6 +35,13 @@
       "applied_by": "code/devtools/pixal3d-lowmem/round-j/sagecuda/apply_package_edit.py (post4's edit), then apply_package_edit_post5.py",
       "diff_stat": "csrc/qattn/attn_cuda_sm80.h           |  13 +++\n csrc/qattn/pybind_sm80.cpp            |  15 +++\n csrc/qattn/qk_int_sv_f16_cuda_sm80.cu | 184 ++++++++++++++++++++++++++++++++--\n setup.py                              |  19 +++-\n 4 files changed, 219 insertions(+), 12 deletions(-)",
       "what": "post4's edit (the tuned code for the flows' configuration, SASS for sm_86 / sm_89 and compute_89 PTX in _qattn_sm80, NVCC_THREADS) with the kernel template's new last parameter sc3d (default false) selecting the tuned code, so the shipped ops launch the shipped code everywhere, and the second op ..._inst_buf_sc3d (the inst_buf host function as a template on sc3d) registered beside the shipped one"
+    },
+    "spellcast3d_fork": {
+      "repo": "https://github.com/IgorAherne/SageAttention.git",
+      "branch": "spellcast3d",
+      "kernel_edit_commit": "4afb492",
+      "study_commit": "1070a55",
+      "what": "the user's fork of thu-ml/SageAttention; the branch spellcast3d is woct0rdho's tag v2.2.0-windows.post3 (3abe607) plus the round J edits: 4afb492 the package edit the post5 wheel was built from (setup.py, qk_int_sv_f16_cuda_sm80.cu, attn_cuda_sm80.h, pybind_sm80.cpp), 1070a55 the study folder csrc/qattn/sagecuda and README-round-j.md (not built into the package)"
     }
   },
   "build": {
