@@ -4,8 +4,11 @@ import torch.nn as nn
 from .. import SparseTensor
 from . import config
 from . import lean_cache
+from . import tuning
 import flex_gemm
 from flex_gemm.ops.spconv import sparse_submanifold_conv3d
+
+tuning.install()    # the masked kernel's tile configuration chosen by a steadier measurement (no value changes)
 
 
 BACKWARD_ONLY = ('valid_signal_i', 'valid_signal_o', 'valid_signal_seg')   # of flex_gemm's neighbour cache

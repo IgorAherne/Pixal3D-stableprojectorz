@@ -225,6 +225,8 @@ class SLatFlowModel(nn.Module):
             
         # Handle different conditioning modes
         zero = isinstance(cond, dict) and bool(cond.get("zero", False))     # all zeros: the unconditional pass
+        # the engine asks for proj_linear's answers to be kept across the steps (proj_attention.py)
+        proj_cache = isinstance(cond, dict) and bool(cond.get("proj_cache", False)) and not zero
         if self.image_attn_mode == 'proj':
             if isinstance(cond, dict):
                 global_cond = cond['global']
@@ -250,7 +252,7 @@ class SLatFlowModel(nn.Module):
             cond = manual_cast(cond, self.dtype)
 
         for block in self.blocks:
-            h = block(h, t_emb, cond, zero=zero)
+            h = block(h, t_emb, cond, zero=zero, proj_cache=proj_cache)
 
         h = manual_cast(h, x.dtype)
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))

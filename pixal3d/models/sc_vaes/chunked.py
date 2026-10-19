@@ -46,6 +46,14 @@ import torch.nn.functional as F
 from ...modules import sparse as sp
 
 SLAB_BYTES = 64 << 20       # the widest table of a slab: the MLP's hidden rows, conv1's [rows, 8C'] output
+COARSE_SLAB_BYTES = 256 << 20   # the same on the levels decoded on whole tables (0-2), far below the boxes' peak:
+#                             larger slabs there make fewer, larger convolution and Linear calls (the same rows)
+EVEN_WINDOWS = True         # rowwise on a whole table: near-equal windows of at least MIN_CALL_ROWS rows instead of
+#                             `window`-row windows the last of which overlaps the one before (whose rows it computes
+#                             again); a ConvNeXt block's second MLP layer then writes straight into the table
+MIN_CALL_ROWS = 1 << 13     # the smallest Linear call that gives a row the same values as any larger one (above)
+GATHER_INTO = False         # an up-block's conv1 rows gathered straight into the finer level's table (index_select
+#                             with out=: the same copy without the intermediate table and its second copy)
 NORM_SLAB_ROWS = 1 << 16    # rows normalised at a time (LayerNorm32 makes two float32 copies of them)
 BOX_WINDOW = 1 << 16        # rows of every Linear call inside a box (a box's tables are padded to it)
 KERNEL_VOLUME = 27
@@ -128,10 +136,11 @@ def subset(cache: Any, rows: Any) -> Any:
         nmap, gray = cache.neighbor_map[rows], cache.gray_code[rows]
     else:       # uint32 has no gather of its own: the same bits through an int32 view
         nmap, gray = cache.neighbor_map.view(torch.int32)[rows].view(torch.uint32), cache.gray_code[rows]
-    binary = gray.clone()
-    for v in range(1, KERNEL_VOLUME):
-        binary.bitwise_xor_(gray >> v)
-    return SubMConv3dNeighborCache(neighbor_map=nmap.contiguous(), gray_code=gray.contiguous(),
+    from ...modules.sparse.conv import codes
+
+    gray = gray.contiguous()
+    binary = codes.binary_of(gray, KERNEL_VOLUME)       # lean_cache.build's binary code of these rows' Gray codes
+    return SubMConv3dNeighborCache(neighbor_map=nmap.contiguous(), gray_code=gray,
                                    sorted_idx=torch.argsort(binary))
 
 
@@ -153,18 +162,42 @@ def whole_conv(conv: Any, x: sp.SparseTensor) -> torch.Tensor:
 
 # ------------------------------------------------------------------------------------------------ the blocks
 
-def _slab_rows(width: int, itemsize: int = 2) -> int:
-    return max(1024, SLAB_BYTES // (width * itemsize))
+def _slab_rows(width: int, itemsize: int = 2, budget: Optional[int] = None) -> int:
+    return max(1024, (SLAB_BYTES if budget is None else budget) // (width * itemsize))
+
+
+def even_windows(n: int, window: int) -> Optional[List[Tuple[int, int]]]:
+    """[a, b) row ranges covering n rows in calls of at most `window` rows, as equal as they can be, none smaller
+    than MIN_CALL_ROWS; None when the table cannot be cut so (then rowwise's overlapping windows are used)."""
+    k = -(-n // window)
+    size = -(-n // k)
+    last = n - (k - 1) * size
+    if min(size, last) < MIN_CALL_ROWS:
+        return None
+    return [(a, min(n, a + size)) for a in range(0, n, size)]
 
 
 def rowwise(fn: Callable[[torch.Tensor], torch.Tensor], src: torch.Tensor, out: torch.Tensor, window: int,
-            pad: bool) -> None:
+            pad: bool, into: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None) -> None:
     """out[i] = fn(src)[i] for every row i of a row-wise `fn` (Linear layers and what lies between them), in calls on
     exactly `window` rows: the last call overlaps the one before and only its new rows are kept (`out` may be `src`:
     the overlapped rows' second results are thrown away). A table of at most `window` rows is one call: on the table
     itself (`pad` False: on a whole level, the reference's own call), or on the table padded with zero rows to
-    `window` rows (`pad` True: a box, so that no call is smaller than the window)."""
+    `window` rows (`pad` True: a box, so that no call is smaller than the window).
+
+    With EVEN_WINDOWS a whole level (`pad` False) is cut into near-equal windows instead (even_windows), and
+    `into(rows, out_rows)`, when given, computes fn(rows) straight into out_rows (rows and out_rows may be the same
+    memory: `into` must have read its rows before it writes)."""
     n = src.shape[0]
+    if EVEN_WINDOWS and not pad:
+        ranges = [(0, n)] if n <= window else even_windows(n, window)
+        if ranges is not None:
+            for a, b in ranges:
+                if into is not None:
+                    into(src[a:b], out[a:b])
+                else:
+                    out[a:b] = fn(src[a:b])
+            return
     if n <= window:
         if pad and n < window:
             buffer = src.new_zeros((window, *src.shape[1:]))
@@ -191,10 +224,22 @@ def convnext(block: Any, x: sp.SparseTensor, conv: Callable, boxed: bool) -> sp.
     """SparseConvNeXtBlock3d: conv, then LayerNorm and the MLP on windows of rows, in place in the conv's output
     (`rowwise`; a box's windows are BOX_WINDOW rows), then the input added in place."""
     h = conv(block.conv, x)
-    window = BOX_WINDOW if boxed else _slab_rows(block.mlp[0].out_features)
-    rowwise(lambda rows: block.mlp(block.norm(rows)), h, h, window, pad=boxed)
+    window = BOX_WINDOW if boxed else _slab_rows(block.mlp[0].out_features, budget=COARSE_SLAB_BYTES)
+    rowwise(lambda rows: block.mlp(block.norm(rows)), h, h, window, pad=boxed,
+            into=lambda rows, out: mlp_into(block, rows, out))
     h.add_(x.feats)
     return x.replace(h)
+
+
+def mlp_into(block: Any, rows: torch.Tensor, out: torch.Tensor) -> None:
+    """block.mlp(block.norm(rows)) written into `out` (which may be `rows` itself): the same calls as the
+    Sequential's - Linear, SiLU over its input, Linear (addmm, as F.linear calls it) - the last one with out=."""
+    first, act, last = block.mlp
+    hidden = act(first(block.norm(rows)))
+    if last.bias is not None:
+        torch.addmm(last.bias, hidden, last.weight.t(), out=out)
+    else:
+        torch.mm(hidden, last.weight.t(), out=out)
 
 
 def children(coords: torch.Tensor, sub: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -230,7 +275,7 @@ def up_block(up: Any, x: sp.SparseTensor, sub: torch.Tensor, parents: Optional[t
         return sp.SparseTensor(torch.empty((0, C2), dtype=x.feats.dtype, device=x.device), coords), pidx
     ends = torch.cumsum(psub.sum(dim=-1), 0)
     hf = torch.empty((nf, C2), dtype=x.feats.dtype, device=x.device)
-    step = _slab_rows(8 * C2) if sliced else max(p, 1)
+    step = _slab_rows(8 * C2, budget=COARSE_SLAB_BYTES if parents is None else None) if sliced else max(p, 1)
     bounds = list(range(0, p, step)) + [p]
     fine_bounds = [0] + ends[torch.tensor(bounds[1:], device=ends.device) - 1].tolist() if p else [0]
     for k, (a, b) in enumerate(zip(bounds[:-1], bounds[1:])):
@@ -239,7 +284,10 @@ def up_block(up: Any, x: sp.SparseTensor, sub: torch.Tensor, parents: Optional[t
         else:
             out = up.conv1(hx).feats if parents is None else up.conv1(hx).feats[parents]
         fa, fb = fine_bounds[k], fine_bounds[k + 1]
-        hf[fa:fb] = out.view(-1, C2)[(pidx[fa:fb] - a) * 8 + subidx[fa:fb]]
+        if GATHER_INTO:
+            torch.index_select(out.view(-1, C2), 0, (pidx[fa:fb] - a) * 8 + subidx[fa:fb], out=hf[fa:fb])
+        else:
+            hf[fa:fb] = out.view(-1, C2)[(pidx[fa:fb] - a) * 8 + subidx[fa:fb]]
         del out
         for c in range(fa, fb, NORM_SLAB_ROWS):
             d = min(fb, c + NORM_SLAB_ROWS)

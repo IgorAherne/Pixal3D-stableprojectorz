@@ -301,6 +301,8 @@ class SparseStructureFlowModel(nn.Module):
         
         # Handle different conditioning modes
         zero = isinstance(cond, dict) and bool(cond.get("zero", False))     # all zeros: the unconditional pass
+        # the engine asks for proj_linear's answers to be kept across the steps (proj_attention.py)
+        proj_cache = isinstance(cond, dict) and bool(cond.get("proj_cache", False)) and not zero
         if self.image_attn_mode == 'proj':
             if isinstance(cond, dict):
                 global_cond = cond['global']
@@ -319,7 +321,7 @@ class SparseStructureFlowModel(nn.Module):
             cond = manual_cast(cond, self.dtype)
             
         for block in self.blocks:
-            h = block(h, t_emb, cond, self.rope_phases, zero=zero)
+            h = block(h, t_emb, cond, self.rope_phases, zero=zero, proj_cache=proj_cache)
         h = manual_cast(h, x.dtype)
         h = F.layer_norm(h, h.shape[-1:])
         h = self.out_layer(h)

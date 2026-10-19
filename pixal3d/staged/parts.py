@@ -123,6 +123,10 @@ FILL_MIB_PER_KVOXEL = 0.15
 SAMPLER_BASE_MIB = 2_700
 SAMPLER_MIB_PER_KTOKEN = 50
 SAMPLER_SLACK = 1.25
+PROJ_CACHE_SLACK = 1.1              # over the kept proj_linear answers' bytes (proj_cache_fits)
+PROJ_CACHE_MARGIN_MIB = 1_536       # what must stay free under the cap beside the sampler and the kept tables: on a
+#                                     7-8 GB card's cap (6.8-7.1 GB) the tables of a 1536 prop left 72 MiB (round J's
+#                                     emulated run: hr reserved 6,964 of 7,036), so they are for caps of about 9 GB on
 HOOK_RAM_BASE_MIB = 1_500
 HOOK_RAM_MIB_PER_MVOXEL = 200
 RAM_FLOOR_MIB = 1_500               # what must stay available to Windows and the hub beside the hook's own need
@@ -163,6 +167,19 @@ HOOK_TORCH_MIB = 1_500              # what Spellcast3D's GLB GPU steps reserve t
 #                                     (Hooks.gpu_torch_mib(req), hook_torch_mib below), so a larger texture keeps
 #                                     less rather than running out of memory beside what is kept (that would only
 #                                     cost the step a second run with it gone, runner._after_failure)
+HOOK_TORCH_REF_MFACES = 15          # the decoded faces (millions) that figure, and the hook's own, hold for: the
+#                                     golden sv1536 mesh (14.9 M faces) is the largest it was measured on
+HOOK_TORCH_MIB_PER_MFACE = 120      # what the GLB GPU steps reserve through PyTorch per million decoded faces
+#                                     beyond that: geometry and bake upload the decoded mesh, the bake the texture
+#                                     volume (36 B a voxel, about 2 faces a voxel) and grid_sample's tables. Round
+#                                     I's 7.2 GiB run: the geometry and the bake of a 21.5 M-face prop and the bake
+#                                     of an 18.3 M-face one ran out of memory beside the kept texture network with
+#                                     1,593 / 1,593 / 1,785 MiB left for them (pair_keep had counted 1,500 for every
+#                                     prop), so each step ran again with the network gone (re-read from the disk)
+#                                     and the bake built its BVH anew: 1,500 + 87 a million faces beyond 15 M is the
+#                                     least those three say, 120 gives the 18.3 M-face bake ~100 MiB of margin; the
+#                                     full RTX 3060 still keeps both decoders beside the int8 texture network for
+#                                     every prop of the test set (round J, overlap)
 
 # The decoders give their cache back level by level (decoder.lean: an empty_cache between the levels, the
 # results moved through RAM once to leave the card unfragmented) only where the decode needs it. Without it a
@@ -188,6 +205,33 @@ def hook_torch_mib(hooks: Any, req: Any) -> int:
         return HOOK_TORCH_MIB
 
 
+def steps_torch_mib(hooks: Any, req: Any, faces: int) -> int:
+    """MiB the finish hook's GPU steps reserve through PyTorch for a decoded mesh of `faces` faces: the hook's
+    figure (hook_torch_mib, which holds up to HOOK_TORCH_REF_MFACES million faces) and HOOK_TORCH_MIB_PER_MFACE for
+    every million beyond."""
+    beyond = max(0.0, faces / 1e6 - HOOK_TORCH_REF_MFACES)
+    return hook_torch_mib(hooks, req) + int(HOOK_TORCH_MIB_PER_MFACE * beyond)
+
+
+def reserve_faces(native_mib: int) -> int:
+    """The decoded faces glb_reserve gives `native_mib` for (its inverse): what a prop in its steps decoded."""
+    return max(0, (int(native_mib) - 2300) * 1_000_000 // 60)
+
+
+def next_sampler_mib(flow: Any, tokens: int, cap_mib: float) -> float:
+    """MiB the next prop's texture sampling takes on the card beside what is kept for it: its sampler
+    (sampler_mib) and, where the cap in force leaves room for them beside it, the flow's kept proj_linear answers
+    (the same test as proj_cache_fits', so that the decoders the pair keeps never take that room: the sampling
+    would run out of memory and run again with them gone). A flow without such answers, or one that cannot say,
+    needs its sampler alone."""
+    sampler = sampler_mib(tokens)
+    try:
+        proj = PROJ_CACHE_SLACK * proj_cache_mib(flow, tokens) if flow is not None else 0.0
+    except Exception:           # noqa: BLE001 - no proj cache to make room for
+        proj = 0.0
+    return sampler + proj if proj_cache_room(sampler, proj / PROJ_CACHE_SLACK, cap_mib) else sampler
+
+
 def pair_keep(ctx: PartContext, prop: PropState, following: PropState, natives: list) -> frozenset:
     """The networks that may stay on the card through `prop`'s finish in the paired texture and finish, so that
     `following` (the next prop of the group) does not load them again: its texture network, and both decoders after
@@ -195,10 +239,12 @@ def pair_keep(ctx: PartContext, prop: PropState, following: PropState, natives: 
     `natives`: the native reserves of the props in their finish steps, whose GPU steps run beside what is kept.
     The texture network stays only when, with it on the card, the decode with both decoders fits under the cap the
     finish will set (with decoders_fit's margin), the closing of the holes beside it does, and so do the finish
-    steps: their native reserve (glb_reserve of the faces the voxels foresee, or a larger one of a prop in its
-    steps) and HOOK_TORCH_MIB within what the hook's cap leaves the card (the finish cap and its native reserve);
-    the decoders stay only when, beside it, the holes and the steps fit as well and the next prop's texture sampler
-    (sampler_mib) fits beside them under the cap in force."""
+    steps: the largest of this prop's and of each prop in its steps of their native reserve (glb_reserve of the
+    faces the voxels foresee, or the prop's own) and what they reserve through PyTorch (steps_torch_mib of those
+    faces) within what the hook's cap leaves the card (the finish cap and its native reserve);
+    the decoders stay only when, beside it, the holes and the steps fit as well and the next prop's texture sampling
+    (next_sampler_mib: its sampler, and its proj_linear answers where it will keep them) fits beside them under the
+    cap in force."""
     loader = ctx.loader
     size_of = getattr(loader, "size_mib", None)
     headroom = loader.headroom_mib() if hasattr(loader, "headroom_mib") else None
@@ -218,15 +264,18 @@ def pair_keep(ctx: PartContext, prop: PropState, following: PropState, natives: 
     budget = finish_limit / 1.1
     decoders_mib = sum(size_of(name) or DECODER_MIB for name in LAZY["finish"])
     # the hook's cap leaves FINISH_SAFETY_MIB of the card free: what the decode's cap does, less its native reserve
-    steps = (max([glb_reserve(int(FACES_PER_VOXEL * voxels)), *[int(mib) for mib in natives]])
-             + hook_torch_mib(getattr(ctx, "hooks", None), prop.req))
+    hooks = getattr(ctx, "hooks", None)
+    faces = int(FACES_PER_VOXEL * voxels)
+    steps = max([glb_reserve(faces) + steps_torch_mib(hooks, prop.req, faces),
+                 *[int(mib) + steps_torch_mib(hooks, prop.req, reserve_faces(int(mib))) for mib in natives]])
     steps_room = finish_limit + NATIVE_RESERVE["finish"]
+    sampler = next_sampler_mib(loader.get(flow), tokens, cap_now)
 
     def fits(decoders: bool) -> bool:
         after = flow_mib + (decoders_mib if decoders else 0)
         return (flow_mib + decode_mib(voxels, 2, chunk_for(voxels)) <= budget and after + fill_mib(voxels) <= budget
                 and after + steps <= steps_room
-                and (not decoders or sampler_mib(tokens) + decoders_mib <= cap_now))
+                and (not decoders or sampler + decoders_mib <= cap_now))
 
     if fits(decoders=True):
         return frozenset({flow, *LAZY["finish"]})
@@ -296,6 +345,40 @@ def finish_mib(voxels: int, decoders: int = 1) -> float:
 def sampler_mib(tokens: int) -> float:
     """MiB a 1024-grid flow sampler needs on the card for a prop of `tokens` tokens, fragmentation included."""
     return SAMPLER_SLACK * (SAMPLER_BASE_MIB + SAMPLER_MIB_PER_KTOKEN * tokens / 1000)
+
+
+def proj_cache_mib(flow: Any, tokens: int) -> float:
+    """MiB the flow's blocks keep when their proj_linear answers are cached for a prop of `tokens` tokens."""
+    from ..modules.sparse.attention.proj_attention import proj_cache_bytes
+
+    return proj_cache_bytes(flow, tokens) / 2**20
+
+
+def proj_cache_room(sampler: float, need: float, cap_mib: float) -> bool:
+    """Whether `need` MiB of kept proj_linear answers fit beside a sampler of `sampler` MiB under `cap_mib`, with
+    PROJ_CACHE_MARGIN_MIB to spare (the one test of proj_cache_fits and next_sampler_mib)."""
+    return need > 0 and sampler + PROJ_CACHE_SLACK * need + PROJ_CACHE_MARGIN_MIB <= cap_mib
+
+
+def proj_cache_fits(ctx: PartContext, flow: Any, tokens: int) -> bool:
+    """Whether the flow may keep its blocks' proj_linear answers across a sampling's conditional steps for a prop
+    of `tokens` tokens: the same bits one GEMM per block cheaper every pass after the first (157 ms of a 3.1 s
+    detail pass at 21.5k tokens), for 1.9 GB on the card there - taken only where the cap in force has that room
+    beside the sampler's own need with PROJ_CACHE_MARGIN_MIB to spare (the 12 GB card at 1536; never a 7-8 GB
+    one), never on the CPU or when the cap was lifted."""
+    limits = card_limits(ctx)
+    if limits is None:
+        return False
+    return proj_cache_room(sampler_mib(tokens), proj_cache_mib(flow, tokens), limits[1])
+
+
+def _drop_proj_cache(ctx: PartContext, flow: Any, part: str, prop: PropState) -> None:
+    from ..modules.sparse.attention.proj_attention import drop_proj_caches
+
+    freed = drop_proj_caches(flow)
+    if freed:
+        print(f"[PROJ-CACHE] {part} {prop.id}: proj_linear's answers kept across the conditional steps "
+              f"({freed / 2**20:,.0f} MiB), dropped", flush=True)
 
 
 def hook_ram_mib(voxels: int) -> float:
@@ -505,10 +588,13 @@ def _as_reference_layout(cond: dict, multi: bool) -> dict:
     return {**cond, "proj": proj.transpose(1, 2).contiguous().transpose(1, 2)}
 
 
-def _token_cond(cond: dict, coords: torch.Tensor, negative: bool = True) -> dict:
-    """{"cond", "neg_cond"} of a sparse stage: the stored rows on the prop's coords, and zeros of the same form."""
+def _token_cond(cond: dict, coords: torch.Tensor, negative: bool = True, proj_cache: bool = False) -> dict:
+    """{"cond", "neg_cond"} of a sparse stage: the stored rows on the prop's coords, and zeros of the same form.
+    `proj_cache`: the flow keeps each block's proj_linear answer across the conditional steps (proj_cache_fits)."""
     pair = {"cond": {"global": cond["global"], "proj": SparseTensor(feats=cond["proj"], coords=coords)},
             "neg_cond": None}
+    if proj_cache:
+        pair["cond"]["proj_cache"] = True
     if negative:
         zero = _proj_cond().negative(cond)
         pair["neg_cond"] = {"global": zero["global"], "proj": SparseTensor(feats=zero["proj"], coords=coords),
@@ -632,14 +718,18 @@ def _shape_latent(ctx: PartContext, prop: PropState, mode: str, part: str, coord
     store, device, args = ctx.store, ctx.device, ctx.args(prop)
     flow = _network(ctx, f"{part}_flow.{prop.kind}")
     coords = store.get_small(prop.id, coords_key)["coords"].to(device)
-    pair = _token_cond(ctx.take(prop, f"cond_{part}"), coords)
+    pair = _token_cond(ctx.take(prop, f"cond_{part}"), coords,
+                       proj_cache=proj_cache_fits(ctx, flow, coords.shape[0]))
     params = {**args.sampler_params["shape"], **prop.req.sampler_params.get("shape", {})}
     torch.set_rng_state(store.get_small(prop.id, rng_key)["state"])
     noise = SparseTensor(feats=torch.randn(coords.shape[0], flow.in_channels).to(device), coords=coords)
-    slat = args.samplers["shape"].sample(
-        flow, noise, **pair, **params, verbose=False, keep_trajectory=False,
-        step_callback=_steps(ctx, prop, part, mode),
-    ).samples
+    try:
+        slat = args.samplers["shape"].sample(
+            flow, noise, **pair, **params, verbose=False, keep_trajectory=False,
+            step_callback=_steps(ctx, prop, part, mode),
+        ).samples
+    finally:
+        _drop_proj_cache(ctx, flow, part, prop)
     slat = _denormalised(slat, args.shape_normalization)
     rng = torch.get_rng_state()
     store.put_small(prop.id, slat_key, {"feats": slat.feats.cpu()})
@@ -732,7 +822,8 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
     coords = stored["coords"].to(device)
     params = {**args.sampler_params["tex"], **request.sampler_params.get("tex", {})}
     # A guidance strength of 1 runs only the positive pass: the zero conditioning would never be read.
-    pair = _token_cond(ctx.take(prop, "cond_tex"), coords, negative=params.get("guidance_strength") != 1)
+    pair = _token_cond(ctx.take(prop, "cond_tex"), coords, negative=params.get("guidance_strength") != 1,
+                       proj_cache=proj_cache_fits(ctx, flow, coords.shape[0]))
 
     std = torch.tensor(args.shape_normalization["std"])[None].to(device)
     mean = torch.tensor(args.shape_normalization["mean"])[None].to(device)
@@ -740,10 +831,13 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
     torch.set_rng_state(store.get_small(prop.id, "rng_hr")["state"])
     noise = shape_slat.replace(
         feats=torch.randn(shape_slat.coords.shape[0], flow.in_channels - shape_slat.feats.shape[1]).to(device))
-    slat = args.samplers["tex"].sample(
-        flow, noise, concat_cond=shape_slat, **pair, **params, verbose=False, keep_trajectory=False,
-        step_callback=_steps(ctx, prop, "tex", mode),
-    ).samples
+    try:
+        slat = args.samplers["tex"].sample(
+            flow, noise, concat_cond=shape_slat, **pair, **params, verbose=False, keep_trajectory=False,
+            step_callback=_steps(ctx, prop, "tex", mode),
+        ).samples
+    finally:
+        _drop_proj_cache(ctx, flow, "tex", prop)
     tex_feats = _denormalised(slat, args.tex_normalization).feats.cpu()
 
     store.put_small(prop.id, "tex_slat", {"feats": tex_feats})

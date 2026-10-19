@@ -1,25 +1,582 @@
 {
-  "wheel": "sageattention-2.2.0+cu128torch2.8.0.post3-cp39-abi3-win_amd64.whl",
-  "sha256": "7dabcd00e63229b28f046c5a69ec37cf4756afb375dbadd1975dadec045ae21c",
-  "size_bytes": 11964789,
-  "origin": {
-    "release": "https://github.com/woct0rdho/SageAttention/releases (the build for torch 2.8.0 + cu128; post4-post6 need torch >= 2.9)",
-    "upstream": "https://github.com/thu-ml/SageAttention",
-    "license": "Apache-2.0 (LICENSE inside the wheel)",
-    "downloaded": "2026-10-15, sha256 equal to the release asset's digest"
+  "wheel": "sageattention-2.2.0+cu128torch2.8.0.post5-cp39-abi3-win_amd64.whl",
+  "sha256": "530027fa713c3b5dd30dd7addd17733ab3fd60efc0e946501e391846d53f1604",
+  "size_bytes": 20379790,
+  "built": "2026-10-19T18:59:57+00:00",
+  "build_seconds": 532,
+  "build_seconds_total": 704,
+  "what_for": "The flows' full self-attention (one sequence, 12 heads x 128, bf16): pixal3d/modules/sage.py calls sageattn_qk_int8_pv_fp16_cuda(per_warp, fp16+fp32). post5 = post4 with BOTH CUDA kernels of that call: the shipped one under the original op and round J's tuned one (two blocks an SM, the P.V step one output tile at a time; the same bits; -13 % a call on an RTX 3060, other cards unmeasured) under a second op; the fork times the two at its first use on the card and keeps the faster",
+  "ops": {
+    "shipped": {
+      "op": "torch.ops.sageattention_qattn_sm80.qk_int8_sv_f16_accum_f16_attn_inst_buf",
+      "called_by": "sageattn_qk_int8_pv_fp16_cuda (the wheel's Python, post3's byte for byte)",
+      "kernel": "the shipped code for every configuration (sm_80 SASS: post3's instruction for instruction; sm_86 / sm_89: native SASS of the same source, as every kernel of post4 except the tuned one)"
+    },
+    "tuned": {
+      "op": "torch.ops.sageattention_qattn_sm80.qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d",
+      "schema": "the shipped op's (query, key, value, output, query_scale, key_scale, tensor_layout, is_causal, qk_quant_gran, sm_scale, return_lse)",
+      "kernel": "for head 128 / not causal / per_warp / no LSE / bf16 out (the flows' call) the tuned instantiation (sc3d = true: __launch_bounds__(256, 2), P.V one output tile at a time) - post4's tuned kernel instruction for instruction; every other configuration the shipped kernel. The same bits as the shipped op for every input",
+      "called_by": "pixal3d/modules/sage.py (_wheel_call: the wheel's preprocessing, then this op), where its first-use timing (_race) finds it faster"
+    }
   },
-  "what_for": "The flows' full self-attention (one sequence, 12 heads x 128, bf16) through int8 Q.K^T and fp16 P.V kernels: pixal3d/modules/sage.py, switch PIXAL3D_SAGE (on by default after a first-use self-check; off = flash_attn, bit for bit as before). Measured on an RTX 3060: an hr / tex pass at 1536 -26 %, a five-prop batch -20 %, the allocated memory peak of a pass unchanged.",
+  "sources": {
+    "fork": {
+      "repo": "https://github.com/woct0rdho/SageAttention",
+      "tag": "v2.2.0-windows.post3",
+      "commit": "3abe607071a3031b2a785b9a76fec05efaf69620",
+      "license": "Apache-2.0 (LICENSE inside the wheel)",
+      "what": "the Windows build-system fork of thu-ml/SageAttention 2.2.0 that post3 was built from"
+    },
+    "upstream": "https://github.com/thu-ml/SageAttention",
+    "edits": {
+      "package_patch": "temp_code/SageAttention/round-j-sagecuda-package.patch (setup.py, csrc/qattn/qk_int_sv_f16_cuda_sm80.cu, attn_cuda_sm80.h, pybind_sm80.cpp; sha256 1564dd77d68ed1ec778f6c346c1550617f3132b0322b3b51384bbccd807548dd = `git diff --binary` of the clone at build time: the wheel is built from exactly this patch)",
+      "patch": "temp_code/SageAttention/round-j-sagecuda.patch (the package patch plus README-round-j.md and the study folder csrc/qattn/sagecuda/)",
+      "readme": "temp_code/SageAttention/README-round-j.md",
+      "applied_by": "code/devtools/pixal3d-lowmem/round-j/sagecuda/apply_package_edit.py (post4's edit), then apply_package_edit_post5.py",
+      "diff_stat": "csrc/qattn/attn_cuda_sm80.h           |  13 +++\n csrc/qattn/pybind_sm80.cpp            |  15 +++\n csrc/qattn/qk_int_sv_f16_cuda_sm80.cu | 184 ++++++++++++++++++++++++++++++++--\n setup.py                              |  19 +++-\n 4 files changed, 219 insertions(+), 12 deletions(-)",
+      "what": "post4's edit (the tuned code for the flows' configuration, SASS for sm_86 / sm_89 and compute_89 PTX in _qattn_sm80, NVCC_THREADS) with the kernel template's new last parameter sc3d (default false) selecting the tuned code, so the shipped ops launch the shipped code everywhere, and the second op ..._inst_buf_sc3d (the inst_buf host function as a template on sc3d) registered beside the shipped one"
+    }
+  },
+  "build": {
+    "command": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\sa\\venv\\Scripts\\python.exe -m pip wheel C:\\_myDrive\\repos\\SPELLC~1\\release\\cache\\wheels\\build\\sa\\src --no-deps --no-build-isolation --disable-pip-version-check -v -w C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\sa\\wheel-out  (in the vcvars64 environment)",
+    "driver": "code/devtools/pixal3d-lowmem/round-j/sagecuda/build_wheel_post5.py --max-jobs 4 --nvcc-threads 1",
+    "env": {
+      "CUDA_HOME": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
+      "CUDA_PATH": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
+      "DISTUTILS_USE_SDK": "1",
+      "TORCH_CUDA_ARCH_LIST": "8.0 8.6 8.9 9.0 12.0",
+      "SAGEATTENTION_WHEEL_VERSION_SUFFIX": "+cu128torch2.8.0.post5",
+      "SAGEATTENTION_SM80_PTX": "1",
+      "MAX_JOBS": "4",
+      "NVCC_THREADS": "1",
+      "CUDA_VISIBLE_DEVICES": "-1"
+    },
+    "tools": {
+      "python": "3.11.9",
+      "torch": "2.8.0+cu128 (CUDA 12.8)",
+      "setuptools": "80.9.0",
+      "wheel": "0.45.1",
+      "ninja": "1.13.2.git.kitware.jobserver-pipe-1",
+      "nvcc": "12.8 V12.8.93",
+      "msvc": "Microsoft (R) C/C++ Optimizing Compiler Version 19.44.35213 for x64",
+      "vctools": "14.44.35207"
+    },
+    "as_woct0rdho": "the same TORCH_CUDA_ARCH_LIST, version suffix scheme and cp39 abi3 tag as the workflow .github/workflows/build-sageattn.yml (cibuildwheel on Python 3.12 with the CUDA 12.8.1 toolkit there; here pip wheel on Python 3.11, nvcc 12.8.93 = 12.8.1)"
+  },
   "cuobjdump": {
-    "_qattn_sm80.pyd": {"sass_sm": [80], "ptx_compute": [], "note": "runs on every sm_8x card (RTX 30xx / 40xx, A100): the kernel the fork uses there"},
-    "_qattn_sm89.pyd": {"sass_sm": [89, 120], "ptx_compute": [], "note": "fp8 kernels, not used by the fork"},
-    "_qattn_sm90.pyd": {"sass_sm": [90], "ptx_compute": [], "note": "not used by the fork: sm_90+ runs the package's Triton kernel"},
-    "_fused.pyd": {"sass_sm": [80, 89, 90, 120], "ptx_compute": []}
+    "_fused.pyd": {
+      "sass_sm": [
+        "sm_80",
+        "sm_89",
+        "sm_90a",
+        "sm_120a"
+      ],
+      "ptx_compute": [],
+      "imports": [
+        "c10.dll",
+        "torch_cpu.dll",
+        "cudart64_12.dll",
+        "MSVCP140.dll",
+        "python3.dll",
+        "KERNEL32.dll",
+        "VCRUNTIME140.dll",
+        "VCRUNTIME140_1.dll",
+        "api-ms-win-crt-runtime-l1-1-0.dll",
+        "api-ms-win-crt-heap-l1-1-0.dll"
+      ],
+      "size_bytes": 1287168,
+      "post3": {
+        "sass_sm": [
+          "sm_80",
+          "sm_89",
+          "sm_90a",
+          "sm_120a"
+        ],
+        "ptx_compute": []
+      },
+      "post4": {
+        "sass_sm": [
+          "sm_80",
+          "sm_89",
+          "sm_90a",
+          "sm_120a"
+        ],
+        "ptx_compute": []
+      }
+    },
+    "_qattn_sm80.pyd": {
+      "sass_sm": [
+        "sm_80",
+        "sm_86",
+        "sm_89"
+      ],
+      "ptx_compute": [
+        "sm_89"
+      ],
+      "imports": [
+        "c10.dll",
+        "torch_cpu.dll",
+        "cudart64_12.dll",
+        "python3.dll",
+        "MSVCP140.dll",
+        "KERNEL32.dll",
+        "VCRUNTIME140_1.dll",
+        "VCRUNTIME140.dll",
+        "api-ms-win-crt-heap-l1-1-0.dll",
+        "api-ms-win-crt-runtime-l1-1-0.dll"
+      ],
+      "size_bytes": 27541504,
+      "post3": {
+        "sass_sm": [
+          "sm_80"
+        ],
+        "ptx_compute": []
+      },
+      "post4": {
+        "sass_sm": [
+          "sm_80",
+          "sm_86",
+          "sm_89"
+        ],
+        "ptx_compute": [
+          "sm_89"
+        ]
+      }
+    },
+    "_qattn_sm89.pyd": {
+      "sass_sm": [
+        "sm_89",
+        "sm_120a"
+      ],
+      "ptx_compute": [],
+      "imports": [
+        "c10.dll",
+        "torch_cpu.dll",
+        "cudart64_12.dll",
+        "python3.dll",
+        "MSVCP140.dll",
+        "KERNEL32.dll",
+        "VCRUNTIME140_1.dll",
+        "VCRUNTIME140.dll",
+        "api-ms-win-crt-heap-l1-1-0.dll",
+        "api-ms-win-crt-runtime-l1-1-0.dll"
+      ],
+      "size_bytes": 30827520,
+      "post3": {
+        "sass_sm": [
+          "sm_89",
+          "sm_120a"
+        ],
+        "ptx_compute": []
+      },
+      "post4": {
+        "sass_sm": [
+          "sm_89",
+          "sm_120a"
+        ],
+        "ptx_compute": []
+      }
+    },
+    "_qattn_sm90.pyd": {
+      "sass_sm": [
+        "sm_90a"
+      ],
+      "ptx_compute": [],
+      "imports": [
+        "nvcuda.dll",
+        "c10.dll",
+        "torch_cpu.dll",
+        "cudart64_12.dll",
+        "python3.dll",
+        "MSVCP140.dll",
+        "KERNEL32.dll",
+        "VCRUNTIME140_1.dll",
+        "VCRUNTIME140.dll",
+        "api-ms-win-crt-heap-l1-1-0.dll",
+        "api-ms-win-crt-runtime-l1-1-0.dll"
+      ],
+      "size_bytes": 2272768,
+      "post3": {
+        "sass_sm": [
+          "sm_90a"
+        ],
+        "ptx_compute": []
+      },
+      "post4": {
+        "sass_sm": [
+          "sm_90a"
+        ],
+        "ptx_compute": []
+      }
+    }
+  },
+  "against_post3": {
+    "file_list_equal": true,
+    "python_files_byte_equal": {
+      "sageattention/__init__.py": true,
+      "sageattention/core.py": true,
+      "sageattention/fa3_wrapper.py": true,
+      "sageattention/quant.py": true,
+      "sageattention/triton/__init__.py": true,
+      "sageattention/triton/attn_qk_int8_block_varlen.py": true,
+      "sageattention/triton/attn_qk_int8_per_block.py": true,
+      "sageattention/triton/attn_qk_int8_per_block_causal.py": true,
+      "sageattention/triton/attn_qk_int8_per_block_causal_varlen.py": true,
+      "sageattention/triton/quant_per_block.py": true,
+      "sageattention/triton/quant_per_block_varlen.py": true,
+      "sageattention/triton/quant_per_thread.py": true
+    },
+    "other_modules_sass_per_kernel": {
+      "_fused.pyd sm_80": {
+        "kernels": [
+          44,
+          44
+        ],
+        "identical": 44,
+        "differ": [],
+        "only_new": [],
+        "only_post3": []
+      },
+      "_fused.pyd sm_89": {
+        "kernels": [
+          44,
+          44
+        ],
+        "identical": 44,
+        "differ": [],
+        "only_new": [],
+        "only_post3": []
+      },
+      "_fused.pyd sm_90a": {
+        "kernels": [
+          44,
+          44
+        ],
+        "identical": 44,
+        "differ": [],
+        "only_new": [],
+        "only_post3": []
+      },
+      "_fused.pyd sm_120a": {
+        "kernels": [
+          44,
+          44
+        ],
+        "identical": 44,
+        "differ": [],
+        "only_new": [],
+        "only_post3": []
+      },
+      "_qattn_sm89.pyd sm_89": {
+        "kernels": [
+          224,
+          224
+        ],
+        "identical": 224,
+        "differ": [],
+        "only_new": [],
+        "only_post3": []
+      },
+      "_qattn_sm89.pyd sm_120a": {
+        "kernels": [
+          224,
+          224
+        ],
+        "identical": 224,
+        "differ": [],
+        "only_new": [],
+        "only_post3": []
+      },
+      "_qattn_sm90.pyd sm_90a": {
+        "kernels": [
+          64,
+          64
+        ],
+        "identical": 64,
+        "differ": [],
+        "only_new": [],
+        "only_post3": []
+      }
+    }
+  },
+  "qattn_sm80_sass": {
+    "new": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\sa\\cmp\\new\\_qattn_sm80.pyd",
+    "post3": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\sa\\cmp\\post3\\_qattn_sm80.pyd",
+    "post4": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\sa\\cmp\\post4\\_qattn_sm80.pyd",
+    "arch": {
+      "sm_80": {
+        "kernels_new": 129,
+        "kinds": {
+          "shipped": 128,
+          "tuned": 1,
+          "other": 0
+        },
+        "shipped_vs": "post3",
+        "kernels_ref": 128,
+        "common": 128,
+        "identical": 128,
+        "differ": [],
+        "only_new": [],
+        "only_ref": [],
+        "flows_shipped_vs_post3": true,
+        "flows_shipped_vs_ctrl80": true,
+        "tuned": {
+          "symbol": "_Z25qk_int_sv_f16_attn_kernelILj128ELj64ELj16ELj64ELj128EL8DataType1EL16QuantGranularity2ELS1_2EfLb1E13__nv_bfloat16L11ComputeUnit0EL8MaskMode0ELb0ELb0ELb1EEvPaS5_P6__halfPT9_PfSA_SA_S9_jjjjjjjjjjjjjjjf",
+          "maps_to": true,
+          "instructions": 2320,
+          "vs_post4_flows_kernel": true,
+          "vs_o1lb2_80": true
+        }
+      },
+      "sm_86": {
+        "kernels_new": 129,
+        "kinds": {
+          "shipped": 128,
+          "tuned": 1,
+          "other": 0
+        },
+        "shipped_vs": "post4",
+        "kernels_ref": 128,
+        "common": 128,
+        "identical": 127,
+        "differ": [
+          "_Z25qk_int_sv_f16_attn_kernelILj128ELj64ELj16ELj64ELj128EL8DataType1EL16QuantGranularity2ELS1_2EfLb1E13__nv_bfloat16L11ComputeUnit0EL8MaskMode0ELb0ELb0EEvPaS5_P6__halfPT9_PfSA_SA_S9_jjjjjjjjjjjjjjjf"
+        ],
+        "only_new": [],
+        "only_ref": [],
+        "flows_shipped_vs_ctrl86": true,
+        "tuned": {
+          "symbol": "_Z25qk_int_sv_f16_attn_kernelILj128ELj64ELj16ELj64ELj128EL8DataType1EL16QuantGranularity2ELS1_2EfLb1E13__nv_bfloat16L11ComputeUnit0EL8MaskMode0ELb0ELb0ELb1EEvPaS5_P6__halfPT9_PfSA_SA_S9_jjjjjjjjjjjjjjjf",
+          "maps_to": true,
+          "instructions": 2320,
+          "vs_post4_flows_kernel": true,
+          "vs_o1lb2_86": true
+        }
+      },
+      "sm_89": {
+        "kernels_new": 129,
+        "kinds": {
+          "shipped": 128,
+          "tuned": 1,
+          "other": 0
+        },
+        "shipped_vs": "post4",
+        "kernels_ref": 128,
+        "common": 128,
+        "identical": 127,
+        "differ": [
+          "_Z25qk_int_sv_f16_attn_kernelILj128ELj64ELj16ELj64ELj128EL8DataType1EL16QuantGranularity2ELS1_2EfLb1E13__nv_bfloat16L11ComputeUnit0EL8MaskMode0ELb0ELb0EEvPaS5_P6__halfPT9_PfSA_SA_S9_jjjjjjjjjjjjjjjf"
+        ],
+        "only_new": [],
+        "only_ref": [],
+        "flows_shipped_vs_own_sm86_f2fp_mapped": true,
+        "tuned": {
+          "symbol": "_Z25qk_int_sv_f16_attn_kernelILj128ELj64ELj16ELj64ELj128EL8DataType1EL16QuantGranularity2ELS1_2EfLb1E13__nv_bfloat16L11ComputeUnit0EL8MaskMode0ELb0ELb0ELb1EEvPaS5_P6__halfPT9_PfSA_SA_S9_jjjjjjjjjjjjjjjf",
+          "maps_to": true,
+          "instructions": 2320,
+          "vs_post4_flows_kernel": true,
+          "vs_o1lb2_89": true
+        }
+      }
+    },
+    "as_expected": true
   },
   "declared_dependencies": "none in the wheel's METADATA (needs torch 2.8.x+cu128 and, for sm_90+, triton-windows, both installed in Pixal3D's venv)",
   "runtime_requirements": {
     "install": "pip install <this wheel>  (Pixal3D's install.py installs every wheel in its whl folder)",
-    "cards": "sm_80 and newer; below that pixal3d/modules/sage.py refuses it and the flows keep their attention backend"
+    "cards": "sm_80 and newer; below that pixal3d/modules/sage.py refuses it"
   },
-  "known_issue_of_this_build": "post6 upstream fixed stale shared memory for key rows past the sequence end; in this build it only matters for sequences of 64 keys or fewer, which the fork never hands to it (sage.MIN_TOKENS 65)",
-  "measurements": "code/logs/profiling/pixal3d-lowmem/round-g/sage/REPORT.md and round-g/sage-full, sage-7g (Spellcast3D hub, git-ignored); scripts in code/devtools/pixal3d-lowmem/round-g/sage/"
+  "previous": {
+    "wheel": "sageattention-2.2.0+cu128torch2.8.0.post4-cp39-abi3-win_amd64.whl",
+    "sha256": "7fc41e1c2fefd93344c064769fe5d84e05ed6aa8c9af6663ead6c245178e40cc",
+    "what": "The flows' full self-attention (one sequence, 12 heads x 128, bf16): pixal3d/modules/sage.py calls sageattn_qk_int8_pv_fp16_cuda(per_warp, fp16+fp32); post4 = post3 with that kernel tuned for sm_8x (two blocks an SM, the P.V step one output tile at a time) and SASS for sm_86 / sm_89: the same bits, -13 % a call on an RTX 3060",
+    "kept_in": "release/cache/wheels/keep/ (the wheel, and its json as sageattention.post4.json; post3 and sageattention.post3.json beside it)"
+  },
+  "post3_notes": {
+    "origin": {
+      "release": "https://github.com/woct0rdho/SageAttention/releases (the build for torch 2.8.0 + cu128; post4-post6 need torch >= 2.9)",
+      "upstream": "https://github.com/thu-ml/SageAttention",
+      "license": "Apache-2.0 (LICENSE inside the wheel)",
+      "downloaded": "2026-10-15, sha256 equal to the release asset's digest"
+    },
+    "what_for": "The flows' full self-attention (one sequence, 12 heads x 128, bf16) through int8 Q.K^T and fp16 P.V kernels: pixal3d/modules/sage.py, switch PIXAL3D_SAGE (on by default after a first-use self-check; off = flash_attn, bit for bit as before). Measured on an RTX 3060: an hr / tex pass at 1536 -26 %, a five-prop batch -20 %, the allocated memory peak of a pass unchanged.",
+    "known_issue_of_this_build": "post6 upstream fixed stale shared memory for key rows past the sequence end; in this build it only matters for sequences of 64 keys or fewer, which the fork never hands to it (sage.MIN_TOKENS 65)",
+    "measurements": "code/logs/profiling/pixal3d-lowmem/round-g/sage/REPORT.md and round-g/sage-full, sage-7g (Spellcast3D hub, git-ignored); scripts in code/devtools/pixal3d-lowmem/round-g/sage/"
+  },
+  "post4_verification": {
+    "card": "NVIDIA GeForce RTX 3060 (sm_86), 2026-10-19, after pip install --no-deps --force-reinstall --no-index into code/venvs/pixal3d",
+    "selfcheck": "pixal3d.modules.sage._check: passes, kernel sageattn_qk_int8_pv_fp16_cuda (per_warp, fp16+fp32)",
+    "every_qattn_sm80_kernel": "128 of 128 calls of sageattn_qk_int8_pv_fp16_cuda's option grid bit-equal to post3 (sha256 of output and LSE; sv_entrypoints.py; post3 ran sm_80 SASS, post4 sm_86 SASS)",
+    "flows_kernel_vs_post3_kernel": "52 of 52 cases bit-equal and deterministic (round I's 32 q/k/v captures + random tables at 65..41,637 tokens x 2 seeds; bitcheck.py against ctrl80 = post3's kernel instruction for instruction)",
+    "error_tables": "round I's sf_real.py on the 32 captures: every error figure of the fork's kernel equal to round I's (post3) to the last digit",
+    "passes_sv1536": "hr 2.936 -> 2.688 s a pass (-8.45 %), tex 2.936 -> 2.700 s (-8.0 %), interleaved, one pass bit-equal post3 vs post4 (sv_passes.py)",
+    "ms_per_call_vs_post3_kernel": {
+      "4096": "2.171 -> 1.860 (-14.3 %)",
+      "17446": "37.473 -> 32.392 (-13.6 %)",
+      "21504": "56.364 -> 49.004 (-13.1 %)",
+      "21547": "57.642 -> 49.928 (-13.4 %)",
+      "41637": "215.118 -> 186.779 (-13.2 %)"
+    },
+    "golden_check_sage_off": "check_engine.py --case sv1024: PASSED, all 34 comparisons",
+    "not_verified": "sm_89 SASS (no sm_89 card: compared instruction for instruction with sm_86's, F2FP spellings aside), sm_80 SASS on an A100-class card (measured as sm_80 SASS on the RTX 3060 only), PTX JIT on sm_90 / sm_120 (the fork uses the Triton kernel there); Nsight Compute (performance counters restricted to administrators on this PC)",
+    "scripts_and_results": "code/devtools/pixal3d-lowmem/round-j/sagecuda/ (README.md); code/logs/profiling/pixal3d-lowmem/round-j/sagecuda/ (install-post4.json, bitcheck-installed-post4.json, entrypoints-post*.json, real-post4.json, passes-sv1536.json, bench-*.json)"
+  },
+  "verification": {
+    "card": "NVIDIA GeForce RTX 3060 (sm_86), after pip install --no-deps --force-reinstall --no-index into code/venvs/pixal3d",
+    "selfcheck": {
+      "ok": true,
+      "kernel": "sageattn_qk_int8_pv_fp16_cuda (per_warp, fp16+fp32), the tuned kernel (qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d)",
+      "lines": [
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 55.86 -> 49.28 ms (-11.8 %), 8,192 tokens 8.09 -> 7.01 ms (-13.4 %) (0.52 s)",
+        "[SAGE] the flows' full self-attention runs SageAttention: sageattn_qk_int8_pv_fp16_cuda (per_warp, fp16+fp32), the tuned kernel (qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d) (PIXAL3D_SAGE)"
+      ],
+      "seconds": 1.646
+    },
+    "every_qattn_sm80_kernel_through_the_wheel_entry": {
+      "against": "2.2.0+cu128torch2.8.0.post3",
+      "file": "C:\\_myDrive\\repos\\spellcast3d\\code\\logs\\profiling\\pixal3d-lowmem\\round-j\\sagecuda\\entrypoints-post3.json",
+      "equal": 128,
+      "differ": []
+    },
+    "both_ops_vs_post3_kernel": "52 / 52 (shipped op) and 52 / 52 (tuned op) cases bit-equal to ctrl80 (post3's kernel instruction for instruction), deterministic 52 / 52; the whole entry 52 / 52, the fork's tuned call 52 / 52; round I's 32 captures + random tables at 65..41,637 tokens x 2 seeds",
+    "tuned_op_option_grid": "32 / 32 configurations of the inst_buf op (fp16 / bf16, head 64 / 128, causal, per_warp / per_thread, LSE): the _sc3d op's output and LSE equal to the shipped op's",
+    "ms_per_call": {
+      "what": "kernel only, interleaved, medians of 30 (ctrl80 = post3's kernel, ctrl86 = the shipped source as sm_86 SASS, o1lb2_86 = post4's tuned kernel)",
+      "rows": {
+        "4096": {
+          "ctrl80": 2.143,
+          "ctrl86": 2.071,
+          "shipped": 2.088,
+          "tuned": 1.787,
+          "o1lb2_86": 1.785,
+          "tuned_vs_shipped_pct": -14.44,
+          "shipped_vs_post3_pct": -2.56,
+          "tuned_vs_post3_pct": -16.63
+        },
+        "17446": {
+          "ctrl80": 37.492,
+          "ctrl86": 36.474,
+          "shipped": 36.435,
+          "tuned": 32.563,
+          "o1lb2_86": 32.509,
+          "tuned_vs_shipped_pct": -10.63,
+          "shipped_vs_post3_pct": -2.82,
+          "tuned_vs_post3_pct": -13.15
+        },
+        "21504": {
+          "ctrl80": 56.517,
+          "ctrl86": 54.752,
+          "shipped": 54.815,
+          "tuned": 49.065,
+          "o1lb2_86": 49.06,
+          "tuned_vs_shipped_pct": -10.49,
+          "shipped_vs_post3_pct": -3.01,
+          "tuned_vs_post3_pct": -13.19
+        },
+        "21547": {
+          "ctrl80": 57.637,
+          "ctrl86": 56.092,
+          "shipped": 55.874,
+          "tuned": 49.907,
+          "o1lb2_86": 49.868,
+          "tuned_vs_shipped_pct": -10.68,
+          "shipped_vs_post3_pct": -3.06,
+          "tuned_vs_post3_pct": -13.41
+        },
+        "41637": {
+          "ctrl80": 215.414,
+          "ctrl86": 208.829,
+          "shipped": 208.801,
+          "tuned": 187.281,
+          "o1lb2_86": 186.749,
+          "tuned_vs_shipped_pct": -10.31,
+          "shipped_vs_post3_pct": -3.07,
+          "tuned_vs_post3_pct": -13.06
+        }
+      }
+    },
+    "fork_choice": {
+      "as_expected": true,
+      "checks": {
+        "auto_tuned_every_time": true,
+        "forced_tuned": true,
+        "forced_shipped": true,
+        "wheel_shipped": true,
+        "no_op_shipped_no_race": true,
+        "margin_shipped": true,
+        "no_room_shipped": true,
+        "race_error_shipped": true,
+        "every_answer_equals_shipped_call": true,
+        "off_is_off": true
+      },
+      "auto_lines": [
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 55.29 -> 49.17 ms (-11.1 %), 8,192 tokens 8.10 -> 7.00 ms (-13.6 %) (0.52 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 55.34 -> 47.66 ms (-13.9 %), 8,192 tokens 8.09 -> 7.02 ms (-13.3 %) (0.50 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 55.01 -> 47.58 ms (-13.5 %), 8,192 tokens 8.12 -> 7.01 ms (-13.8 %) (0.50 s)"
+      ],
+      "selfcheck_seconds": [
+        0.611,
+        0.508,
+        0.507
+      ]
+    },
+    "race_representative": {
+      "what": "race_check.py: tuned / shipped - 1 (median of 12 ABBA calls each, after a warm-up) on the race's own tables, separate q / k, normal-like int8, the bench's quantised tables and a real sv1536 hr capture; then sage._race as the fork calls it (RACE_TOKENS (21504, 4), (8192, 6), margin 5 %)",
+      "ratio_pct": {
+        "race@21504": -12.67,
+        "race_qk@21504": -12.44,
+        "normal@21504": -12.59,
+        "real@21504": -12.6,
+        "capture@21504": -13.84,
+        "race@8192": -13.51,
+        "race_qk@8192": -13.58,
+        "normal@8192": -13.67,
+        "real@8192": -13.75
+      },
+      "race_runs": [
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 54.86 -> 47.65 ms (-13.1 %), 8,192 tokens 8.11 -> 7.00 ms (-13.8 %) (0.51 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 54.73 -> 47.59 ms (-13.0 %), 8,192 tokens 8.09 -> 6.98 ms (-13.7 %) (0.51 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 54.64 -> 47.61 ms (-12.9 %), 8,192 tokens 8.09 -> 7.01 ms (-13.4 %) (0.51 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 54.58 -> 47.60 ms (-12.8 %), 8,192 tokens 8.11 -> 6.98 ms (-13.9 %) (0.50 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 54.68 -> 47.76 ms (-12.7 %), 8,192 tokens 8.09 -> 7.02 ms (-13.2 %) (0.51 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 54.68 -> 47.70 ms (-12.8 %), 8,192 tokens 8.09 -> 6.98 ms (-13.7 %) (0.51 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 54.72 -> 47.66 ms (-12.9 %), 8,192 tokens 8.11 -> 7.01 ms (-13.6 %) (0.51 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 54.74 -> 47.69 ms (-12.9 %), 8,192 tokens 8.09 -> 7.01 ms (-13.4 %) (0.51 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 54.65 -> 47.75 ms (-12.6 %), 8,192 tokens 8.12 -> 7.03 ms (-13.5 %) (0.51 s)",
+        "[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: 21,504 tokens 54.76 -> 47.69 ms (-12.9 %), 8,192 tokens 8.10 -> 6.98 ms (-13.8 %) (0.51 s)"
+      ],
+      "race_runs_won_by_tuned": 10
+    },
+    "passes_sv1536": {
+      "hr": {
+        "post4": 2.6947,
+        "post5": 2.6904,
+        "shipped": 2.8909,
+        "post5_vs_post4_pct": -0.16,
+        "shipped_vs_post4_pct": 7.28,
+        "bit_equal_one_pass_to_post4": {
+          "post5": true,
+          "shipped": true
+        }
+      },
+      "tex": {
+        "post4": 2.6997,
+        "post5": 2.6994,
+        "shipped": 2.8952,
+        "post5_vs_post4_pct": -0.01,
+        "shipped_vs_post4_pct": 7.24,
+        "bit_equal_one_pass_to_post4": {
+          "post5": true,
+          "shipped": true
+        }
+      }
+    },
+    "golden_check_sage_off": "PASSED: all 34 comparisons.",
+    "fake_tests": {
+      "fake": "PASSED: 41 of 41 tests of the engine's logic on fakes.",
+      "fake_real_store_loader": "PASSED: 41 of 41 tests of the engine's logic on fakes, with the worktree's own PropStore, with the worktree's own NetworkLoader."
+    },
+    "not_verified": "only the RTX 3060 (sm_86) could be measured; every other sm_8x card times the two ops itself at its first use (sage._race) and keeps the tuned one only where it is >= 5 % faster at 21,504 and at 8,192 tokens. Unmeasured: sm_80 SASS on an A100-class card, sm_89 SASS on an RTX 40xx (its shipped kernel's SASS equals its own sm_86 SASS, F2FP spellings aside), other RTX 30xx; the shipped op's native sm_86 / sm_89 SASS against post3's sm_80 SASS on cards other than the 3060; PTX JIT on sm_90 / sm_120 (the fork uses the Triton kernel there); Nsight Compute (performance counters restricted to administrators on this PC)",
+    "scripts_and_results": "code/devtools/pixal3d-lowmem/round-j/sagecuda/ (README.md: *_post5.py, bitcheck_ops.py, bench_ops.py, compare_post5.py); code/logs/profiling/pixal3d-lowmem/round-j/sagecuda/ (install-post5.json, bitcheck-ops-post5.json, bench-ops-post5.json, selfcheck-post5.json, passes-post5-sv1536.json, entrypoints-post5.json, post5/)"
+  }
 }

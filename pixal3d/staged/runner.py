@@ -536,7 +536,16 @@ class StagedRunner:
         self._extra = set()
         self.ctx.hold = frozenset()
         if names:
+            size = getattr(loader, "size_mib", None)
+            names.sort(key=lambda name: -int((size(name) if size is not None else 0) or 0))
             loader.drop(*names)
+            # They were kept for the next prop of the group, which loads them again soon: the largest (the texture
+            # network) is read into the file cache meanwhile, as _set_aside does when it lets one go - from the
+            # disk a flow takes 1.1-1.8 s against 0.4 s from the cache (round I's 7.2 GiB run, three such reloads)
+            ahead = next((name for name in names if name not in self.plan.LIGHT), None)
+            if ahead is not None:
+                self._ahead = ahead
+                loader.prefetch(ahead)
 
     def _extra_mib(self) -> int:
         """MiB the networks kept for a later prop take on the card (those a part leaves for the next prop too)."""
@@ -732,9 +741,12 @@ class StagedRunner:
             for tail in list(self._tails):
                 if tail not in fresh:
                     self._advance(tail, gpu=False)
-            for tail in list(self._tails):
-                if tail not in fresh:
-                    self._advance(tail, gpu=True)
+            if self._decodes_left():
+                for tail in list(self._tails):
+                    if tail not in fresh:
+                        self._advance(tail, gpu=True)
+            else:
+                self._run_longest_first()
             for tail in fresh:
                 if tail in self._tails:
                     self._advance(tail, gpu=False)
@@ -757,6 +769,29 @@ class StagedRunner:
         return [tail for tail in self._tails
                 if tail.index == 0 and tail.future is None and tail.steps.steps
                 and tail.steps.steps[0][0] == "cpu"]
+
+    def _decodes_left(self) -> bool:
+        """Are props of the finish part still to be decoded in this wave (their turn on the card comes)?"""
+        return any(prop.part != "finish" for prop in self._alive("finish", self._wave_now))
+
+    def _run_longest_first(self) -> None:
+        """After the wave's last decode, nothing is left to hide the tails' CPU steps under and the batch ends with
+        the last of them: the GPU steps run one at a time, each time the tail with the most steps left first (a
+        geometry hands the worker an unwrap of several seconds and a bake and an export after it; a bake only an
+        export), and the CPU steps that ended meanwhile are collected and the next ones handed over between two GPU
+        steps. While props remain to be decoded the tails keep their own order (a bake lets go of its prop's RAM).
+        Round I's full-card tail through this runner with steps that sleep as long as that run's took (Spellcast3D's
+        round-j/overlap/tail_sim.py): the last prop done 13.9 s after the last decode instead of 15.85 (the run: 15.9).
+        A prop's numbers do not depend on when its steps run."""
+        while True:
+            for tail in list(self._tails):
+                self._advance(tail, gpu=False)
+            ready = [tail for tail in self._tails if tail.future is None and tail.index < len(tail.steps.steps)
+                     and tail.steps.steps[tail.index][0] == "gpu"]
+            if not ready:
+                return
+            longest = max(ready, key=lambda tail: len(tail.steps.steps) - tail.index)     # the first of equals
+            self._advance(longest, gpu=True)
 
     def _in_flight(self) -> int:
         """The tails whose steps still hold their prop's mesh and textures in RAM: every tail but those in their

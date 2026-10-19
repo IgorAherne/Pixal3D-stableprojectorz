@@ -195,7 +195,7 @@ class ModulatedTransformerCrossBlock(nn.Module):
             self.modulation = nn.Parameter(torch.randn(6 * channels) / channels ** 0.5)
 
     def _forward(self, x: torch.Tensor, mod: torch.Tensor, context: torch.Tensor, phases: Optional[torch.Tensor] = None,
-                 zero: bool = False) -> torch.Tensor:
+                 zero: bool = False, proj_cache: bool = False) -> torch.Tensor:
         if self.share_mod:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.modulation + mod).type(mod.dtype).chunk(6, dim=1)
         else:
@@ -203,15 +203,16 @@ class ModulatedTransformerCrossBlock(nn.Module):
         rows = _fused_rows(x)
         if rows is not None:
             return self._forward_fused(x, context, phases, rows, shift_msa, scale_msa, gate_msa, shift_mlp,
-                                       scale_mlp, gate_mlp, zero)
+                                       scale_mlp, gate_mlp, zero, proj_cache)
         h = self.norm1(x)
         h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
         h = self.self_attn(h, phases=phases)
         h = h * gate_msa.unsqueeze(1)
         x = x + h
         h = self.norm2(x)
-        if zero and type(self.cross_attn) is ProjectAttention:
-            h = self.cross_attn(h, context, zero=True)      # the zero context's one row (proj_attention.py)
+        if type(self.cross_attn) is ProjectAttention:
+            # zero: the zero context's one row; proj_cache: proj_linear's kept answer (proj_attention.py)
+            h = self.cross_attn(h, context, zero=zero, cache=proj_cache)
         else:
             h = self.cross_attn(h, context)
         x = x + h
@@ -225,7 +226,7 @@ class ModulatedTransformerCrossBlock(nn.Module):
     def _forward_fused(self, x: torch.Tensor, context: Any, phases: Optional[torch.Tensor], rows: dict,
                        shift_msa: torch.Tensor, scale_msa: torch.Tensor, gate_msa: torch.Tensor,
                        shift_mlp: torch.Tensor, scale_mlp: torch.Tensor, gate_mlp: torch.Tensor,
-                       zero: bool = False) -> torch.Tensor:
+                       zero: bool = False, proj_cache: bool = False) -> torch.Tensor:
         """_forward with the elementwise ops fused (modules/fused.py: the switch PIXAL3D_FUSED); the same
         sub-layers in the same order."""
         h = fused.norm_modulate(x, self.norm1.eps, scale=scale_msa, shift=shift_msa, **rows)
@@ -242,7 +243,7 @@ class ModulatedTransformerCrossBlock(nn.Module):
             global_context, proj_context = ((context['global'], context['proj']) if isinstance(context, dict)
                                             else context)
             global_out = self.cross_attn.cross_attn_block(h, global_context)
-            proj_out = self.cross_attn.proj_linear(proj_context)
+            proj_out = self.cross_attn.proj_feats(proj_context, proj_cache and not zero)
             if zero:
                 # the sum as the residual kernel rounds it (one bf16 add), first row of each batch item
                 self.cross_attn.remember_zero_row(shape, proj_out[:, :1] + global_out[:, :1])
@@ -260,10 +261,12 @@ class ModulatedTransformerCrossBlock(nn.Module):
         return fused.residual(x, h, gate=gate_mlp, **rows)
 
     def forward(self, x: torch.Tensor, mod: torch.Tensor, context: torch.Tensor, phases: Optional[torch.Tensor] = None,
-                zero: bool = False) -> torch.Tensor:
-        """`zero`: the context is all zeros (a guided sampling's unconditional pass; proj_attention.py)."""
+                zero: bool = False, proj_cache: bool = False) -> torch.Tensor:
+        """`zero`: the context is all zeros (a guided sampling's unconditional pass); `proj_cache`: keep
+        proj_linear's answer for the next pass with this context (proj_attention.py)."""
         if self.use_checkpoint:
-            return torch.utils.checkpoint.checkpoint(self._forward, x, mod, context, phases, zero, use_reentrant=False)
+            return torch.utils.checkpoint.checkpoint(self._forward, x, mod, context, phases, zero, proj_cache,
+                                                     use_reentrant=False)
         else:
-            return self._forward(x, mod, context, phases, zero)
+            return self._forward(x, mod, context, phases, zero, proj_cache)
         

@@ -3,9 +3,13 @@
     y = (x_int8 @ w_int8^T) [int32 accumulate] * row_scale[M] * col_scale[N] + bias   [-> GELU(tanh)]  -> bf16
 
 Symmetric quantisation, no zero points: weights per output channel (one-off at load), activations per row (token)
-at run time, or per row and per 128 input channels ("group" scales, a finer grain for the quality study).
+at run time, or per row and per 128 input channels ("group" scales, a finer grain for the quality study); with
+group scales on the activations the weights may have them too (one per output channel and 128 input channels:
+the group GEMM multiplies each 128-K slab's int32 partial product by the row's and the channel's scale of that
+slab), and SmoothQuant's per-input-channel vector s goes into the quantisers (x * (1 / s) as x is quantised, W * s
+before W is), or into fc1's epilogue for fc2's input.
 
-    quantize_weight(w)            bf16 [N, K] -> (int8 [N, K] row-major, fp32 col_scales [N])
+    quantize_weight(w, smooth, group)  bf16 [N, K] -> (int8 [N, K] row-major, fp32 scales [N] or [N, K / group])
     quantize_rows(x, group=0)     bf16 [..., K] -> (int8 [M, K], fp32 scales [M] or [M, K / group])
     norm_quant(x, eps, ...)       fused.norm_modulate's math (LayerNorm32 [affine] [* (1 + scale) + shift], the
                                   default "rounded" mode) emitting int8 rows + scales instead of bf16
@@ -21,7 +25,8 @@ Paths (`path=`; None = the table PATHS, chosen from the round-I measurements on 
     "intmm"    quantize_rows + torch._int_mm (cuBLASLt IMMA, int32 [M, N] out, rows in chunks of CHUNK_ROWS)
                + one Triton epilogue kernel: 1.6-2.7x (the int32 round trip); ties "triton" only on fc2 at small M.
     "group"    quantize_rows(group=128) + the Triton GEMM with the accumulator rescaled every 128-K block:
-               1.2-1.3x slower than "triton" (66-68 TOPS), for the quality study's finer scales.
+               1.2-1.3x slower than "triton" (66-68 TOPS), for the quality study's finer scales; weight scales
+               [N, K / 128] (quantize_weight(group=128)) add one multiply per element and slab (round J).
 The whole block (3 norms + 7 token-sized linears + GELU) runs 2.67-2.83x faster than bf16 (README.md).
 
 Capability gate (`capability()`): int8 tensor-core MMA exists from sm_75 (Turing). torch._int_mm needs sm_75+ and
@@ -186,16 +191,19 @@ def _build():
             tl.store(S + row * stride_s + g, tl.div_rn(amax, tl.full([NG], 127.0, tl.float32)), mask=gmask)
 
     @triton.jit(do_not_specialize=["M", "stride_asm", "stride_qsm"])
-    def gemm_kernel(A, B, C, AS, BS, BIAS, QS, M, N, K, stride_am, stride_bn, stride_cm, stride_asm, stride_qsm,
-                    HAS_BIAS: tl.constexpr, GELU: tl.constexpr, OUT: tl.constexpr, A_GROUP: tl.constexpr,
-                    MAGIC: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-                    GROUP_M: tl.constexpr):
+    def gemm_kernel(A, B, C, AS, BS, BIAS, QS, SMO, M, N, K, stride_am, stride_bn, stride_cm, stride_asm,
+                    stride_qsm, stride_bsn, HAS_BIAS: tl.constexpr, GELU: tl.constexpr, OUT: tl.constexpr,
+                    A_GROUP: tl.constexpr, B_GROUP: tl.constexpr, OUT_SMOOTH: tl.constexpr, MAGIC: tl.constexpr,
+                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
         # A: int8 [M, K] row-major; B: int8 [N, K] row-major (the weight as stored: both operands K-contiguous,
         # the "TN" layout int8 mma wants). OUT: 0 = bf16, 1 = the raw int32 accumulator (checks), 2 = int8 with one
         # fp32 scale per row and per BLOCK_N columns (QS [M, N / BLOCK_N]: the next layer's group-scaled input).
         # A_GROUP: 0 = AS holds one scale per row; else AS [M, K / BLOCK_K] and the int32 partial product of each
         # BLOCK_K slab is scaled into an fp32 accumulator (MAGIC: int32 -> fp32 by the 1.5 * 2^23 trick, exact for
-        # |partial| < 2^22, i.e. BLOCK_K <= 256).
+        # |partial| < 2^22, i.e. BLOCK_K <= 256). B_GROUP (needs A_GROUP): BS [N, K / BLOCK_K] column-major (a
+        # slab's BLOCK_N scales contiguous: stride 1 along N, N along K) holds one weight scale per output channel
+        # and BLOCK_K slab, multiplied into the slab's partial product beside the row's scale (otherwise BS [N]
+        # scales the columns in the epilogue). OUT_SMOOTH (OUT 2): the result times SMO [N] before it is quantised.
         pid = tl.program_id(0)
         num_pid_m = tl.cdiv(M, BLOCK_M)
         num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -215,6 +223,8 @@ def _build():
         if A_GROUP:
             accf = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             s_ptrs = AS + ram.to(tl.int64) * stride_asm
+            if B_GROUP:
+                w_ptrs = BS + rbn.to(tl.int64) * stride_bsn
             for kb in range(0, tl.cdiv(K, BLOCK_K)):
                 a = tl.load(a_ptrs)
                 b = tl.load(b_ptrs)
@@ -224,7 +234,11 @@ def _build():
                     pf = (part + 0x4B400000).to(tl.float32, bitcast=True) - 12582912.0
                 else:
                     pf = part.to(tl.float32)
-                accf += pf * s[:, None]
+                if B_GROUP:
+                    ws = tl.load(w_ptrs + kb * N)
+                    accf += pf * (s[:, None] * ws[None, :])
+                else:
+                    accf += pf * s[:, None]
                 a_ptrs += BLOCK_K
                 b_ptrs += BLOCK_K
             y = accf
@@ -243,13 +257,16 @@ def _build():
         if OUT == 1:
             tl.store(c_ptrs, acc, mask=mask)
         else:
-            cs = tl.load(BS + rbn)
-            y = y * cs[None, :]
+            if not B_GROUP:
+                cs = tl.load(BS + rbn)
+                y = y * cs[None, :]
             if HAS_BIAS:
                 y += tl.load(BIAS + rbn).to(tl.float32)[None, :]
             if GELU:
                 inner = 0.7978845608028654 * (y + 0.044715 * (y * y * y))
                 y = 0.5 * y * (1.0 + libdevice.tanh(inner))
+            if OUT_SMOOTH:
+                y = y * tl.load(SMO + rbn)[None, :]
             if OUT == 2:
                 amax = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-30)
                 inv = tl.div_rn(tl.full([BLOCK_M], 127.0, tl.float32), amax)
@@ -327,14 +344,19 @@ def quantize_rows(x: torch.Tensor, group: int = 0,
     return q, s
 
 
-def quantize_weight(w: torch.Tensor, smooth: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-    """nn.Linear weight [N, K] -> (int8 [N, K] row-major, fp32 per-output-channel scales [N]). The same row
+def quantize_weight(w: torch.Tensor, smooth: Optional[torch.Tensor] = None,
+                    group: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+    """nn.Linear weight [N, K] -> (int8 [N, K] row-major, fp32 per-output-channel scales [N], or [N, K // group]
+    with `group`: one per output channel and group of K, the "group" GEMM's weight scales, column-major). The same row
     quantiser: a row of the weight is one output channel. One-off, at load. smooth: s [K]; W * s is quantised
     (the activations then pass inv_smooth = 1 / s to quantize_rows / norm_quant / int8_linear)."""
     w = w.detach()
     if smooth is not None:
         w = w.float() * smooth.float()[None, :]
-    return quantize_rows(w, 0)
+    q, s = quantize_rows(w, group)
+    if group:
+        s = s.t().contiguous().t()          # column-major: the GEMM reads a 128-K slab's scales contiguously
+    return q, s
 
 
 def quantize_rows_torch(x: torch.Tensor, group: int = 0,
@@ -402,26 +424,41 @@ def norm_quant(x: torch.Tensor, eps: float, *, weight: Optional[torch.Tensor] = 
 # GEMMs
 # =====================================================================================================================
 
-def pick_config(M: int, N: int, K: int, group: int = 0) -> tuple:
+# group scales on both operands (weight scales per output channel and group, round J's policy "cs"): one more
+# multiply per element and 128-K slab; 64 x 128 tiles of 4 warps keep it 6-10 % over the group GEMM at K <= 2048
+# (CFG_GROUP: 10-14 %); fc2 (K = 8192) is fastest at CFG_GROUP (round-j/int8cs gg_sweep.json; the same bits)
+CFG_GROUP_W = (64, 128, 128, 8, 3, 4)
+
+
+def pick_config(M: int, N: int, K: int, group: int = 0, w_group: bool = False) -> tuple:
     if group:
-        return CFG_GROUP
+        return CFG_GROUP_W if w_group and K <= 2048 else CFG_GROUP
     return CFG_LONGK if K >= 4096 else CFG_BIG
 
 
 def gemm(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, bias: Optional[torch.Tensor],
          *, gelu: bool = False, out: str = "bf16", group: int = 0, cfg: Optional[tuple] = None,
-         magic: bool = True):
+         magic: bool = True, out_smooth: Optional[torch.Tensor] = None):
     """The Triton int8 GEMM with the epilogue fused. out: "bf16" -> bf16 [M, N]; "int32" -> the raw accumulator
-    (per-row mode only); "int8" -> (int8 [M, N], fp32 scales [M, N // BLOCK_N])."""
+    (per-row mode only); "int8" -> (int8 [M, N], fp32 scales [M, N // BLOCK_N]). w_s: fp32 [N] (one scale per
+    output channel) or [N, K // group] (one per output channel and group of K: needs group scales on x too).
+    out_smooth: fp32 [N] that multiplies the result before an "int8" output is quantised (the next layer's 1 / s)."""
     k = _build()
     M, K = xq.shape
     N = w_q.shape[0]
-    BM, BN, BK, GM, stages, warps = cfg or pick_config(M, N, K, group)
+    BM, BN, BK, GM, stages, warps = cfg or pick_config(M, N, K, group, w_s.dim() == 2)
     if K % BK:
         raise ValueError(f"K = {K} is not a multiple of BLOCK_K = {BK}")
     if group and group != BK:
         raise ValueError(f"the group path needs BLOCK_K == group ({BK} != {group})")
+    b_group = w_s.dim() == 2
+    if b_group and (not group or w_s.shape[1] * group != K):
+        raise ValueError(f"weight scales {tuple(w_s.shape)} per group need group scales on x (group {group}, K {K})")
+    if b_group and (w_s.stride(0) != 1 or w_s.stride(1) != N):
+        w_s = w_s.t().contiguous().t()      # the kernel reads them column-major (quantize_weight gives them so)
     mode = {"bf16": 0, "int32": 1, "int8": 2}[out]
+    if mode == 1 and b_group:
+        raise ValueError("the raw int32 output is for per-row scales only")
     dtype = {0: torch.bfloat16, 1: torch.int32, 2: torch.int8}[mode]
     y = torch.empty((M, N), dtype=dtype, device=xq.device)
     qs = None
@@ -432,10 +469,12 @@ def gemm(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tenso
     if M:
         grid = (k["cdiv"](M, BM) * k["cdiv"](N, BN),)
         k["gemm"][grid](xq, w_q, y, xs, w_s, bias if bias is not None else w_s, qs if qs is not None else w_s,
+                        out_smooth if out_smooth is not None else w_s,
                         M, N, K, xq.stride(0), w_q.stride(0), y.stride(0), xs.stride(0) if group else 1,
-                        qs.stride(0) if qs is not None else 1, HAS_BIAS=bias is not None, GELU=gelu, OUT=mode,
-                        A_GROUP=group, MAGIC=magic, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK, GROUP_M=GM,
-                        num_stages=stages, num_warps=warps)
+                        qs.stride(0) if qs is not None else 1, w_s.stride(0) if b_group else 1,
+                        HAS_BIAS=bias is not None, GELU=gelu, OUT=mode, A_GROUP=group, B_GROUP=b_group,
+                        OUT_SMOOTH=out_smooth is not None, MAGIC=magic, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+                        GROUP_M=GM, num_stages=stages, num_warps=warps)
     return (y, qs) if mode == 2 else y
 
 
@@ -489,13 +528,13 @@ def dequantize_rows(xq: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
     """(int8 [M, K], scales [M] or [M, K / group]) -> fp32 [M, K]."""
     M, K = xq.shape
     if xs.dim() == 2:
-        return (xq.float().view(M, xs.shape[1], -1) * xs.view(M, -1, 1)).view(M, K)
+        return (xq.float().view(M, xs.shape[1], -1) * xs.unsqueeze(-1)).view(M, K)
     return xq.float() * xs[:, None]
 
 
 def _fallback(x2: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, bias: Optional[torch.Tensor],
               gelu: bool) -> torch.Tensor:
-    w = (w_q.float() * w_s[:, None]).to(x2.dtype if x2.dtype.is_floating_point else torch.bfloat16)
+    w = dequantize_rows(w_q, w_s).to(x2.dtype if x2.dtype.is_floating_point else torch.bfloat16)
     y = F.linear(x2.to(w.dtype), w, bias.to(w.dtype) if bias is not None else None)
     return F.gelu(y, approximate="tanh") if gelu else y
 
@@ -505,11 +544,15 @@ def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: 
                 out_int8: bool = False, inv_smooth: Optional[torch.Tensor] = None):
     """y = x @ W^T + b [GELU tanh] with W = w_q * w_s[:, None]; x: bf16 [..., K] or a pre-quantised (x_q [M, K],
     x_s) pair (x_s [M]: per row; x_s [M, K / 128]: group scales, the "group" path). Returns bf16 [..., N], or
-    (int8 [M, N], scales) with out_int8 (path "triton"/"group": [M, N / 128] group scales; "intmm": [M] per row)."""
+    (int8 [M, N], scales) with out_int8 (path "triton"/"group": [M, N / 128] group scales; "intmm": [M] per row).
+    w_s [N, K / 128] (weight scales per output channel and group: quantize_weight(group=GROUP)) takes the "group"
+    path. inv_smooth: 1 / s [K] applied to a bf16 x as it is quantised (the weight holds W * s)."""
     pre = isinstance(x, tuple)
     K = w_q.shape[1]
     N = w_q.shape[0]
     lead = None if pre else x.shape[:-1]
+    if w_s.dim() == 2:
+        path = "group"
     if not enabled(x[0] if pre else x):
         if pre:
             x2 = dequantize_rows(*x).to(torch.bfloat16)
@@ -542,13 +585,18 @@ def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: 
 
 
 def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tuple, w2: tuple, *,
-             path: str = "rows", cfg1: Optional[tuple] = None) -> torch.Tensor:
+             path: str = "rows", cfg1: Optional[tuple] = None,
+             inv_smooth2: Optional[torch.Tensor] = None) -> torch.Tensor:
     """fc2(GELU(fc1(x))): w1, w2 = (w_q, w_s, bias).
     "rows" (fastest measured: 15.5 ms at M = 21504 vs 41.4 bf16): fc1 Triton with GELU -> bf16, quantize_rows,
            fc2 Triton (per-row scales everywhere, like the other layers);
     "group": fc1's Triton epilogue quantises each 128-column tile per row (int8 + group scales, the [M, 8192]
            hidden layer never in bf16; fc2 runs the group GEMM): 15.7 ms, 237 MiB peak vs 672 MiB bf16;
+           weight scales per group ([N, K / 128]) on either layer take the group-weight GEMM; inv_smooth2: fc2's
+           SmoothQuant 1 / s [8192], applied in fc1's epilogue before the hidden layer is quantised;
     "intmm": torch._int_mm, fc1's epilogue quantises each full row for fc2's torch._int_mm: 16.6 ms."""
+    if inv_smooth2 is not None and path != "group":
+        raise ValueError("fc2's smoothing is applied in the group path's fc1 epilogue only")
     if path == "rows":
         xq, xs = x if isinstance(x, tuple) else quantize_rows(x)
         h = gemm(xq, xs, *w1, gelu=True, group=GROUP if xs.dim() == 2 else 0)
@@ -566,10 +614,12 @@ def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tupl
         xq, xs = quantize_rows(x)
     M = xq.shape[0]
     if cfg1 is None:
-        cfg1 = CFG_GROUP if xs.dim() == 2 else CFG_FC1_INT8
+        cfg1 = (pick_config(M, w1[0].shape[0], xq.shape[1], GROUP, w1[1].dim() == 2) if xs.dim() == 2
+                else CFG_FC1_INT8)
     if cfg1[1] != GROUP:                            # fc1's BLOCK_N is the group size of fc2's input
         cfg1 = (cfg1[0], GROUP) + tuple(cfg1[2:])
-    hq, hs = gemm(xq, xs, *w1, gelu=True, out="int8", group=GROUP if xs.dim() == 2 else 0, cfg=cfg1)
+    hq, hs = gemm(xq, xs, *w1, gelu=True, out="int8", group=GROUP if xs.dim() == 2 else 0, cfg=cfg1,
+                  out_smooth=inv_smooth2)
     return gemm(hq, hs, *w2, group=GROUP, cfg=CFG_GROUP)
 
 
@@ -584,9 +634,13 @@ def reference_int(xq: torch.Tensor, w_q: torch.Tensor) -> torch.Tensor:
 
 def reference(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor,
               bias: Optional[torch.Tensor], gelu: bool = False) -> torch.Tensor:
-    """fp64 y from the same quantised operands (per-row or group scales), unrounded."""
+    """fp64 y from the same quantised operands (per-row or group scales; weight scales per channel or per group),
+    unrounded."""
     K = xq.shape[1]
-    if xs.dim() == 2:
+    if w_s.dim() == 2:
+        xd = dequantize_rows(xq.double(), xs.double()) if xs.dim() == 2 else xq.double() * xs.double()[:, None]
+        y = xd @ dequantize_rows(w_q.double(), w_s.double()).t()
+    elif xs.dim() == 2:
         g = K // xs.shape[1]
         xd = xq.double().view(xq.shape[0], -1, g) * xs.double().view(xq.shape[0], -1, 1)
         y = xd.view(xq.shape) @ w_q.double().t()
@@ -608,7 +662,13 @@ def reference_mag(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: to
     out = []
     for r0 in range(0, M, rows):
         q = xq[r0:r0 + rows].double()
-        if xs.dim() == 2:
+        if w_s.dim() == 2:
+            G = w_s.shape[1]
+            part = torch.einsum("mgk,ngk->mng", q.view(q.shape[0], G, -1), w_q.double().view(w_q.shape[0], G, -1))
+            sx = xs[r0:r0 + rows].double()
+            sx = sx[:, None, :] if sx.dim() == 2 else sx[:, None, None]
+            m = (part.abs() * sx * w_s.double()[None, :, :]).sum(-1)
+        elif xs.dim() == 2:
             G = xs.shape[1]
             part = torch.einsum("mgk,ngk->mng", q.view(q.shape[0], G, -1), w_q.double().view(w_q.shape[0], G, -1))
             m = (part.abs() * xs[r0:r0 + rows].double()[:, None, :]).sum(-1) * w_s.double()[None, :]
@@ -683,9 +743,50 @@ def self_check(device: torch.device) -> Tuple[bool, str]:
         worst, _ = within(got, reference(gq, gs, wq, ws, b), reference_mag(gq, gs, wq, ws, b), c=4 + K // GROUP)
         if worst > 1.0:
             return False, f"group GEMM {worst:.2f}x the fp32-rounding bound off"
+        ok, why = _check_group_weights(device, g, x, w, b)
+        if not ok:
+            return False, why
         torch.cuda.synchronize(device)
     except Exception as exc:        # noqa: BLE001
         return False, f"{type(exc).__name__}: {str(exc)[:300]}"
+    return True, ""
+
+
+def _check_group_weights(device: torch.device, g: torch.Generator, x: torch.Tensor, w: torch.Tensor,
+                         b: torch.Tensor) -> Tuple[bool, str]:
+    """The "cs" pieces: SmoothQuant 1 / s in the quantiser (bit-equal to the torch reference), weights quantised per
+    output channel and group (W * s), the GEMM with group scales on both operands (bf16 out within the fp32-rounding
+    bound of the fp64 value), and fc1's int8 output with the next layer's 1 / s applied before the quantisation
+    (each value within half a step of its group's scale of the fp64 value)."""
+    M, K = x.shape
+    N = w.shape[0]
+    s = torch.rand((K,), device=device, generator=g) * 4 + 0.25
+    s[3] = 20.0                                         # an outlier channel's divisor
+    inv = 1.0 / s
+    gq, gs = quantize_rows(x, GROUP, inv)
+    rq, rs = quantize_rows_torch(x, GROUP, inv)
+    if not (torch.equal(gq, rq) and torch.equal(gs, rs)):
+        return False, "smoothed group quantize_rows differs from the torch reference"
+    wq, ws = quantize_weight(w, smooth=s, group=GROUP)
+    rq, rs = quantize_rows_torch(w.float() * s[None, :], GROUP)
+    if not (torch.equal(wq, rq) and torch.equal(ws, rs)):
+        return False, "the group weight quantiser differs from the torch reference"
+    for gelu in (False, True):
+        got = gemm(gq, gs, wq, ws, b, gelu=gelu, group=GROUP, cfg=(64, 64, 128, 8, 3, 4))
+        worst, _ = within(got, reference(gq, gs, wq, ws, b, gelu), reference_mag(gq, gs, wq, ws, b),
+                          c=4 + 2 * K // GROUP, gelu=gelu)
+        if worst > 1.0:
+            return False, f"group-weight GEMM (gelu={gelu}) {worst:.2f}x the fp32-rounding bound off"
+    inv2 = 1.0 / (torch.rand((N,), device=device, generator=g) * 4 + 0.25)
+    hq, hs = gemm(gq, gs, wq, ws, b, gelu=True, out="int8", group=GROUP, cfg=(64, GROUP, 128, 8, 3, 4),
+                  out_smooth=inv2)
+    want = reference(gq, gs, wq, ws, b, True) * inv2.double()[None, :]
+    mag = reference_mag(gq, gs, wq, ws, b) * 1.2 * inv2.double()[None, :]
+    step = hs.double().repeat_interleave(GROUP, dim=1)
+    err = (dequantize_rows(hq.double(), hs.double()) - want).abs()
+    worst = float((err / (0.5 * (1 + 1e-4) * step + (4 + 2 * K // GROUP) * 2.0 ** -24 * mag + 1e-30)).max())
+    if worst > 1.0:
+        return False, f"fc1's smoothed int8 output {worst:.2f}x half a step off"
     return True, ""
 
 

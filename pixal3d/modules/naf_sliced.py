@@ -37,6 +37,15 @@ VALUE_SLICE_ABOVE_MIB = 512
 # left cut up would otherwise keep cuDNN's work area out, and cuDNN would go on with another algorithm (an
 # out-of-memory event the runner counts as a failure). It costs about 0.03 s a run at 1024 px.
 TRIM_BEFORE_ENCODERS = True
+# _rope_by_head turns every head of the guide's map by one Triton kernel, in place (FUSED_ROPE): rope_apply's
+# arithmetic element by element - x * cos and (-+partner) * sin each rounded to float32, then their sum, with no fused
+# multiply-add - so the same bits, without the per-head permuted copies, the rotated copy and the three temporary maps
+# (on the 4-view golden prop's cond_hr: 0.57 s of 4.4 s; Spellcast3D code/devtools/pixal3d-lowmem/round-j/parts).
+# At its first use in a process the kernel is checked against rope_apply on a small map; a card or Triton that cannot
+# run it, or gives other values, turns it off for the process (one line printed). False: rope_apply head by head.
+FUSED_ROPE = True
+_rope_kernel = None
+_rope_state: Optional[bool] = None      # None: not tried; True: checked; False: rope_apply from now on
 
 
 def _attention_of(naf) -> Optional[Callable]:
@@ -63,12 +72,85 @@ def _rope_by_head(rope, x: torch.Tensor) -> torch.Tensor:
     sin = torch.sin(angles)
     del angles
     dtype = torch.result_type(x, cos)
+    if dtype == x.dtype and _fused_rope_ok(x, cos, sin, rope.num_heads, rope_apply):
+        _fused_rope(x, cos, sin, rope.num_heads)
+        return x
     turned = x if dtype == x.dtype else x.new_empty(x.shape, dtype=dtype)
     for i in range(rope.num_heads):
         head = rope_apply(x[:, d * i:d * (i + 1)].permute(0, 2, 3, 1).reshape(batch, 1, height * width, d), sin, cos)
         turned[:, d * i:d * (i + 1)] = head.reshape(batch, height, width, d).permute(0, 3, 1, 2)
         del head
     return turned
+
+
+def _build_rope_kernel():
+    global _rope_kernel
+    if _rope_kernel is None:
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def rope_kernel(x, cos, sin, HW, D: tl.constexpr, D2: tl.constexpr, D2P: tl.constexpr, BLOCK: tl.constexpr):
+            # program (block of positions, b * heads + head): the head's channel pairs (j, j + D/2), j < D/2
+            hw = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+            j = tl.arange(0, D2P)
+            m = (hw < HW)[:, None] & (j < D2)[None, :]
+            p1 = x + tl.program_id(1).to(tl.int64) * D * HW + j[None, :].to(tl.int64) * HW + hw[:, None]
+            p2 = p1 + D2 * HW
+            c = hw[:, None].to(tl.int64) * D + j[None, :]
+            x1 = tl.load(p1, mask=m, other=0.0)
+            x2 = tl.load(p2, mask=m, other=0.0)
+            o1 = x1 * tl.load(cos + c, mask=m, other=0.0) + (-x2) * tl.load(sin + c, mask=m, other=0.0)
+            o2 = x2 * tl.load(cos + c + D2, mask=m, other=0.0) + x1 * tl.load(sin + c + D2, mask=m, other=0.0)
+            tl.store(p1, o1, mask=m)
+            tl.store(p2, o2, mask=m)
+
+        _rope_kernel = (rope_kernel, triton.cdiv, triton.next_power_of_2)
+    return _rope_kernel
+
+
+def _fused_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, heads: int) -> None:
+    """rope_apply(head, sin, cos) of every head of x [B, C, H, W] float32, written over x."""
+    kernel, cdiv, pow2 = _build_rope_kernel()
+    batch, channels, height, width = x.shape
+    d = channels // heads
+    hw = height * width
+    block = 128
+    kernel[(cdiv(hw, block), batch * heads)](x, cos, sin, hw, D=d, D2=d // 2, D2P=pow2(d // 2), BLOCK=block,
+                                              num_warps=4, enable_fp_fusion=False)
+
+
+def _fused_rope_ok(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, heads: int, rope_apply: Callable) -> bool:
+    """Whether the fused kernel applies to this map (and, at its first use, gives rope_apply's values)."""
+    global _rope_state
+    if not FUSED_ROPE or _rope_state is False or not x.is_cuda:
+        return False
+    batch, channels, height, width = x.shape
+    d = channels // heads
+    if (x.dtype != torch.float32 or cos.dtype != torch.float32 or sin.dtype != torch.float32 or d % 2
+            or not (x.is_contiguous() and cos.is_contiguous() and sin.is_contiguous())
+            or tuple(cos.shape) != (height * width, d) or tuple(sin.shape) != (height * width, d)):
+        return False
+    if _rope_state is None:
+        try:
+            g = torch.Generator(device=x.device).manual_seed(0)
+            hh, ww = 23, 37
+            small = torch.randn(2, 2 * d, hh, ww, device=x.device, generator=g) * 7
+            c = torch.randn(hh * ww, d, device=x.device, generator=g)
+            sn = torch.randn(hh * ww, d, device=x.device, generator=g)
+            want = torch.empty_like(small)
+            for i in range(2):
+                head = rope_apply(small[:, d * i:d * (i + 1)].permute(0, 2, 3, 1).reshape(2, 1, hh * ww, d), sn, c)
+                want[:, d * i:d * (i + 1)] = head.reshape(2, hh, ww, d).permute(0, 3, 1, 2)
+            _fused_rope(small, c, sn, 2)
+            if not torch.equal(small, want):
+                raise RuntimeError("the fused rotation differs from rope_apply")
+            _rope_state = True
+        except Exception as exc:        # noqa: BLE001 - rope_apply always works
+            print(f"[NAF] the fused rotation is off ({type(exc).__name__}: {str(exc)[:160]}); rope_apply runs "
+                  f"instead", flush=True)
+            _rope_state = False
+    return _rope_state
 
 
 def _heads_last(x: torch.Tensor) -> torch.Tensor:

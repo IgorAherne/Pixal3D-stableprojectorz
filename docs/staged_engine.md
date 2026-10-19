@@ -89,8 +89,12 @@ them, while props are still to be decoded (what its first step makes - the hub's
 prop - is needed one texture later, and the GPU steps that run now let go of an older prop's: two trees in RAM at
 that moment, not three; the last prop's tail is not deferred); and the props of a paired group go through the
 texture and the finish biggest shape first (`parts.pair_order`, by the voxels `upsample` foresaw), so that the last
-prop's steps, which nothing hides, are the smallest prop's. A prop's numbers do not depend on its place: every
-part draws from the generator state its own prop stored.
+prop's steps, which nothing hides, are the smallest prop's. After the wave's last decode the tails' GPU steps run
+one at a time, the tail with the most steps left first (`runner._run_longest_first`: a geometry, which hands the
+worker an unwrap, a bake and an export after it, before a bake, which hands it only an export), the CPU steps that
+ended collected and the next ones handed over between two of them; before that the tails keep their own order (a
+bake lets go of its prop's RAM). A prop's numbers do not depend on its place or on when its steps run: every part
+draws from the generator state its own prop stored.
 
 One thing a step may leave on the card: what the engine has room for. Before every step the runner writes
 `state["room_mib"]`, the MiB the step may keep for a later step of the same prop (`parts.tail_room`: what the card
@@ -156,7 +160,8 @@ of 8 GB, the last prop of a group - the texture network leaves the card before t
 room, and the cap `finish` sets counts what is allocated as room) and is read again for the next prop, from the
 file cache in most cases (its file is read ahead again meanwhile), and the decoders are loaded for every prop, as
 before. Whatever is kept for the next prop leaves the card at any failure, before the retry: the ladder's next rung
-finds the card as it would have without it. Props resumed from a checkpoint, which run `finish` alone, go
+finds the card as it would have without it (and the texture network's file is read ahead again, as when it leaves
+before a decode: from the disk it takes 1.1-1.8 s, from the file cache 0.4). Props resumed from a checkpoint, which run `finish` alone, go
 first in their kind. The events are those of the two parts with overlapping brackets: `tex` opens before its
 first prop, `finish` before its first prop, `tex` closes after its last prop, `finish` after the last prop's steps
 are over. A process that dies in a prop's finish leaves that prop's checkpoint alone: the props after it have not
@@ -204,6 +209,18 @@ the answer by 2^8 after it is folded into the weights when the switch is on (`sa
 `_prepare_flow` once a flow is loaded: to_qkv's v rows and bias times 2^-8, to_out's weight times 2^8; powers of
 two scale every product and sum exactly, so flash_attn, SDPA and the int8 layers give the same bits too): the
 kernel is called without its two elementwise passes (`sage.attention(..., scaled=True)`).
+
+A third saving of the same kind (round J): on the conditional passes, proj_linear's input is the projected
+conditioning, the same tensor at every step of a sampling, so each block's answer is the same table every pass
+(one GEMM of one shape on one input gives the same bits each time). Where the cap in force leaves room for the 30
+tables beside the sampler's own need (`parts.proj_cache_fits`: `sampler_mib(tokens)` + 1.1 x the tables, 1.9 GB at
+21.5k tokens, + 1,536 MiB to spare - the 12 GB card at 1536; a 7-8 GB card's cap of 6.8-7.1 GB would be left 72 MiB,
+as round J's emulated run showed before the margin; never when the cap was lifted) the engine marks the
+conditioning (`"proj_cache": True`, `parts._token_cond`) and the block keeps its answer with its input's identity
+(storage address, shape, version: `SparseProjectAttention.proj_feats`, `ProjectAttention.proj_feats`) and gives it
+again while the input is that tensor; the engine drops the tables after the sampling (`drop_proj_caches`, in a
+`finally`). One GEMM per block (157 ms of a 3.1 s detail pass) cheaper on every conditional pass after the first;
+bit-identical (the golden engine check sv1024 with the tables kept).
 
 The detail flows' token-sized linear layers run as int8 GEMMs (`pixal3d/modules/int8.py`, the kernels in
 `modules/int8mm.py`: Triton GEMMs on the int8 tensor cores with the scaling, bias and GELU fused into the epilogue,
@@ -317,15 +334,25 @@ Two rules use the room a big card leaves, and change nothing where it is short:
   stays through the prop's finish when, with it on the card, the decode with both decoders fits the cap the finish
   will set (with `decoders_fit`'s margin), the closing of the holes fits beside it, and the finish steps' GPU steps
   do within what their cap leaves the card: their native reserve (`glb_reserve` of the faces the voxels foresee -
-  `FACES_PER_VOXEL` 2.2 - or the larger one of a prop in its steps) and what they reserve through PyTorch
-  (`HOOK_TORCH_MIB` 1,500: Spellcast3D's geometry and bake at the default 2048 texture, 1.0-1.4 GB measured; a
-  4096 texture's bake takes 2.5 GB and may then run out of memory once, to run again with what is kept gone);
-  both decoders stay as well when the holes and the steps fit beside them too and the next prop's texture sampler
-  (`sampler_mib`) fits beside them under the cap in force. The sizes are the loaded networks' own
-  (`loader.size_mib`: 2,708 MiB for a texture network, 914 for a decoder). What is kept is counted out of the room a
-  finish step is offered (`tail_room`). On the full RTX 3060 every prop of the test set keeps both; under the caps
-  of a card that leaves Pixal3D 7.2 GiB nothing is kept, as before (a 1536 prop's decode with both decoders beside
-  the texture network needs 7,181 MiB of a 5,749 budget; a 1024 prop's 6,138 of 5,516 under a 7,168 MiB cap).
+  `FACES_PER_VOXEL` 2.2 - or that of a prop in its steps) and what they reserve through PyTorch, for this prop
+  and for every prop in its steps by its own faces (`steps_torch_mib`: the hook's figure, `HOOK_TORCH_MIB` 1,500
+  for Spellcast3D's geometry and bake at the default 2048 texture, 1.0-1.4 GB measured on meshes of up to 15 M
+  faces, and `HOOK_TORCH_MIB_PER_MFACE` 120 a million faces beyond: in round I's 7.2 GiB run, with one flat 1,500
+  counted, the geometry and the bake of a 21.5 M-face prop and the bake of an 18.3 M-face one ran out of memory
+  beside the kept texture network and ran again with it gone; measured in isolation on golden meshes at 2048
+  (round J): geometry 1,002 MiB at 14.9 M faces and 2,126 at 35.9 M, the bake 964 and 1,744, so the rule's
+  4,008 MiB at 35.9 M faces is conservative; a 4096 texture's bake takes 2.5 GB and may then run out of memory
+  once, to run again with what is kept gone);
+  both decoders stay as well when the holes and the steps fit beside them too and the next prop's texture
+  sampling fits beside them under the cap in force: its sampler (`sampler_mib`) and, where it will keep them, its
+  flow's proj_linear answers (`next_sampler_mib`: the test of `proj_cache_fits`, so the decoders never take the
+  room of that cache - 3.5 GB with its margin at 36 k tokens; on the full RTX 3060 a next prop above about 34 k
+  tokens keeps its cache and the decoders are loaded again for it). The sizes are the loaded networks' own
+  (`loader.size_mib`: 2,708 MiB for a bf16 texture network, 1,557 for an int8 one, 914 for a decoder). What is kept
+  is counted out of the room a finish step is offered (`tail_room`). On the full RTX 3060 every prop of the test
+  set keeps both; under the caps of a card that leaves Pixal3D 7.2 GiB nothing is kept for the test set's 1536 props
+  (by the figures), as before (with a bf16 network a 1536 prop's decode with both decoders beside it needs 7,181 MiB of a 5,749 budget;
+  an int8 one fits beside the decode, but not beside the GLB steps of the bulky props in their steps).
   Measured on golden props at 1024 on the full card, the pair's loads went from 14 (8.9 s) to 5 (1.4 s) and its
   drops from 15 to 6; a prop of the same kind turns round about 1.1 s sooner and decodes 0.4-0.9 s sooner; under a
   7,168 MiB cap the loads and drops are those of before, and the peaks too (4,116 MiB reserved).
@@ -338,6 +365,21 @@ Two rules use the room a big card leaves, and change nothing where it is short:
   comparisons on both cases). On the full RTX 3060 no prop of the test set needs it; on a card that leaves
   Pixal3D 7.2 GiB the bulkiest 1536 props (12.3 M voxels foreseen) and any shape on whole tables keep it, while the
   golden 1024 props and sv1536 (8.7 M), decoded in boxes, do without. The up-sampling keeps it.
+- **The decoders' own kernels (round J, 2026-10-19; every value the same):** the masked sparse convolutions' row
+  codes (the Gray code of the present neighbours and its binary number, which `sorted_idx` orders the rows by) are
+  made by one Triton pass (`modules/sparse/conv/codes.py`, checked against the eager loops at first use, which serve
+  if the kernel cannot run) instead of 27 + 26 integer passes over the neighbour map (0.05-3.1 ms against 1.5-47
+  ms a level; the sv1536 finish decode -0.19 s); `chunked.rowwise` cuts a whole table into near-equal windows of at
+  least `MIN_CALL_ROWS` (`EVEN_WINDOWS`) and the coarse levels' slab is 256 MiB (`COARSE_SLAB_BYTES`: -0.1 to -0.2 s
+  a prop, the peak unchanged); NAF's RoPE turns every head of the guide map in place by one Triton kernel
+  (`naf_sliced.FUSED_ROPE`, the eager `rope_apply` serving at any failure: cond_hr 4.38 -> 3.90 s on a three-view
+  prop); and flex_gemm's masked implicit-GEMM kernel is tuned with a steadier benchmark plus two tiles its list
+  lacks (`modules/sparse/conv/tuning.py`, installed by `conv_flex_gemm`): Triton's own benchmark times one run of a
+  50-80 ms kernel under whatever load the card has, which on the developer's PC had left 60 of 74 keys with slow
+  tiles (the 512x512 convolutions at 76.6 ms where 43.8 exists; every tile gives the same bits, SPLITK 1). The
+  tuning is per card and per install (`autotune_cache.json`, keyed by the card's name); a tile a card cannot hold
+  (shared memory) is skipped by Triton's autotuner. First-run tuning of the largest keys takes about twice as long
+  as before, once; the decode of a 1536 prop is then 9.5 -> 8.1 s on the RTX 3060.
 
 Before the decode in boxes, a bulky prop (41.6k tokens at 1408 by the token cap alone, 16.45 M voxels) was thus
 made at 1024 on a card that leaves Pixal3D 7.2 GiB, inside it, in 299 s - instead of at 1408 in 801 s with 2.6 GB

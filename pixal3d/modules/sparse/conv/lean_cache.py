@@ -25,6 +25,8 @@ from flex_gemm.ops import spconv, utils
 from flex_gemm.ops.spconv import Algorithm
 from flex_gemm.ops.spconv.submanifold_conv3d import SubMConv3dNeighborCache
 
+from . import codes
+
 MASKED = (Algorithm.MASKED_IMPLICIT_GEMM, Algorithm.MASKED_IMPLICIT_GEMM_SPLITK)
 MAX_KERNEL_VOLUME = 31      # the codes are kept as int32, as flex_gemm stores them: bit 31 would be the sign
 
@@ -57,16 +59,10 @@ def build(coords: torch.Tensor, shape: torch.Size, kernel_size: Tuple[int, int, 
     )
     del hashmap_keys, hashmap_vals
 
-    # A missing neighbour is 0xffffffff, which reads as -1 through an int32 view of the same memory.
-    neighbors = neighbor_map.view(torch.int32)
-    gray_code = torch.zeros(neighbor_map.shape[0], dtype=torch.int32, device=neighbor_map.device)
-    for v in range(volume):
-        gray_code.bitwise_or_((neighbors[:, v] != -1).to(torch.int32).bitwise_left_shift_(v))
-
-    # Gray code to binary: the code xor-ed with itself shifted right by 1, 2, ..., volume - 1.
-    binary_code = gray_code.clone()
-    for v in range(1, volume):
-        binary_code.bitwise_xor_(gray_code >> v)
+    # A missing neighbour is 0xffffffff, which reads as -1 through an int32 view of the same memory. The Gray code
+    # (bit v: a neighbour at offset v) and its binary number - the code xor-ed with itself shifted right by 1, 2,
+    # ..., volume - 1 - in one Triton pass (codes.py, the same integers as the eager loops, which it falls back to).
+    gray_code, binary_code = codes.codes(neighbor_map, volume)
     sorted_idx = torch.argsort(binary_code)
 
     return SubMConv3dNeighborCache(neighbor_map=neighbor_map, gray_code=gray_code, sorted_idx=sorted_idx)
