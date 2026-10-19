@@ -7,6 +7,7 @@ __pycache__/
 # Output files
 output.glb
 autotune_cache.json
+calibration.json
 
 # Virtual environment
 venv/

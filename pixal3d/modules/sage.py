@@ -63,6 +63,11 @@ and the tuned one serves only where it is at least RACE_MARGIN (5 %) faster at e
 wherever the timing cannot run (an older wheel without the op, no memory for the tables, an error), the shipped
 one, as before.
 One `[SAGE]` line says which won and by how much; PIXAL3D_SAGE=cuda-shipped / cuda-tuned skips the timing.
+An installed Spellcast3D does that timing once, at install, on a quiet card (`calibrate`, called by
+`python -m pixal3d.calibrate`, with more calls than the first-use race: CALIBRATION_RACE) and keeps the answer in
+the install's calibration record (pixal3d/calibration.py); a process then takes the recorded choice and times
+nothing. The record serves only for the card and the wheel it was made with: another card or wheel races at first
+use as an uncalibrated install does.
 
 Before the first SageAttention call of a process each kernel the card may use runs once on a small random table
 against an fp32 reference (`_check`; the Triton kernels compile there); a kernel that fails or answers wrongly is
@@ -101,6 +106,7 @@ RACE_MARGIN = 0.05  # the tuned op serves only where it is at least this much fa
 #                     (-12.8 % against -11.8 % a call at 21.5k tokens; blocks of one kernel: -10.5 %), and a median of
 #                     a few calls varies by about +-3 points - 5 % keeps the shipped op on a card where the tuned one
 #                     is not clearly faster, and loses nothing on the 3060 (the race there: -9 to -15 %)
+CALIBRATION_RACE = ((21504, 12), (8192, 16))  # the same race at install (calibrate): more calls, the card quiet
 # sm_8x, the automatic choice (PIXAL3D_SAGE on or unset), measured per card architecture (round J, sagefast):
 FUSED_PREP = False  # the CUDA kernel fed by sage_triton.ship_prep (one Triton pass) instead of the wheel's own
 #                     preprocessing; taken only where the self-check finds the wheel's bits on its table
@@ -272,19 +278,20 @@ def _wheel_call(op: Callable) -> Callable:
     return run
 
 
-def _race(device: torch.device) -> tuple[bool, str]:
+def _race(device: torch.device, plan: tuple = RACE_TOKENS) -> tuple[bool, str, list]:
     """The shipped and the tuned CUDA op timed on this card (see the docstring): the same random int8 q (also as k)
     and fp16 v at each of RACE_TOKENS, 12 heads x 128, the calls interleaved (shipped, tuned / tuned, shipped), one
     CUDA event pair each, the medians compared (round J: the tuned / shipped ratio on these tables is the one on
     the bench's quantised tables and on the flows' captured q / k / v to ~1 point, race_check.py). Both ops have run on the self-check's table just before (loaded,
-    the same bits). Returns (the tuned op serves, the [SAGE] line). Raises on a CUDA error; a size whose tables
-    (5 bytes a token and channel) do not fit in what the card and PyTorch's cache have free is left out."""
+    the same bits). `plan`: (tokens, calls of each) per size. Returns (the tuned op serves, the [SAGE] line, the
+    rows (tokens, shipped ms, tuned ms)). Raises on a CUDA error; a size whose tables (5 bytes a token and channel)
+    do not fit in what the card and PyTorch's cache have free is left out."""
     ops = torch.ops.sageattention_qattn_sm80
     fns = {"shipped": ops.qk_int8_sv_f16_accum_f16_attn_inst_buf, "tuned": getattr(ops, TUNED_OP)}
     heads, began = 12, time.perf_counter()
     rows, skipped = [], []
     torch.cuda.synchronize(device)
-    for n, calls in RACE_TOKENS:
+    for n, calls in plan:
         need = n * heads * HEAD_DIM * 5                  # int8 q (= k), fp16 v, bf16 output
         free = torch.cuda.mem_get_info(device)[0]
         spare = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
@@ -313,25 +320,74 @@ def _race(device: torch.device) -> tuple[bool, str]:
     seconds = time.perf_counter() - began
     if not rows:
         return False, (f"[SAGE] the shipped CUDA kernel serves: the tuned one was not timed (no room for the "
-                       f"tables of {', '.join(f'{n:,}' for n in skipped)} tokens)")
+                       f"tables of {', '.join(f'{n:,}' for n in skipped)} tokens)"), rows
     wins = all(t <= s * (1 - RACE_MARGIN) for _, s, t in rows)
     text = ", ".join(f"{n:,} tokens {s:.2f} -> {t:.2f} ms ({100 * (t / s - 1):+.1f} %)" for n, s, t in rows)
     if skipped:
         text += f"; {', '.join(f'{n:,}' for n in skipped)} not timed (no room)"
     if wins:
         return True, (f"[SAGE] the tuned CUDA kernel (round J) serves, timed against the shipped one: {text} "
-                      f"({seconds:.2f} s)")
+                      f"({seconds:.2f} s)"), rows
     return False, (f"[SAGE] the shipped CUDA kernel serves: the tuned one (round J) is not {100 * RACE_MARGIN:.0f} % "
-                   f"faster at every size timed: {text} ({seconds:.2f} s)")
+                   f"faster at every size timed: {text} ({seconds:.2f} s)"), rows
+
+
+def _wheel_version() -> Optional[str]:
+    from importlib import metadata
+
+    try:
+        return metadata.version("sageattention")
+    except Exception:        # noqa: BLE001 - no distribution metadata
+        return None
+
+
+def _stored(device: torch.device) -> Optional[dict]:
+    """The calibration record's choice between the two CUDA ops (`calibrate`), when it was made on this card with
+    the installed wheel; None otherwise (the first-use race then decides)."""
+    from .. import calibration
+
+    entry = calibration.section("sage", device)
+    if not entry or "tuned" not in entry or entry.get("wheel") != _wheel_version():
+        return None
+    return entry
+
+
+def calibrate(device: torch.device) -> dict:
+    """The install's calibration of the choice between the wheel's two CUDA kernels (`python -m pixal3d.calibrate`
+    calls it once, the card quiet): both ops on the self-check's table (they must give the same bits, else the
+    shipped one is recorded), then the race with CALIBRATION_RACE. Returns the record's "sage" section: {"wheel",
+    "capability", "tuned": bool, "summary", "timings": [{"tokens", "shipped_ms", "tuned_ms"}], "why"}."""
+    major, minor = torch.cuda.get_device_capability(device)
+    found = {"wheel": _wheel_version(), "capability": [major, minor], "tuned": False, "timings": []}
+    if major != 8:
+        found.update(why=f"sm_{major}{minor}: the CUDA kernels are used on sm_8x only", summary="not sm_8x")
+        return found
+    op = _tuned_op()
+    if op is None:
+        found.update(why="the installed wheel has no tuned kernel", summary="no tuned kernel in the wheel")
+        return found
+    q, k, vs, _want = _check_table(device)
+    shipped = _candidates(device, "wheel")["wheel"][0](q, k, vs)
+    tuned = _wheel_call(op)(q, k, vs)
+    torch.cuda.synchronize(device)
+    if not torch.equal(shipped, tuned):
+        found.update(why="the tuned kernel did not give the shipped kernel's bits on this card",
+                     summary="the tuned kernel's bits differ: the shipped one serves")
+        return found
+    del q, k, vs, _want, shipped, tuned
+    wins, line, rows = _race(device, CALIBRATION_RACE)
+    found["tuned"] = wins
+    found["timings"] = [{"tokens": n, "shipped_ms": round(a, 3), "tuned_ms": round(b, 3)} for n, a, b in rows]
+    found["summary"] = ", ".join(f"{n:,} tokens {a:.2f} -> {b:.2f} ms ({100 * (b / a - 1):+.1f} %)"
+                                 for n, a, b in rows) or "not timed"
+    found["why"] = line
+    return found
 
 
 def _triton_ranges(device: torch.device) -> tuple:
     """TRITON_TOKENS' ranges for the installed wheel and this card's architecture (none: the CUDA kernel serves)."""
-    from importlib import metadata
-
-    try:
-        version = metadata.version("sageattention")
-    except Exception:        # noqa: BLE001 - no distribution metadata: nothing was measured for it
+    version = _wheel_version()
+    if version is None:      # no distribution metadata: nothing was measured for it
         return ()
     return tuple(TRITON_TOKENS.get((version, *torch.cuda.get_device_capability(device)), ()))
 
@@ -370,11 +426,17 @@ def _choose(device: torch.device, cands: dict, tried: dict[str, Optional[torch.T
               f"available on this card or failed its self-check; the automatic choice serves", flush=True)
     cuda = ok.get("cuda") or ok.get("wheel")
     if "tuned" in ok:
-        try:
-            wins, line = _race(device)
-        except Exception as exc:        # noqa: BLE001 - a timing that fails changes nothing: the shipped op serves
-            wins, line = False, (f"[SAGE] the shipped CUDA kernel serves: timing the tuned one failed "
-                                 f"({type(exc).__name__}: {str(exc)[:200]})")
+        stored = _stored(device)
+        if stored is not None:
+            wins = bool(stored.get("tuned"))
+            line = (f"[SAGE] the {'tuned' if wins else 'shipped'} CUDA kernel serves, as timed on this card when "
+                    f"Spellcast3D was installed ({stored.get('summary', 'calibration record')})")
+        else:
+            try:
+                wins, line, _rows = _race(device)
+            except Exception as exc:    # noqa: BLE001 - a timing that fails changes nothing: the shipped op serves
+                wins, line = False, (f"[SAGE] the shipped CUDA kernel serves: timing the tuned one failed "
+                                     f"({type(exc).__name__}: {str(exc)[:200]})")
         print(line, flush=True)
         if wins:
             cuda = ok["tuned"]
@@ -388,6 +450,18 @@ def _choose(device: torch.device, cands: dict, tried: dict[str, Optional[torch.T
     return _by_length(cuda[0], triton[0], ranges), f"{cuda[1]}; at {text} tokens {triton[1]}"
 
 
+def _check_table(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The self-check's table (see _check): q, k, v * 2^-V_SHIFT [1, 1000, 12, 128] bf16 and the fp32 answer."""
+    g = torch.Generator(device=device).manual_seed(0)
+    n, heads = 1000, 12
+    qkv = torch.randn((1, n, 3, heads, HEAD_DIM), device=device, dtype=torch.bfloat16, generator=g)
+    qkv[:, :, 2] *= 1000
+    q, k, v = qkv[:, :, 0].contiguous(), qkv[:, :, 1].contiguous(), qkv[:, :, 2]
+    want_out = F.scaled_dot_product_attention(q.float().transpose(1, 2), k.float().transpose(1, 2),
+                                              v.float().transpose(1, 2)).transpose(1, 2)
+    return q, k, v * 2.0 ** -V_SHIFT, want_out
+
+
 def _check(device: torch.device) -> bool:
     """Every candidate kernel once on a random table (1000 tokens: more than one block of keys and not a multiple
     of it; v as a strided view and 1000 times larger than q and k, as the flows' v is), against fp32 attention:
@@ -397,14 +471,7 @@ def _check(device: torch.device) -> bool:
     global _state, _kernel, KERNEL
     try:
         cands = _candidates(device, preference())
-        g = torch.Generator(device=device).manual_seed(0)
-        n, heads = 1000, 12
-        qkv = torch.randn((1, n, 3, heads, HEAD_DIM), device=device, dtype=torch.bfloat16, generator=g)
-        qkv[:, :, 2] *= 1000
-        q, k, v = qkv[:, :, 0].contiguous(), qkv[:, :, 1].contiguous(), qkv[:, :, 2]
-        want_out = F.scaled_dot_product_attention(q.float().transpose(1, 2), k.float().transpose(1, 2),
-                                                  v.float().transpose(1, 2)).transpose(1, 2)
-        vs = v * 2.0 ** -V_SHIFT
+        q, k, vs, want_out = _check_table(device)
         tried: dict[str, Optional[torch.Tensor]] = {}
         notes = []
         for name in cands:
