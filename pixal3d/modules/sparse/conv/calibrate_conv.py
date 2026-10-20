@@ -198,11 +198,12 @@ def _one(n: int, logn: int, ci: int, co: int, seed: int, device: Any, masked: Ca
 
 
 def run(device: Any, say: Callable[[str], None] = print, grid: Optional[Dict[Tuple[int, int], Tuple[int, int]]] = None,
-        drop: bool = True) -> dict:
+        drop: bool = True, pause: Optional[Callable[[], None]] = None) -> dict:
     """Tune every key of `grid` (GRID by default) through flex_gemm's own tuners and save them into its cache file
-    (once, at the end: an interrupted run leaves the file as it was); with `drop` the three tuners' entries of this
-    card are dropped first (a first-use tuning may have been made under load), so that the file then holds the
-    calibrated keys alone. Returns the record's "flex_gemm" section."""
+    (once, at the end, only when every key was done: a run that fails or is interrupted leaves the file as it was and
+    the tuners as they were); with `drop` the three tuners' entries of this card are replaced by the calibrated keys
+    (a first-use tuning may have been made under load). `pause()` is called before each key (the caller checks the
+    card is still quiet). Returns the record's "flex_gemm" section."""
     import importlib
 
     from flex_gemm import AUTOTUNE_CACHE_PATH
@@ -226,6 +227,8 @@ def run(device: Any, say: Callable[[str], None] = print, grid: Optional[Dict[Tup
     keys: List[list] = []
     skipped: List[dict] = []
     autosave = getattr(autotuner, "AUTOSAVE_AUTOTUNE_CACHE", None)
+    before = {name: dict(t.cache) for name, t in tuners.items()}      # put back should the run not finish
+    finished = False
     with tuning.suspended():
         try:
             autotuner.AUTOSAVE_AUTOTUNE_CACHE = False        # one save at the end, not one per key and tuner
@@ -244,6 +247,8 @@ def run(device: Any, say: Callable[[str], None] = print, grid: Optional[Dict[Tup
                     if n is None:
                         skipped.append({"key": f"2^{logn} {family(ci, co)}", "why": f"over {MAX_KEY_MIB} MiB"})
                         continue
+                    if pause is not None:
+                        pause()
                     t0 = time.perf_counter()
                     torch.cuda.reset_peak_memory_stats(device)
                     failed = None
@@ -265,10 +270,16 @@ def run(device: Any, say: Callable[[str], None] = print, grid: Optional[Dict[Tup
                     done += 1
                 say(f"convolutions {ci}x{co}: {done} sizes (2^{lo}-2^{hi} rows) in "
                     f"{time.perf_counter() - fam_began:.1f} s")
+            finished = True
         finally:
             autotuner.AUTOSAVE_AUTOTUNE_CACHE = autosave
-            if keys or drop:
-                autotuner.save_autotune_cache()
+            if finished:
+                if keys or drop:
+                    autotuner.save_autotune_cache()
+            else:                                           # the tuners as they were: nothing half done is kept
+                for name, t in tuners.items():
+                    t.cache.clear()
+                    t.cache.update(before[name])
     seconds = time.perf_counter() - began
     peak_key = max((k[7] for k in keys), default=0)
     return {

@@ -39,14 +39,17 @@ def path() -> Path:
 
 
 def load() -> Optional[dict]:
-    """The record, or None when there is none or it cannot be read (read once per process)."""
+    """The record, or None when there is none or it cannot be read. A record that was read is kept for the process;
+    a missing or unreadable one is looked for again at the next call (the installer may write it meanwhile)."""
     where = str(path())
     if where not in _cache:
         try:
             record = json.loads(Path(where).read_text(encoding="utf-8"))
-            _cache[where] = record if isinstance(record, dict) else None
         except (OSError, ValueError):
-            _cache[where] = None
+            return None
+        if not isinstance(record, dict):
+            return None
+        _cache[where] = record
     return _cache[where]
 
 

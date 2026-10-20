@@ -127,12 +127,52 @@ def install() -> bool:
                 for c in tuner.configs}
         extra = [triton.Config({"B1": b1, "B2": b2, "BK": bk}, num_warps=warps, num_stages=stages)
                  for b1, b2, bk, warps, stages in EXTRA_CONFIGS if (b1, b2, bk, warps, stages) not in have]
-        tuner.configs[:0] = extra       # first: the usual winners set the bar EARLY_OUT holds the others to
+        # A new list on this tuner alone: flex_gemm gives every spconv tuner the same list object, and the split
+        # kernel's tile (SPLITK > 1) changes a decode's last bits - its choice stays among flex_gemm's own tiles.
+        tuner.configs = [*extra, *tuner.configs]    # first: the usual winners set the bar EARLY_OUT holds the others to
+        _merging_saver()
         _installed = True
     except Exception as exc:        # noqa: BLE001 - tuning as before
         print(f"[SPARSE] the convolutions' steady tuning is off ({type(exc).__name__}: {str(exc)[:120]})", flush=True)
         return False
     return True
+
+
+def _merging_saver() -> None:
+    """flex_gemm's save_autotune_cache merges the file with the process's tuners per CARD (`cache.update`): a process
+    that read the file before a calibration and tunes one key after it would write the card's whole entry back from
+    its own memory and lose every calibrated key (silently: the record still says calibrated). The saver is made to
+    merge per key: the file's keys stay, the process's own are added or replaced. Once per process."""
+    try:
+        from flex_gemm.utils import autotuner
+    except ImportError:
+        return
+    if getattr(autotuner.save_autotune_cache, "_sc3d_merging", False):
+        return
+    import json
+
+    def save_autotune_cache(path=None):     # noqa: ANN001 - flex_gemm's signature
+        path = path or autotuner.AUTOTUNE_CACHE_PATH
+        lock_path = path + ".lock"
+        with autotuner.FileLock(lock_path):
+            try:
+                with open(path, "r") as f:
+                    cache = json.load(f)
+            except (OSError, ValueError):
+                cache = {}
+            for device, tuners in autotuner.get_autotune_cache().items():
+                into = cache.setdefault(device, {})
+                for name, keys in tuners.items():
+                    into.setdefault(name, {}).update(keys)
+            tmp_path = path + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(cache, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+
+    save_autotune_cache._sc3d_merging = True            # type: ignore[attr-defined]
+    autotuner.save_autotune_cache = save_autotune_cache
 
 
 # ------------------------------------------------------------------------------------------------ the calibrated lookup
@@ -250,16 +290,26 @@ def nearest(cache: dict, name: str, key: str) -> Optional[Tuple[str, Any]]:
     if not sizes:
         return None
     best = None
+    seen_any = False
     for other in list(dict.keys(cache)):
         got = parse_key(name, other)
         if got is None or got[1] != rest or got[0] not in sizes:
             continue
+        seen_any = True
         rank = (abs(got[0] - logn), -got[0])
         if best is None or rank < best[0]:
             best = (rank, other)
     if best is None:
+        if not seen_any and (name, tuple(rest[:3])) not in _warned_gone:
+            _warned_gone.add((name, tuple(rest[:3])))
+            print(f"[SPARSE] the calibration record lists {rest[0]}x{rest[1]}x{rest[2]} for the {name} tuner but the "
+                  f"cache file holds no calibrated entry of it: tuning at first use (calibrate again: start "
+                  f"Spellcast3D's installer)", flush=True)
         return None
     return best[1], dict.__getitem__(cache, best[1])
+
+
+_warned_gone: set = set()
 
 
 def _install_nearest() -> bool:
@@ -269,6 +319,7 @@ def _install_nearest() -> bool:
     global _nearest_installed
     if _nearest_installed:
         return True
+    _merging_saver()
     try:
         found = tuners()
         for name, tuner in found.items():
@@ -331,14 +382,15 @@ def choice(logn: int, ci: int, co: int, v: int = 27) -> dict:
     return out
 
 
-def calibrate(device: Any, say: Callable[[str], None] = print) -> dict:
+def calibrate(device: Any, say: Callable[[str], None] = print, pause: Optional[Callable[[], None]] = None) -> dict:
     """Tune every convolution size the decoders can meet on this card, once (the install's calibration, `python -m
     pixal3d.calibrate`, on a quiet card): flex_gemm's own tuners through the functions the decoders call, with the
     steady benchmark and EXTRA_CONFIGS, saved into flex_gemm's cache file; this card's earlier entries of the three
     tuners are dropped first. Returns the record's "flex_gemm" section (calibrate_conv.run): the grid of sizes the
-    calibrated lookup reads, every key's choice, time and card memory, "summary" in one line."""
+    calibrated lookup reads, every key's choice, time and card memory, "summary" in one line. `pause()` runs
+    before each key (the caller checks the card is still quiet)."""
     from . import calibrate_conv
 
-    found = calibrate_conv.run(device, say=say)
+    found = calibrate_conv.run(device, say=say, pause=pause)
     forget_grid()
     return found

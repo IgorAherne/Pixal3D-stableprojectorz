@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import sys
-from typing import Callable, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -118,6 +118,25 @@ def _fused_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, heads: in
     block = 128
     kernel[(cdiv(hw, block), batch * heads)](x, cos, sin, hw, D=d, D2=d // 2, D2P=pow2(d // 2), BLOCK=block,
                                               num_warps=4, enable_fp_fusion=False)
+
+
+def warm_rope(device: Any, side: int, channels: int = 256, heads: int = 4) -> bool:
+    """Compile the fused rotation for a guide map of `side` x `side` (the install's calibration: the kernel is then
+    in Triton's cache for the artist's first prop). False when the kernel is off or cannot run (rope_apply serves)."""
+    if not FUSED_ROPE or _rope_state is False:
+        return False
+    d = channels // heads
+    x = torch.zeros(1, channels, side, side, device=device, dtype=torch.float32)
+    cos = torch.ones(side * side, d, device=device, dtype=torch.float32)
+    sin = torch.zeros(side * side, d, device=device, dtype=torch.float32)
+    try:
+        _fused_rope(x, cos, sin, heads)
+        torch.cuda.synchronize(device)
+    except Exception:       # noqa: BLE001 - the first real use decides, with its self-check
+        return False
+    finally:
+        del x, cos, sin
+    return True
 
 
 def _fused_rope_ok(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, heads: int, rope_apply: Callable) -> bool:
