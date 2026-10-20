@@ -10,8 +10,8 @@ process times or tunes anything while the artist works:
      every timing below wrong. NVML's utilisation is read every second (nvidia-smi); the steps start after five
      quiet seconds in a row (QUIET_UTIL %), and the card is looked at again before every convolution key: a run
      that finds it busy waits again, within one budget of --quiet-wait seconds for the whole run. A run that had to
-     go on with a busy card is written "complete": false, so that the installer tries once more at the next start
-     (at most MAX_ATTEMPTS times, then the record stands as it is).
+     go on with a busy card is written "complete": false; it stands all the same (the installer never measures again
+     by itself: Spellcast3D's Settings > Debugging has "Measure the graphics card again" for that).
   2. The Triton kernels the engine compiles at first use are compiled now, through their own self-checks (the
      fused elementwise kernels, the int8 GEMMs, the convolutions' row codes): the first 3D job of the install no
      longer waits for them (the compiled kernels stay in Triton's cache).
@@ -60,7 +60,7 @@ QUIET_SECONDS = 5        # quiet samples in a row before the steps start
 SETTLE_SECONDS = 1.0
 CHECK_EVERY = 15.0
 SAY_EVERY = 30.0         # while waiting: one line this often
-MAX_ATTEMPTS = 3         # runs that ended with a busy card or a failed step before the record stands as it is
+MAX_ATTEMPTS = 3         # (kept for the record's "attempts" count; the installer no longer retries by itself)
 # Where the run's bar stands when each step begins (the installer shows it on its page: components._calibrate reads
 # the "NN%" of a progress line).
 SHARE = {"start": 0.0, "triton": 0.04, "sage": 0.14, "convolutions": 0.18, "done": 1.0}
@@ -429,12 +429,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
     why = (f"the card was busy with another program during the run" if quiet.busy_during else "") \
         + (f"{'; ' if quiet.busy_during and failed else ''}{', '.join(failed)} failed" if failed else "")
-    if attempts >= MAX_ATTEMPTS:
-        say(f"done in {record['seconds'] / 60:.1f} minutes, with a reservation ({why}); this was attempt "
-            f"{attempts} of {MAX_ATTEMPTS}: the record stands as it is (kept in {where})")
-        return 0
-    say(f"done in {record['seconds'] / 60:.1f} minutes, with a reservation ({why}): the installer tries once more "
-        f"at its next start (attempt {attempts} of {MAX_ATTEMPTS}; kept in {where})")
+    say(f"done in {record['seconds'] / 60:.1f} minutes, with a reservation ({why}); the record stands as it is (kept in "
+        f"{where}). To measure again with the card free, use Settings > Debugging > Measure the graphics card again")
     return 1
 
 
