@@ -52,12 +52,27 @@ os.environ["TRITON_CACHE_DIR"] = str(Path(sys.prefix) / "triton-cache")
 
 QUIET_UTIL = 15          # % of the card's time busy (NVML) that still counts as quiet
 QUIET_SECONDS = 5        # quiet samples in a row before the steps start
+# A quick look between keys first lets the run's own kernels drop out of NVML's sample window: utilization.gpu is
+# the share of the LAST sample period (up to a second) that had a kernel running, so a sample taken right after a
+# benchmark reads 100 % of the run's own work (the first install blamed itself and waited after every key). The
+# card is looked at again at most every CHECK_EVERY seconds of work (a look costs SETTLE_SECONDS), and two busy
+# samples in a row are needed before a quick look counts the card as busy.
+SETTLE_SECONDS = 1.0
+CHECK_EVERY = 15.0
 SAY_EVERY = 30.0         # while waiting: one line this often
 MAX_ATTEMPTS = 3         # runs that ended with a busy card or a failed step before the record stands as it is
+# Where the run's bar stands when each step begins (the installer shows it on its page: components._calibrate reads
+# the "NN%" of a progress line).
+SHARE = {"start": 0.0, "triton": 0.04, "sage": 0.14, "convolutions": 0.18, "done": 1.0}
 
 
 def say(text: str) -> None:
     print(f"[CALIBRATE] {text}", flush=True)
+
+
+def progress(fraction: float, text: str) -> None:
+    """A line the installer reads for its page: how far the run is (0..1) and what it does now."""
+    print(f"[CALIBRATE] {int(round(max(0.0, min(1.0, fraction)) * 100)):3d}% {text}", flush=True)
 
 
 def _nvidia_smi() -> Optional[str]:
@@ -98,48 +113,63 @@ class Quiet:
         self.busy_during = False    # a wait ran out of budget: the steps went on beside another program
         self.unknown = False        # nvidia-smi could not be asked
         self.told = -SAY_EVERY
+        self.looked: Optional[float] = None     # time.monotonic() of the last look (a quick one is skipped for CHECK_EVERY)
 
     def wait(self, quick: bool = False) -> bool:
-        """Until the card has been at most QUIET_UTIL % busy for QUIET_SECONDS samples in a row - one sample when
-        `quick` (between keys: the card is ours unless another program started; found busy, a proper quiet spell is
-        waited for). True when it was quiet, False when the budget ran out."""
+        """Until the card has been at most QUIET_UTIL % busy for QUIET_SECONDS samples in a row. `quick` (between
+        keys: the card is the run's own unless another program started): nothing within CHECK_EVERY seconds of the
+        last look; else SETTLE_SECONDS for the run's own kernels to leave NVML's window, then one sample - quiet,
+        done; busy twice in a row, a proper quiet spell is waited for. True when it was quiet, False when the budget
+        ran out."""
         self.checks += 1
         if self.busy_during:
             return False                # the budget is spent: said once, the run goes on without more waiting
+        if quick and self.looked is not None and time.monotonic() - self.looked < CHECK_EVERY:
+            return True
+        if quick:
+            time.sleep(SETTLE_SECONDS)
         began = time.monotonic()
-        calm, need, found_busy = 0, (1 if quick else QUIET_SECONDS), False
-        while True:
-            got = _query("utilization.gpu")
-            if got is None:
-                self.unknown = True
-                return True
-            try:
-                util = int(float(got[0]))
-            except ValueError:
-                util = 100
-            if util <= QUIET_UTIL:
-                calm += 1
-            else:
-                calm = 0
-                need = QUIET_SECONDS
-                if not found_busy:
-                    found_busy = True
-                    self.waits += 1
-            if calm >= need:
-                self.spent += time.monotonic() - began
-                return True
-            waited = self.spent + time.monotonic() - began
-            if waited >= self.limit:
-                self.spent = waited
-                self.busy_during = True
-                say(f"the graphics card is still busy after {waited / 60:.0f} minutes of waiting (last {util} %): "
-                    f"going on anyway - this run is not kept as final, the installer tries again at its next start")
-                return False
-            if util > QUIET_UTIL and waited - self.told >= SAY_EVERY:
-                self.told = waited
-                say(f"the graphics card is busy ({util} % in use): waiting for it to be free before measuring. "
-                    f"Please close heavy programs (Blender, games, videos, Photoshop, a browser with many tabs).")
-            time.sleep(1.0)
+        calm, need, found_busy, strikes = 0, (1 if quick else QUIET_SECONDS), False, 0
+        try:
+            while True:
+                got = _query("utilization.gpu")
+                if got is None:
+                    self.unknown = True
+                    return True
+                try:
+                    util = int(float(got[0]))
+                except ValueError:
+                    util = 100
+                if util <= QUIET_UTIL:
+                    calm += 1
+                    strikes = 0
+                else:
+                    calm = 0
+                    strikes += 1
+                    if quick and not found_busy and strikes < 2:
+                        time.sleep(1.0)     # one busy sample right after the run's own work proves nothing
+                        continue
+                    need = QUIET_SECONDS
+                    if not found_busy:
+                        found_busy = True
+                        self.waits += 1
+                if calm >= need:
+                    self.spent += time.monotonic() - began
+                    return True
+                waited = self.spent + time.monotonic() - began
+                if waited >= self.limit:
+                    self.spent = waited
+                    self.busy_during = True
+                    say(f"the graphics card is still busy after {waited / 60:.0f} minutes of waiting (last {util} %): "
+                        f"going on anyway - this run is not kept as final, the installer tries again at its next start")
+                    return False
+                if util > QUIET_UTIL and waited - self.told >= SAY_EVERY:
+                    self.told = waited
+                    say(f"the graphics card is busy ({util} % in use): waiting for it to be free before measuring. "
+                        f"Please close heavy programs (Blender, games, videos, Photoshop, a browser with many tabs).")
+                time.sleep(1.0)
+        finally:
+            self.looked = time.monotonic()
 
     def record(self) -> dict:
         return {"quiet": not self.busy_during and not self.unknown, "waited_s": round(self.spent, 1),
@@ -314,12 +344,23 @@ def _sage(device: Any) -> dict:
 
 
 def _convolutions(device: Any, quiet: Quiet) -> dict:
-    from pixal3d.modules.sparse.conv import tuning
+    from pixal3d.modules.sparse.conv import calibrate_conv, tuning
 
     calibrate = getattr(tuning, "calibrate", None)
     if calibrate is None:
         return {"ok": False, "why": "this build has no convolution calibration"}
-    return calibrate(device, say=say, pause=lambda: quiet.wait(quick=True))
+    shapes = max(1, len(getattr(calibrate_conv, "GRID", {})) or 1)
+    done = [0]
+
+    def tell(text: str) -> None:
+        """The step's own lines; one per finished shape ("convolutions 1024x1024: 9 sizes ...") moves the bar."""
+        if text.startswith("convolutions ") and " sizes (" in text:
+            done[0] += 1
+            progress(SHARE["convolutions"] + (SHARE["done"] - SHARE["convolutions"]) * min(done[0], shapes) / shapes,
+                     f"{text} - shape {done[0]} of {shapes}")
+        else:
+            say(text)
+    return calibrate(device, say=tell, pause=lambda: quiet.wait(quick=True))
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -333,7 +374,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         os.environ["PIXAL3D_CALIBRATION_FILE"] = args.record
     skip = {part.strip() for part in args.skip.split(",") if part.strip()}
 
-    say("checking that the graphics card is free (close heavy programs: Blender, games, videos, Photoshop)")
+    progress(SHARE["start"], "checking that the graphics card is free (close heavy programs: Blender, games, videos, "
+                              "Photoshop)")
     quiet = Quiet(args.quiet_wait)
     quiet.wait()
 
@@ -361,16 +403,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         + (f", attempt {attempts}" if attempts > 1 else ""))
     began = time.monotonic()
     if "triton" not in skip:
-        say("compiling Pixal3D's GPU kernels")
+        progress(SHARE["triton"], "compiling Pixal3D's GPU kernels (step 1 of 3)")
         _timed("triton", lambda: _triton(device), record)
     if "sage" not in skip:
-        say("timing the attention kernels")
+        progress(SHARE["sage"], "timing the attention kernels (step 2 of 3)")
         quiet.wait(quick=True)
         found = _timed("sage", lambda: _sage(device), record)
         if found:
             say(f"attention: the {'tuned' if found.get('tuned') else 'shipped'} kernel ({found.get('summary', '')})")
     if "convolutions" not in skip:
-        say("tuning the 3D decoders' convolutions for this card (the longest step: several minutes)")
+        progress(SHARE["convolutions"], "tuning the 3D decoders' convolutions for this card (step 3 of 3, the longest: "
+                                        "several minutes)")
         found = _timed("flex_gemm", lambda: _convolutions(device, quiet), record)
         if found:
             say(f"convolutions: {found.get('summary', found)}")
@@ -382,7 +425,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     record["complete"] = not failed and not quiet.busy_during
     where = calibration.save(record)
     if record["complete"]:
-        say(f"done in {record['seconds'] / 60:.1f} minutes; kept in {where}")
+        progress(SHARE["done"], f"done in {record['seconds'] / 60:.1f} minutes; kept in {where}")
         return 0
     why = (f"the card was busy with another program during the run" if quiet.busy_during else "") \
         + (f"{'; ' if quiet.busy_during and failed else ''}{', '.join(failed)} failed" if failed else "")

@@ -248,6 +248,7 @@ def run(device: Any, say: Callable[[str], None] = print, grid: Optional[Dict[Tup
                         skipped.append({"key": f"2^{logn} {family(ci, co)}", "why": f"over {MAX_KEY_MIB} MiB"})
                         continue
                     if pause is not None:
+                        torch.cuda.synchronize(device)     # the look at the card sees no kernel of this run
                         pause()
                     t0 = time.perf_counter()
                     torch.cuda.reset_peak_memory_stats(device)
